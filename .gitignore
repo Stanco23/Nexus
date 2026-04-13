@@ -1,0 +1,12 @@
+**/target/
+**/*.rs.bk
+*.pdb
+*.rlib
+*.so
+.env
+.DS_Store
+*.tvc
+*.tvc.sha256
+*.swp
+*.swo
+*~
