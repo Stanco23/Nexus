@@ -19,9 +19,11 @@
 pub mod enums;
 pub mod instrument_id;
 pub mod registry;
+pub mod synthetic;
 pub mod types;
 
 pub use enums::{AssetClass, InstrumentClass, OptionKind};
 pub use instrument_id::InstrumentId;
 pub use registry::InstrumentRegistry;
+pub use synthetic::{parse_formula, Formula, SyntheticInstrument};
 pub use types::Instrument;
