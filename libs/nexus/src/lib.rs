@@ -11,6 +11,6 @@ pub mod catalog;
 pub mod engine;
 pub mod ingestion;
 pub mod instrument;
-// pub mod slippage;
+pub mod slippage;
 // pub mod portfolio;
 // pub mod sweep;
