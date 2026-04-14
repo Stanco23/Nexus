@@ -1,4 +1,5 @@
 //! RingBufferSet — multiple RingBuffers with merged anchor index.
+//! TickBufferSet — multi-instrument tick buffer with time-ordered merge cursor.
 //!
 //! Provides cross-file random access via a merged anchor index built once at startup.
 //! Used by TickBufferSet for multi-instrument backtesting.
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::ring_buffer::{RingBuffer, RingBufferError};
+use super::tick_buffer::{TickBuffer, TradeFlowStats};
 
 /// Instrument ID type.
 ///
@@ -173,6 +175,180 @@ impl RingBufferSet {
     /// Iterate all instruments' buffers.
     pub fn buffers(&self) -> &HashMap<InstrumentId, Arc<RingBuffer>> {
         &self.buffers
+    }
+}
+
+// =============================================================================
+// TickBufferSet
+// =============================================================================
+
+/// A set of TickBuffers, one per instrument, with time-ordered merge cursor.
+///
+/// Used for multi-instrument backtesting where ticks from different instruments
+/// need to be delivered in time-order regardless of which instrument they belong to.
+#[derive(Debug, Clone)]
+pub struct TickBufferSet {
+    buffers: HashMap<InstrumentId, Arc<TickBuffer>>,
+    instrument_ids: Vec<InstrumentId>,
+}
+
+impl TickBufferSet {
+    /// Create a TickBufferSet from a list of (path, instrument_id) pairs.
+    ///
+    /// Each file is opened as a RingBuffer, decoded to a TickBuffer, and stored.
+    pub fn from_files<I>(files: I) -> Result<Self, RingBufferError>
+    where
+        I: IntoIterator<Item = (PathBuf, InstrumentId)>,
+    {
+        let mut buffers: HashMap<InstrumentId, Arc<TickBuffer>> = HashMap::new();
+        let mut instrument_ids: Vec<InstrumentId> = Vec::new();
+
+        for (path, instrument_id) in files {
+            let rb = RingBuffer::open(&path, instrument_id)?;
+            let tb = TickBuffer::from_ring_buffer(&rb, 50)
+                .map_err(|e| RingBufferError::InvalidHeader(e.to_string()))?;
+            buffers.insert(instrument_id, Arc::new(tb));
+            instrument_ids.push(instrument_id);
+        }
+
+        Ok(Self {
+            buffers,
+            instrument_ids,
+        })
+    }
+
+    /// Create a TickBufferSet from pre-built RingBuffers.
+    pub fn from_ring_buffers<I>(ring_buffers: I, num_buckets: u32) -> Result<Self, RingBufferError>
+    where
+        I: IntoIterator<Item = (InstrumentId, RingBuffer)>,
+    {
+        let mut buffers: HashMap<InstrumentId, Arc<TickBuffer>> = HashMap::new();
+        let mut instrument_ids: Vec<InstrumentId> = Vec::new();
+
+        for (instrument_id, rb) in ring_buffers {
+            let tb = TickBuffer::from_ring_buffer(&rb, num_buckets)
+                .map_err(|e| RingBufferError::InvalidHeader(e.to_string()))?;
+            buffers.insert(instrument_id, Arc::new(tb));
+            instrument_ids.push(instrument_id);
+        }
+
+        Ok(Self {
+            buffers,
+            instrument_ids,
+        })
+    }
+
+    /// Get the number of instruments.
+    pub fn num_instruments(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// Get all instrument IDs.
+    pub fn instrument_ids(&self) -> &[InstrumentId] {
+        &self.instrument_ids
+    }
+
+    /// Get a reference to a specific instrument's TickBuffer.
+    pub fn get(&self, instrument_id: InstrumentId) -> Option<&Arc<TickBuffer>> {
+        self.buffers.get(&instrument_id)
+    }
+
+    /// Create a merge cursor for time-ordered iteration across all instruments.
+    pub fn merge_cursor(&self) -> MergeCursor<'_> {
+        MergeCursor::new(self)
+    }
+}
+
+/// A tick event from a specific instrument in a multi-instrument context.
+#[derive(Debug, Clone)]
+pub struct MultiInstrumentEvent<'a> {
+    pub instrument_id: InstrumentId,
+    pub tick: &'a TradeFlowStats,
+}
+
+/// Merge cursor for time-ordered iteration across multiple instrument buffers.
+#[derive(Debug)]
+pub struct MergeCursor<'a> {
+    #[allow(dead_code)]
+    buffer_set: &'a TickBufferSet,
+    iterators: Vec<MergeState<'a>>,
+    current_event: Option<MultiInstrumentEvent<'a>>,
+}
+
+#[derive(Debug)]
+struct MergeState<'a> {
+    instrument_id: InstrumentId,
+    buffer: &'a TickBuffer,
+    next_index: usize,
+}
+
+impl<'a> MergeCursor<'a> {
+    fn new(buffer_set: &'a TickBufferSet) -> Self {
+        let mut iterators = Vec::new();
+
+        for &instrument_id in buffer_set.instrument_ids() {
+            if let Some(tb) = buffer_set.get(instrument_id) {
+                iterators.push(MergeState {
+                    instrument_id,
+                    buffer: tb,
+                    next_index: 0,
+                });
+            }
+        }
+
+        let mut cursor = Self {
+            buffer_set,
+            iterators,
+            current_event: None,
+        };
+        cursor.find_next();
+        cursor
+    }
+
+    fn find_next(&mut self) {
+        let mut earliest_ts: u64 = u64::MAX;
+        let mut earliest_idx: Option<usize> = None;
+
+        // Find the earliest tick across all instruments
+        for (i, state) in self.iterators.iter_mut().enumerate() {
+            if let Some(tick) = state.buffer.get(state.next_index) {
+                if tick.timestamp_ns < earliest_ts {
+                    earliest_ts = tick.timestamp_ns;
+                    earliest_idx = Some(i);
+                }
+            }
+        }
+
+        if let Some(idx) = earliest_idx {
+            let state = &mut self.iterators[idx];
+            if let Some(tick) = state.buffer.get(state.next_index) {
+                self.current_event = Some(MultiInstrumentEvent {
+                    instrument_id: state.instrument_id,
+                    tick,
+                });
+                state.next_index += 1;
+                return;
+            }
+        }
+
+        self.current_event = None;
+    }
+
+    /// Get the current event without advancing.
+    pub fn peek(&self) -> Option<&MultiInstrumentEvent<'a>> {
+        self.current_event.as_ref()
+    }
+
+    /// Advance to the next event.
+    pub fn next(&mut self) -> Option<MultiInstrumentEvent<'a>> {
+        let result = self.current_event.take();
+        self.find_next();
+        result
+    }
+
+    /// Check if there are more events.
+    pub fn has_next(&self) -> bool {
+        self.current_event.is_some()
     }
 }
 
