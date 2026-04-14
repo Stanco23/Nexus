@@ -9,6 +9,7 @@
 pub mod buffer;
 pub mod catalog;
 pub mod ingestion;
+pub mod instrument;
 // pub mod engine;
 // pub mod slippage;
 // pub mod portfolio;
