@@ -7,6 +7,7 @@
 //! - Parameter sweeps via rayon parallelism
 
 pub mod buffer;
+pub mod catalog;
 pub mod ingestion;
 // pub mod engine;
 // pub mod slippage;

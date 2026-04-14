@@ -340,7 +340,7 @@ impl<'a> MergeCursor<'a> {
     }
 
     /// Advance to the next event.
-    pub fn next(&mut self) -> Option<MultiInstrumentEvent<'a>> {
+    pub fn advance(&mut self) -> Option<MultiInstrumentEvent<'a>> {
         let result = self.current_event.take();
         self.find_next();
         result
@@ -349,6 +349,16 @@ impl<'a> MergeCursor<'a> {
     /// Check if there are more events.
     pub fn has_next(&self) -> bool {
         self.current_event.is_some()
+    }
+}
+
+impl<'a> Iterator for MergeCursor<'a> {
+    type Item = MultiInstrumentEvent<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = self.current_event.take();
+        self.find_next();
+        result
     }
 }
 
