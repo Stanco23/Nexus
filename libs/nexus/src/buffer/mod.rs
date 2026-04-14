@@ -1,10 +1,11 @@
-//! Ring buffer — zero-copy TVC file access with binary search.
+//! Buffer module — RingBuffer, TickBuffer, and RingBufferSet.
 //!
-//! Provides single-file random access via memory-mapped files, and
-//! sequential iteration over decoded TradeTicks.
+//! Provides zero-copy TVC file access and pre-decoded tick buffers with VPIN.
 
 pub mod buffer_set;
 pub mod ring_buffer;
+pub mod tick_buffer;
 
 pub use buffer_set::{InstrumentId, RingBufferSet};
 pub use ring_buffer::{RingBuffer, RingBufferError, RingIter};
+pub use tick_buffer::{TickBuffer, TickBufferError, TickIter, TradeFlowStats};

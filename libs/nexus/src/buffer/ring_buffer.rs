@@ -142,7 +142,6 @@ impl RingBuffer {
         // Index entries start after the 4-byte num_anchors
         let index_start = index_offset + 4;
         let index_end = index_start + num_anchors * INDEX_ENTRY_SIZE;
-        let index_end = index_start + num_anchors * INDEX_ENTRY_SIZE;
         if index_end > mmap.len() {
             return Err(RingBufferError::InvalidHeader(
                 "Index extends beyond file".into(),
