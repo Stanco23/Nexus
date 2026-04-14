@@ -6,6 +6,7 @@
 //! - Multi-instrument portfolio support
 //! - Parameter sweeps via rayon parallelism
 
+pub mod book;
 pub mod buffer;
 pub mod catalog;
 pub mod engine;
