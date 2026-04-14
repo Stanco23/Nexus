@@ -1,7 +1,7 @@
 //! Nexus strategy trait and example strategies.
 
-pub mod strategy_trait;
 pub mod context;
+pub mod strategy_trait;
 
-pub use strategy_trait::{Strategy, BacktestMode, Signal, Tick, Bar, Action};
 pub use context::StrategyCtx;
+pub use strategy_trait::{Action, BacktestMode, Bar, Signal, Strategy, Tick};

@@ -60,17 +60,17 @@ pub const SIZE_PRECISION: u8 = 6;
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct TvcHeader {
-    pub magic: [u8; 4],           // 0-3: b"TVC3"
-    pub version: u8,                // 4: must be 1
-    pub decimal_precision: u8,      // 5: price decimal places
-    pub anchor_interval: u32,       // 6-9: ticks per anchor
-    pub instrument_id: u32,        // 10-13: FNV-1a hash of symbol
-    pub start_time_ns: u64,         // 14-21: first tick timestamp
-    pub end_time_ns: u64,           // 22-29: last tick timestamp
-    pub num_ticks: u64,             // 30-37: total tick count
-    pub num_anchors: u32,           // 38-41: number of anchors
-    pub index_offset: u64,          // 42-49: byte offset of index at EOF
-    pub reserved: [u8; 78],         // 50-127: zeros
+    pub magic: [u8; 4],        // 0-3: b"TVC3"
+    pub version: u8,           // 4: must be 1
+    pub decimal_precision: u8, // 5: price decimal places
+    pub anchor_interval: u32,  // 6-9: ticks per anchor
+    pub instrument_id: u32,    // 10-13: FNV-1a hash of symbol
+    pub start_time_ns: u64,    // 14-21: first tick timestamp
+    pub end_time_ns: u64,      // 22-29: last tick timestamp
+    pub num_ticks: u64,        // 30-37: total tick count
+    pub num_anchors: u32,      // 38-41: number of anchors
+    pub index_offset: u64,     // 42-49: byte offset of index at EOF
+    pub reserved: [u8; 78],    // 50-127: zeros
 }
 
 const_assert!(std::mem::size_of::<TvcHeader>() == HEADER_SIZE);
@@ -160,11 +160,11 @@ impl std::error::Error for HeaderError {}
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnchorTick {
-    pub timestamp_ns: u64,  // 0-7
-    pub price_int: i64,      // 8-15: signed for zigzag delta
-    pub size_int: i64,       // 16-23: signed for delta
-    pub side: u8,           // 24: 0=Buy, 1=Sell
-    pub flags: u8,          // 25: 1=trade
+    pub timestamp_ns: u64, // 0-7
+    pub price_int: i64,    // 8-15: signed for zigzag delta
+    pub size_int: i64,     // 16-23: signed for delta
+    pub side: u8,          // 24: 0=Buy, 1=Sell
+    pub flags: u8,         // 25: 1=trade
     pub sequence: u32,     // 26-29: tick index
 }
 
@@ -172,7 +172,14 @@ const_assert!(std::mem::size_of::<AnchorTick>() == ANCHOR_TICK_SIZE);
 
 impl AnchorTick {
     /// Create a new anchor tick.
-    pub fn new(timestamp_ns: u64, price_int: i64, size_int: i64, side: u8, flags: u8, sequence: u32) -> Self {
+    pub fn new(
+        timestamp_ns: u64,
+        price_int: i64,
+        size_int: i64,
+        side: u8,
+        flags: u8,
+        sequence: u32,
+    ) -> Self {
         Self {
             timestamp_ns,
             price_int,
@@ -191,7 +198,11 @@ impl fmt::Display for AnchorTick {
         let size = self.size_int;
         let side = self.side;
         let seq = self.sequence;
-        write!(f, "AnchorTick {{ ts: {}, price: {}, size: {}, side: {}, seq: {} }}", ts, price, size, side, seq)
+        write!(
+            f,
+            "AnchorTick {{ ts: {}, price: {}, size: {}, side: {}, seq: {} }}",
+            ts, price, size, side, seq
+        )
     }
 }
 
@@ -212,7 +223,7 @@ impl fmt::Display for AnchorTick {
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnchorIndexEntry {
-    pub tick_index: u64,   // 0-7: tick number within file
+    pub tick_index: u64,  // 0-7: tick number within file
     pub byte_offset: u64, // 8-15: byte offset of anchor in file
 }
 
@@ -220,7 +231,10 @@ const_assert!(std::mem::size_of::<AnchorIndexEntry>() == INDEX_ENTRY_SIZE);
 
 impl AnchorIndexEntry {
     pub fn new(tick_index: u64, byte_offset: u64) -> Self {
-        Self { tick_index, byte_offset }
+        Self {
+            tick_index,
+            byte_offset,
+        }
     }
 }
 
@@ -228,7 +242,11 @@ impl fmt::Display for AnchorIndexEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tick = self.tick_index;
         let offset = self.byte_offset;
-        write!(f, "AnchorIndexEntry {{ tick: {}, offset: {} }}", tick, offset)
+        write!(
+            f,
+            "AnchorIndexEntry {{ tick: {}, offset: {} }}",
+            tick, offset
+        )
     }
 }
 
@@ -248,13 +266,20 @@ pub struct TradeTick {
     pub timestamp_ns: u64,
     pub price_int: i64,
     pub size_int: i64,
-    pub side: u8,      // 0=Buy (aggressor is buy), 1=Sell
-    pub flags: u8,     // 1=trade
+    pub side: u8,  // 0=Buy (aggressor is buy), 1=Sell
+    pub flags: u8, // 1=trade
     pub sequence: u32,
 }
 
 impl TradeTick {
-    pub fn new(timestamp_ns: u64, price_int: i64, size_int: i64, side: u8, flags: u8, sequence: u32) -> Self {
+    pub fn new(
+        timestamp_ns: u64,
+        price_int: i64,
+        size_int: i64,
+        side: u8,
+        flags: u8,
+        sequence: u32,
+    ) -> Self {
         Self {
             timestamp_ns,
             price_int,

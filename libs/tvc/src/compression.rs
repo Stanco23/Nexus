@@ -20,8 +20,10 @@
 //! bytes 11-14: base_cont  (4B: same bit layout as base delta, timestamp base + side/flags)
 //! ```
 
-use crate::types::{DecodedTick, TradeTick, AnchorTick, ANCHOR_TICK_SIZE, OVERFLOW_ESCAPE};
-use crate::types::{TIMESTAMP_DELTA_MASK, PRICE_ZIGZAG_MASK, PRICE_ZIGZAG_SHIFT, TIMESTAMP_EXTRA_SHIFT};
+use crate::types::{AnchorTick, DecodedTick, TradeTick, ANCHOR_TICK_SIZE, OVERFLOW_ESCAPE};
+use crate::types::{
+    PRICE_ZIGZAG_MASK, PRICE_ZIGZAG_SHIFT, TIMESTAMP_DELTA_MASK, TIMESTAMP_EXTRA_SHIFT,
+};
 
 /// Maximum timestamp delta that fits in 20 bits.
 pub const MAX_TIMESTAMP_DELTA: u32 = TIMESTAMP_DELTA_MASK; // 0xFFFFF = 1,048,575
@@ -87,7 +89,7 @@ pub fn needs_overflow(
 
 /// The 18-bit signed zigzag range.
 pub const PRICE_ZIGZAG_MIN: i32 = -(131_072); // -(2^17)
-pub const PRICE_ZIGZAG_MAX: i32 = 131_071;     // 2^17 - 1
+pub const PRICE_ZIGZAG_MAX: i32 = 131_071; // 2^17 - 1
 
 // =============================================================================
 // Pack delta (tick -> bytes)
@@ -107,10 +109,7 @@ pub enum PackedDelta {
 /// Returns `PackedDelta::Base` (4 bytes) or `PackedDelta::Overflow` (15 bytes).
 ///
 /// `prev_sequence` is the tick index of the previous tick (anchor or delta).
-pub fn pack_delta(
-    prev_tick: &TradeTick,
-    next_tick: &TradeTick,
-) -> PackedDelta {
+pub fn pack_delta(prev_tick: &TradeTick, next_tick: &TradeTick) -> PackedDelta {
     let full_ts_delta = next_tick.timestamp_ns - prev_tick.timestamp_ns;
     let price_delta = (next_tick.price_int - prev_tick.price_int) as i32;
     let _side_changed = next_tick.side != prev_tick.side;
@@ -179,11 +178,7 @@ pub fn pack_delta(
 ///
 /// Returns decoded tick fields plus bytes consumed (4).
 #[inline]
-pub fn unpack_base_delta(
-    bytes: &[u8; 4],
-    prev_tick: &TradeTick,
-    sequence: u32,
-) -> DecodedTick {
+pub fn unpack_base_delta(bytes: &[u8; 4], prev_tick: &TradeTick, sequence: u32) -> DecodedTick {
     let packed = u32::from_le_bytes(*bytes);
 
     let ts_delta = packed & TIMESTAMP_DELTA_MASK;
@@ -283,22 +278,52 @@ pub fn unpack_anchor_at(data: &[u8], pos: usize) -> Result<AnchorTick, Compressi
     }
 
     let timestamp_ns = u64::from_le_bytes([
-        data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+        data[pos],
+        data[pos + 1],
+        data[pos + 2],
+        data[pos + 3],
+        data[pos + 4],
+        data[pos + 5],
+        data[pos + 6],
+        data[pos + 7],
     ]);
     let price_int = i64::from_le_bytes([
-        data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11],
-        data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15],
+        data[pos + 8],
+        data[pos + 9],
+        data[pos + 10],
+        data[pos + 11],
+        data[pos + 12],
+        data[pos + 13],
+        data[pos + 14],
+        data[pos + 15],
     ]);
     let size_int = i64::from_le_bytes([
-        data[pos + 16], data[pos + 17], data[pos + 18], data[pos + 19],
-        data[pos + 20], data[pos + 21], data[pos + 22], data[pos + 23],
+        data[pos + 16],
+        data[pos + 17],
+        data[pos + 18],
+        data[pos + 19],
+        data[pos + 20],
+        data[pos + 21],
+        data[pos + 22],
+        data[pos + 23],
     ]);
     let side = data[pos + 24];
     let flags = data[pos + 25];
-    let sequence = u32::from_le_bytes([data[pos + 26], data[pos + 27], data[pos + 28], data[pos + 29]]);
+    let sequence = u32::from_le_bytes([
+        data[pos + 26],
+        data[pos + 27],
+        data[pos + 28],
+        data[pos + 29],
+    ]);
 
-    Ok(AnchorTick { timestamp_ns, price_int, size_int, side, flags, sequence })
+    Ok(AnchorTick {
+        timestamp_ns,
+        price_int,
+        size_int,
+        side,
+        flags,
+        sequence,
+    })
 }
 
 // =============================================================================
@@ -315,9 +340,13 @@ pub enum CompressionError {
 impl std::fmt::Display for CompressionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompressionError::UnexpectedEndOfFile => write!(f, "Unexpected end of data while decoding delta"),
+            CompressionError::UnexpectedEndOfFile => {
+                write!(f, "Unexpected end of data while decoding delta")
+            }
             CompressionError::InvalidOverflowRecord => write!(f, "Invalid overflow record"),
-            CompressionError::InvalidTimestampDelta => write!(f, "Invalid timestamp delta encoding"),
+            CompressionError::InvalidTimestampDelta => {
+                write!(f, "Invalid timestamp delta encoding")
+            }
         }
     }
 }

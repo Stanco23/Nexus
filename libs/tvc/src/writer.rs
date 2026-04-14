@@ -18,16 +18,15 @@
 //! ```
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write, Seek, SeekFrom};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
-use crate::types::{
-    TvcHeader, AnchorTick, AnchorIndexEntry, TradeTick,
-    HEADER_SIZE, ANCHOR_TICK_SIZE,
-};
 use crate::compression::pack_delta;
+use crate::types::{
+    AnchorIndexEntry, AnchorTick, TradeTick, TvcHeader, ANCHOR_TICK_SIZE, HEADER_SIZE,
+};
 
 /// Errors that can occur during writing.
 #[derive(Debug)]
@@ -36,6 +35,7 @@ pub enum WriterError {
     InvalidAnchorInterval(u32),
     NotFinalized,
     AlreadyFinalized,
+    CheckpointFailed(std::io::Error),
 }
 
 impl std::fmt::Display for WriterError {
@@ -47,6 +47,7 @@ impl std::fmt::Display for WriterError {
             }
             WriterError::NotFinalized => write!(f, "File not finalized"),
             WriterError::AlreadyFinalized => write!(f, "File already finalized"),
+            WriterError::CheckpointFailed(e) => write!(f, "Checkpoint failed: {}", e),
         }
     }
 }
@@ -56,6 +57,28 @@ impl std::error::Error for WriterError {}
 impl From<std::io::Error> for WriterError {
     fn from(e: std::io::Error) -> Self {
         WriterError::Io(e)
+    }
+}
+
+/// Checkpoint error for FlushWriter.
+#[derive(Debug)]
+pub enum CheckpointWriterError {
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for CheckpointWriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckpointWriterError::Io(e) => write!(f, "IO error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointWriterError {}
+
+impl From<std::io::Error> for CheckpointWriterError {
+    fn from(e: std::io::Error) -> Self {
+        CheckpointWriterError::Io(e)
     }
 }
 
@@ -92,6 +115,12 @@ pub struct TvcWriter {
     anchor_index: Vec<AnchorIndexEntry>,
     /// Current byte offset within the data section.
     current_byte_offset: u64,
+    /// Number of ticks at the last checkpoint (for incremental checkpoint).
+    checkpoint_tick_count: u64,
+    /// Byte offset of data end at last checkpoint.
+    checkpoint_data_end: u64,
+    /// Timestamp of first tick written (for header start_time_ns).
+    first_tick_ts: Option<u64>,
 }
 
 impl TvcWriter {
@@ -136,6 +165,9 @@ impl TvcWriter {
             finalized: false,
             anchor_index: Vec::new(),
             current_byte_offset: 0,
+            checkpoint_tick_count: 0,
+            checkpoint_data_end: 0,
+            first_tick_ts: None,
         })
     }
 
@@ -161,6 +193,12 @@ impl TvcWriter {
         // Update header end time
         self.header.end_time_ns = tick.timestamp_ns;
 
+        // Set start time on first tick
+        if self.first_tick_ts.is_none() {
+            self.first_tick_ts = Some(tick.timestamp_ns);
+            self.header.start_time_ns = tick.timestamp_ns;
+        }
+
         // Update SHA256
         let buf = tick_to_bytes(tick);
         self.sha256.update(buf);
@@ -172,7 +210,8 @@ impl TvcWriter {
     fn write_anchor(&mut self, tick: &TradeTick) -> Result<(), WriterError> {
         // Record anchor in index
         let byte_offset = self.data_start_offset + self.current_byte_offset;
-        self.anchor_index.push(AnchorIndexEntry::new(self.tick_count, byte_offset));
+        self.anchor_index
+            .push(AnchorIndexEntry::new(self.tick_count, byte_offset));
         self.anchor_count += 1;
 
         // Convert TradeTick to AnchorTick and write
@@ -194,9 +233,9 @@ impl TvcWriter {
 
     /// Write a delta record (4 bytes or 15 bytes).
     fn write_delta(&mut self, tick: &TradeTick) -> Result<(), WriterError> {
-        let prev = self.last_tick.ok_or_else(|| {
-            std::io::Error::other("No previous tick for delta encoding")
-        })?;
+        let prev = self
+            .last_tick
+            .ok_or_else(|| std::io::Error::other("No previous tick for delta encoding"))?;
 
         let packed = pack_delta(&prev, tick);
 
@@ -212,6 +251,64 @@ impl TvcWriter {
         }
 
         self.last_tick = Some(*tick);
+        Ok(())
+    }
+
+    /// Checkpoint the writer: flush header and data to disk.
+    ///
+    /// This writes the current header state (with tick_count, anchor_count,
+    /// start_time_ns, end_time_ns) at byte position 0. The anchor index is
+    /// NOT written at checkpoint time — it is only written at finalize().
+    ///
+    /// After checkpoint, writing can continue. On resume, the file can be
+    /// opened with `TvcReader` which will rebuild anchor positions by
+    /// scanning from the last anchor forward.
+    ///
+    /// A `.tvc.ckp` sidecar file is written with the last_tick state needed
+    /// to continue delta encoding after resume.
+    pub fn checkpoint(&mut self) -> Result<(), WriterError> {
+        if self.finalized {
+            return Err(WriterError::AlreadyFinalized);
+        }
+
+        // Flush data writes
+        self.writer.flush()?;
+
+        // Update header with current state
+        self.header.num_ticks = self.tick_count;
+        self.header.num_anchors = self.anchor_count;
+        // index_offset = 0 signals file is not finalized
+        self.header.index_offset = 0;
+
+        let header_bytes = header_to_bytes(&self.header);
+
+        // Write header at position 0
+        let mut file = OpenOptions::new().write(true).open(&self.path)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header_bytes)?;
+        file.flush()?;
+        drop(file);
+
+        // Write checkpoint sidecar: last_tick for delta encoding continuation
+        // Layout: [tick_count (8B)][last_tick bytes (30B)]
+        let ckp_path = self.path.with_extension("tvc.ckp");
+        let mut ckp_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&ckp_path)?;
+        ckp_file.write_all(&self.tick_count.to_le_bytes())?;
+        if let Some(ref lt) = self.last_tick {
+            let tick_bytes = tick_to_bytes_lt(lt);
+            ckp_file.write_all(&tick_bytes)?;
+        }
+        ckp_file.flush()?;
+        drop(ckp_file);
+
+        // Update checkpoint tracking
+        self.checkpoint_tick_count = self.tick_count;
+        self.checkpoint_data_end = self.data_start_offset + self.current_byte_offset;
+
         Ok(())
     }
 
@@ -251,7 +348,10 @@ impl TvcWriter {
         self.writer.flush()?;
 
         // Get the inner file
-        let file = self.writer.into_inner().map_err(|e| WriterError::Io(e.into()))?;
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(|e| WriterError::Io(e.into()))?;
 
         // Compute SHA256: header (128 bytes) + all tick data + index
         // NOTE: after into_inner(), the original file handle cannot be used for reading.
@@ -266,7 +366,7 @@ impl TvcWriter {
         file.read_to_end(&mut data)?;
         drop(file);
 
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut sha = Sha256::new();
         sha.update(header_bytes);
         sha.update(&data);
@@ -320,6 +420,11 @@ fn tick_to_bytes(tick: &TradeTick) -> [u8; ANCHOR_TICK_SIZE] {
     buf
 }
 
+/// Convert a TradeTick to 30 bytes (for checkpoint sidecar).
+fn tick_to_bytes_lt(tick: &TradeTick) -> [u8; ANCHOR_TICK_SIZE] {
+    tick_to_bytes(tick)
+}
+
 /// Write a header to 128 bytes.
 fn header_to_bytes(header: &TvcHeader) -> [u8; HEADER_SIZE] {
     let mut buf = [0u8; HEADER_SIZE];
@@ -347,11 +452,19 @@ pub fn bytes_to_header(buf: &[u8; HEADER_SIZE]) -> TvcHeader {
     let decimal_precision = buf[5];
     let anchor_interval = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
     let instrument_id = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let start_time_ns = u64::from_le_bytes([buf[14], buf[15], buf[16], buf[17], buf[18], buf[19], buf[20], buf[21]]);
-    let end_time_ns = u64::from_le_bytes([buf[22], buf[23], buf[24], buf[25], buf[26], buf[27], buf[28], buf[29]]);
-    let num_ticks = u64::from_le_bytes([buf[30], buf[31], buf[32], buf[33], buf[34], buf[35], buf[36], buf[37]]);
+    let start_time_ns = u64::from_le_bytes([
+        buf[14], buf[15], buf[16], buf[17], buf[18], buf[19], buf[20], buf[21],
+    ]);
+    let end_time_ns = u64::from_le_bytes([
+        buf[22], buf[23], buf[24], buf[25], buf[26], buf[27], buf[28], buf[29],
+    ]);
+    let num_ticks = u64::from_le_bytes([
+        buf[30], buf[31], buf[32], buf[33], buf[34], buf[35], buf[36], buf[37],
+    ]);
     let num_anchors = u32::from_le_bytes([buf[38], buf[39], buf[40], buf[41]]);
-    let index_offset = u64::from_le_bytes([buf[42], buf[43], buf[44], buf[45], buf[46], buf[47], buf[48], buf[49]]);
+    let index_offset = u64::from_le_bytes([
+        buf[42], buf[43], buf[44], buf[45], buf[46], buf[47], buf[48], buf[49],
+    ]);
     let mut reserved = [0u8; 78];
     reserved.copy_from_slice(&buf[50..128]);
 
@@ -373,6 +486,72 @@ pub fn bytes_to_header(buf: &[u8; HEADER_SIZE]) -> TvcHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_checkpoint_flushes_header_and_ckp_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut writer = TvcWriter::new(&path, 0x12345678, 10, 9).unwrap();
+
+        // Write some ticks
+        for i in 0..25u64 {
+            let tick = TradeTick::from_floats(
+                1_000_000_000 + i * 1_000_000,
+                100.0 + i as f64 * 0.1,
+                1.0,
+                0,
+                9,
+                i as u32,
+            );
+            writer.write_tick(&tick).unwrap();
+        }
+
+        writer.checkpoint().unwrap();
+
+        // Verify .tvc.ckp exists
+        let ckp_path = path.with_extension("tvc.ckp");
+        assert!(ckp_path.exists());
+
+        // Verify ckp file content: [tick_count (8B)][30B tick]
+        let mut ckp_data = Vec::new();
+        let mut ckp_file = std::fs::File::open(&ckp_path).unwrap();
+        ckp_file.read_to_end(&mut ckp_data).unwrap();
+        assert_eq!(ckp_data.len(), 8 + ANCHOR_TICK_SIZE);
+        let stored_count = u64::from_le_bytes([
+            ckp_data[0],
+            ckp_data[1],
+            ckp_data[2],
+            ckp_data[3],
+            ckp_data[4],
+            ckp_data[5],
+            ckp_data[6],
+            ckp_data[7],
+        ]);
+        assert_eq!(stored_count, 25);
+
+        // Verify header has index_offset=0 (not finalized)
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        let mut header_file = std::fs::File::open(&path).unwrap();
+        header_file.read_exact(&mut header_bytes).unwrap();
+        let idx_off = u64::from_le_bytes([
+            header_bytes[42],
+            header_bytes[43],
+            header_bytes[44],
+            header_bytes[45],
+            header_bytes[46],
+            header_bytes[47],
+            header_bytes[48],
+            header_bytes[49],
+        ]);
+        assert_eq!(idx_off, 0); // not finalized
+
+        // Clean up
+        std::fs::remove_file(&ckp_path).ok();
+    }
 
     #[test]
     fn test_write_and_read_header() {
@@ -398,7 +577,9 @@ mod tests {
         let bytes = tick_to_bytes(&tick);
 
         let _pos = 0usize;
-        let ts = u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let ts = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
         assert_eq!(ts, tick.timestamp_ns);
 
         let anchor = AnchorTick {

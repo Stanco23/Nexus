@@ -1,6 +1,6 @@
 // Debug test for roundtrip
-use tvc::{TvcWriter, TvcReader, TradeTick};
 use std::fs;
+use tvc::{TradeTick, TvcReader, TvcWriter};
 
 fn main() {
     let path = "/tmp/tvc_debug_test.tvc";
@@ -32,14 +32,22 @@ fn main() {
 
     println!("\nAnchor index:");
     for (i, entry) in reader.anchor_index().iter().enumerate() {
-        println!("  {}: tick_index={}, byte_offset={}", i, {entry.tick_index}, {entry.byte_offset});
+        println!(
+            "  {}: tick_index={}, byte_offset={}",
+            i,
+            { entry.tick_index },
+            { entry.byte_offset }
+        );
     }
 
     println!("\nDecoding ticks:");
     for i in 0..count.min(10) {
         let offset = reader.seek_to_tick(i as u64).unwrap();
         let tick = reader.decode_tick_at(offset as usize).unwrap();
-        println!("  tick {}: sequence={}, offset={}", i, tick.sequence, offset);
+        println!(
+            "  tick {}: sequence={}, offset={}",
+            i, tick.sequence, offset
+        );
     }
 
     let _ = fs::remove_file(path);

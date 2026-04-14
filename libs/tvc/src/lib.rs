@@ -26,10 +26,9 @@ pub mod reader;
 pub mod types;
 pub mod writer;
 
-pub use reader::TvcReader;
-pub use compression::{pack_delta, unpack_base_delta, unpack_overflow_delta, unpack_delta_at, unpack_anchor_at};
-pub use types::{
-    AnchorIndexEntry, AnchorTick, DecodedTick, HeaderError,
-    TradeTick, TvcHeader,
+pub use compression::{
+    pack_delta, unpack_anchor_at, unpack_base_delta, unpack_delta_at, unpack_overflow_delta,
 };
-pub use writer::TvcWriter;
+pub use reader::TvcReader;
+pub use types::{AnchorIndexEntry, AnchorTick, DecodedTick, HeaderError, TradeTick, TvcHeader};
+pub use writer::{CheckpointWriterError, TvcWriter};

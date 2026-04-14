@@ -1,8 +1,6 @@
 //! Roundtrip test: write N ticks → read back → verify byte-for-byte identical.
 
-use tvc::{TvcWriter, TvcReader, TradeTick};
-
-
+use tvc::{TradeTick, TvcReader, TvcWriter};
 
 #[test]
 fn test_roundtrip_1m_ticks_anchor_1000() {
@@ -38,7 +36,11 @@ fn test_roundtrip_1m_ticks_anchor_1000() {
 
     // For count=1M, interval=1000: ~20MB
     assert!(file_size < 25_000_000, "File size {} too large", file_size);
-    println!("File size for 1M ticks: {} bytes ({:.2} MB)", file_size, file_size as f64 / 1_000_000.0);
+    println!(
+        "File size for 1M ticks: {} bytes ({:.2} MB)",
+        file_size,
+        file_size as f64 / 1_000_000.0
+    );
 
     // Read back and verify
     let mut reader = TvcReader::open(std::path::Path::new(path)).unwrap();
@@ -107,7 +109,8 @@ fn test_roundtrip_anchor_interval_1() {
     for i in 0..count {
         let offset = reader.seek_to_tick(i as u64).unwrap();
         let tick = reader.decode_tick_at(offset as usize).unwrap();
-        println!("i={}, offset={}, tick={:?}", i, offset, tick); assert_eq!(tick.sequence, i as u32);
+        println!("i={}, offset={}, tick={:?}", i, offset, tick);
+        assert_eq!(tick.sequence, i as u32);
     }
 }
 
