@@ -466,6 +466,7 @@ impl WalkForwardRunner {
         let mut peak_equity = initial_equity;
         let mut max_drawdown = 0.0;
         let mut trades = Vec::new();
+        let mut equity_curve = vec![initial_equity];
 
         let mut position: f64 = 0.0;
         let mut entry_price: f64 = 0.0;
@@ -482,6 +483,7 @@ impl WalkForwardRunner {
             };
 
             equity += pnl;
+            equity_curve.push(equity);
             if equity > peak_equity {
                 peak_equity = equity;
             }
@@ -502,13 +504,14 @@ impl WalkForwardRunner {
                     size: position.abs(),
                     commission: 0.0,
                     pnl,
+                    fee: 0.0,
+                    is_maker: false,
                 });
                 position = 0.0;
                 entry_price = 0.0;
             }
         }
 
-        let equity_curve: Vec<f64> = vec![initial_equity];
         let sharpe = MonteCarloRunner::sharpe_ratio(&equity_curve);
 
         WindowPerformance {
@@ -534,7 +537,6 @@ impl WalkForwardRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
 
     fn sample_trades() -> Vec<Trade> {
         vec![
@@ -545,6 +547,8 @@ mod tests {
                 size: 1.0,
                 commission: 0.1,
                 pnl: 0.0,
+                fee: 0.0,
+                is_maker: false,
             },
             Trade {
                 timestamp_ns: 2_000_000_000,
@@ -553,6 +557,8 @@ mod tests {
                 size: 1.0,
                 commission: 0.11,
                 pnl: 9.89,
+                fee: 0.0,
+                is_maker: false,
             },
             Trade {
                 timestamp_ns: 3_000_000_000,
@@ -561,6 +567,8 @@ mod tests {
                 size: 1.0,
                 commission: 0.105,
                 pnl: 0.0,
+                fee: 0.0,
+                is_maker: false,
             },
             Trade {
                 timestamp_ns: 4_000_000_000,
@@ -569,6 +577,8 @@ mod tests {
                 size: 1.0,
                 commission: 0.115,
                 pnl: 9.885,
+                fee: 0.0,
+                is_maker: false,
             },
         ]
     }

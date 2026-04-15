@@ -58,12 +58,14 @@ pub struct FillEvent {
     pub side: Side,
     pub fill_price: f64,
     pub fill_size: f64,
+    pub remaining_size: f64,   // for partial fills: remaining size after this level
     pub queue_position: u64,
     pub vpin: f64,
     pub slippage_bps: f64,
     pub delay_ns: u64,
     pub timestamp_ns: u64,
     pub is_maker: bool,
+    pub fee: f64,             // commission charged for this fill
 }
 
 /// Price level with queue of orders.
@@ -171,6 +173,7 @@ impl OrderEmulator {
     }
 
     /// Compute fill event for a queued order (no mutable self borrow).
+    #[allow(clippy::too_many_arguments)]
     fn compute_fill_event(
         qo: &QueuedOrder,
         current_price: f64,
@@ -179,6 +182,7 @@ impl OrderEmulator {
         timestamp_ns: u64,
         slippage_config: &SlippageConfig,
         avg_market_volume: f64,
+        maker_fee: f64,
     ) -> Option<FillEvent> {
         let prob = {
             let base_prob = 1.0 / (1.0 + qo.queue_position as f64 * 0.1);
@@ -196,18 +200,21 @@ impl OrderEmulator {
         let impact_bps = slippage_config.compute_impact_bps(order_size_ticks, vpin);
 
         let fill_price = current_price * (1.0 + impact_bps / 10000.0);
+        let fee = qo.remaining_size * maker_fee;
 
         Some(FillEvent {
             order_id: qo.order_id,
             side: qo.side,
             fill_price,
             fill_size: qo.remaining_size,
+            remaining_size: 0.0, // limit orders fully fill in emulator
             queue_position: qo.queue_position,
             vpin,
             slippage_bps: impact_bps,
             delay_ns,
             timestamp_ns,
             is_maker: true,
+            fee,
         })
     }
 
@@ -219,6 +226,7 @@ impl OrderEmulator {
         current_price: f64,
         vpin: f64,
         timestamp_ns: u64,
+        maker_fee: f64,
     ) -> Vec<FillEvent> {
         let market_volume = self.avg_market_volume;
 
@@ -233,6 +241,7 @@ impl OrderEmulator {
                 timestamp_ns,
                 &self.slippage_config,
                 self.avg_market_volume,
+                maker_fee,
             ) {
                 to_fill.push((qo.order_id, event));
             }
@@ -294,6 +303,60 @@ impl OrderEmulator {
     pub fn filled_log(&self) -> &[FillEvent] {
         &self.filled_log
     }
+
+    /// Process a market order by walking through the order book levels.
+    ///
+    /// Consumes liquidity level by level. Each level fill gets its own FillEvent
+    /// with the correct price, size, slippage, and taker fee.
+    ///
+    /// Returns all fill events (one per level consumed). Remaining size is returned
+    /// in the last fill's `remaining_size` if order exceeds book liquidity.
+    pub fn process_market_order(
+        &mut self,
+        size: f64,
+        side: Side,
+        order_book: &OrderBook,
+        timestamp_ns: u64,
+        taker_fee: f64,
+    ) -> Vec<FillEvent> {
+        let levels = order_book.walk_book(size, side);
+        let mut fills = Vec::new();
+
+        for level in levels {
+            let fill_price = level.price();
+            let order_size_ticks = (level.size_filled / self.avg_market_volume).max(1.0);
+            let impact_bps = self.slippage_config.compute_impact_bps(order_size_ticks, order_book.vpin);
+            let delay_ns = self.slippage_config.compute_fill_delay(
+                order_size_ticks,
+                order_book.vpin,
+                1_000_000,
+            );
+            let slippage_price = fill_price * (1.0 + impact_bps / 10000.0);
+            let fee = level.size_filled * taker_fee;
+
+            let order_id = self.next_order_id;
+            self.next_order_id += 1;
+
+            let event = FillEvent {
+                order_id,
+                side,
+                fill_price: slippage_price,
+                fill_size: level.size_filled,
+                remaining_size: level.remaining_at_level,
+                queue_position: 0,
+                vpin: order_book.vpin,
+                slippage_bps: impact_bps,
+                delay_ns,
+                timestamp_ns,
+                is_maker: false,
+                fee,
+            };
+            self.filled_log.push(event.clone());
+            fills.push(event);
+        }
+
+        fills
+    }
 }
 
 impl Default for OrderEmulator {
@@ -315,6 +378,23 @@ pub struct PriceLevel {
 impl PriceLevel {
     pub fn new(price: f64, size: f64) -> Self {
         Self { price, size }
+    }
+}
+
+/// Result of a single price level being consumed by a market order.
+#[derive(Debug, Clone)]
+pub struct LevelFill {
+    /// Price at this level (nanounits).
+    pub price_int: i64,
+    /// Size actually filled at this level.
+    pub size_filled: f64,
+    /// Remaining size at this level after partial fill (0 if fully consumed).
+    pub remaining_at_level: f64,
+}
+
+impl LevelFill {
+    pub fn price(&self) -> f64 {
+        self.price_int as f64 / 1_000_000_000.0
     }
 }
 
@@ -434,6 +514,55 @@ impl OrderBook {
         // If price level doesn't exist, there's nothing to remove — passive order
         // was already filled or never existed; this is fine for the synthetic model.
     }
+
+    /// Walk the order book and compute fills for a market order.
+    ///
+    /// For a BUY order: walk up the ask side (lowest ask first, then higher asks).
+    /// For a SELL order: walk down the bid side (highest bid first, then lower bids).
+    ///
+    /// Returns a list of level fills, each representing one price level consumed.
+    /// The list is ordered from best price to worst price for the aggressing order.
+    ///
+    /// If the order size is larger than total liquidity, remaining size is returned
+    /// in the last fill with `remaining_at_level = size`.
+    pub fn walk_book(&self, size: f64, side: Side) -> Vec<LevelFill> {
+        let mut fills = Vec::new();
+        let mut remaining = size;
+
+        if side == Side::Buy {
+            // Walk up the ask side (ascending by price_int)
+            for (&price_int, &available) in self.asks.iter() {
+                if remaining <= 0.0 {
+                    break;
+                }
+                let size_at_level = available.min(remaining);
+                let remaining_at_level = available - size_at_level;
+                fills.push(LevelFill {
+                    price_int,
+                    size_filled: size_at_level,
+                    remaining_at_level,
+                });
+                remaining -= size_at_level;
+            }
+        } else {
+            // Walk down the bid side (descending by price_int — highest bid first)
+            for (&price_int, &available) in self.bids.iter().rev() {
+                if remaining <= 0.0 {
+                    break;
+                }
+                let size_at_level = available.min(remaining);
+                let remaining_at_level = available - size_at_level;
+                fills.push(LevelFill {
+                    price_int,
+                    size_filled: size_at_level,
+                    remaining_at_level,
+                });
+                remaining -= size_at_level;
+            }
+        }
+
+        fills
+    }
 }
 
 impl Default for OrderBook {
@@ -522,7 +651,7 @@ mod tests {
 
         // Simulate fills — with prob < 0.5 check, may not fill deterministically
         // in test environment. Just verify structure.
-        let fills = emulator.process_fills(100.0, 0.0, 2000);
+        let fills = emulator.process_fills(100.0, 0.0, 2000, 0.0);
         // Without seeded randomness, this is deterministic — prob >= 0.5 should fill
         assert_eq!(emulator.filled_log().len(), fills.len());
     }

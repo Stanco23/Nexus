@@ -55,7 +55,7 @@ fn test_fifo_fill_order() {
     let id2 = emulator.submit_limit(100.0, 1.0, Side::Buy, ts + 2);
 
     // Process fills at a price that crosses (market price = 100)
-    let fills = emulator.process_fills(100.0, 0.0, ts + 100);
+    let fills = emulator.process_fills(100.0, 0.0, ts + 100, 0.0);
 
     // Fills should be in FIFO order
     assert_eq!(fills.len(), 3);
@@ -105,7 +105,7 @@ fn test_fill_event_has_correct_side() {
     let sell_id = emulator.submit_limit(100.0, 1.0, Side::Sell, ts + 1);
 
     // Process fills
-    let fills = emulator.process_fills(100.0, 0.0, ts + 100);
+    let fills = emulator.process_fills(100.0, 0.0, ts + 100, 0.0);
 
     assert_eq!(fills.len(), 2);
 
@@ -127,7 +127,7 @@ fn test_pending_orders_empty_after_all_fills() {
 
     assert_eq!(emulator.num_pending(), 2);
 
-    emulator.process_fills(100.0, 0.0, ts + 100);
+    emulator.process_fills(100.0, 0.0, ts + 100, 0.0);
 
     assert_eq!(emulator.num_pending(), 0);
 }

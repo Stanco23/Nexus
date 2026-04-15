@@ -21,6 +21,8 @@ pub struct Trade {
     pub size: f64,
     pub commission: f64,
     pub pnl: f64,
+    pub fee: f64,
+    pub is_maker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,21 +78,43 @@ impl EngineContext {
 #[derive(Debug, Clone, Copy)]
 pub struct CommissionConfig {
     pub rate: f64,
+    /// Fee rate for limit orders (resting in book, maker).
+    pub maker_fee: f64,
+    /// Fee rate for market orders (aggressing book, taker).
+    pub taker_fee: f64,
 }
 
 impl Default for CommissionConfig {
     fn default() -> Self {
-        Self { rate: 0.0 }
+        Self { rate: 0.0, maker_fee: 0.0, taker_fee: 0.0 }
     }
 }
 
 impl CommissionConfig {
     pub fn new(rate: f64) -> Self {
-        Self { rate }
+        Self { rate, maker_fee: 0.0, taker_fee: 0.0 }
+    }
+
+    pub fn with_maker_fee(mut self, fee: f64) -> Self {
+        self.maker_fee = fee;
+        self
+    }
+
+    pub fn with_taker_fee(mut self, fee: f64) -> Self {
+        self.taker_fee = fee;
+        self
     }
 
     pub fn compute(&self, _price: f64, size: f64) -> f64 {
         size * self.rate
+    }
+
+    pub fn maker_commission(&self, _price: f64, size: f64) -> f64 {
+        size * self.maker_fee
+    }
+
+    pub fn taker_commission(&self, _price: f64, size: f64) -> f64 {
+        size * self.taker_fee
     }
 }
 
@@ -174,7 +198,7 @@ impl BacktestEngine {
             self.order_emulator.update_market_volume(size);
 
             // Process pending limit order fills — update positions based on queue fills
-            let fills = self.order_emulator.process_fills(price, vpin, timestamp);
+            let fills = self.order_emulator.process_fills(price, vpin, timestamp, self.commission.maker_fee);
             for fill in &fills {
                 let fill_signal = if fill.side == Side::Buy { Signal::Buy } else { Signal::Sell };
 
@@ -207,6 +231,8 @@ impl BacktestEngine {
                         size: fill.fill_size,
                         commission: comm,
                         pnl: 0.0,
+                        fee: fill.fee,
+                        is_maker: true,
                     });
                     ctx.num_trades += 1;
                 } else {
@@ -283,8 +309,7 @@ impl BacktestEngine {
         });
     }
 
-    fn open_position(
-        &self,
+    fn open_position(&mut self,
         timestamp: u64,
         price: f64,
         size: f64,
@@ -292,24 +317,46 @@ impl BacktestEngine {
         ctx: &mut EngineContext,
         trades: &mut Vec<Trade>,
     ) {
-        // Compute slippage: order_size in ticks vs avg tick size
-        let order_size_ticks = (size / 0.001).max(1.0); // rough tick size estimate
-        let impact_bps = self.slippage_config.compute_impact_bps(order_size_ticks, 0.0);
-        let fill_price = price * (1.0 + impact_bps / 10_000.0);
-
-        let comm = self.commission.compute(fill_price, size);
-        ctx.equity -= comm;
-        ctx.position = if side == Signal::Buy { size } else { -size };
-        ctx.entry_price = fill_price;
-        trades.push(Trade {
-            timestamp_ns: timestamp,
-            side,
-            price: fill_price,
+        let order_side = if side == Signal::Buy { Side::Buy } else { Side::Sell };
+        let fills = self.order_emulator.process_market_order(
             size,
-            commission: comm,
-            pnl: 0.0,
-        });
-        ctx.num_trades += 1;
+            order_side,
+            &self.order_book,
+            timestamp,
+            self.commission.taker_fee,
+        );
+
+        if fills.is_empty() {
+            // No liquidity — could not fill
+            return;
+        }
+
+        // Average fill price across all levels
+        let total_cost: f64 = fills.iter().map(|f| f.fill_price * f.fill_size).sum();
+        let total_size: f64 = fills.iter().map(|f| f.fill_size).sum();
+        let avg_fill_price = if total_size > 0.0 { total_cost / total_size } else { price };
+
+        // Commission (base rate) + taker fee
+        let base_commission = self.commission.compute(avg_fill_price, total_size);
+        let total_fee: f64 = fills.iter().map(|f| f.fee).sum();
+
+        ctx.equity -= base_commission + total_fee;
+        ctx.position = if side == Signal::Buy { total_size } else { -total_size };
+        ctx.entry_price = avg_fill_price;
+
+        for fill in &fills {
+            trades.push(Trade {
+                timestamp_ns: fill.timestamp_ns,
+                side,
+                price: fill.fill_price,
+                size: fill.fill_size,
+                commission: base_commission * (fill.fill_size / total_size),
+                pnl: 0.0,
+                fee: fill.fee,
+                is_maker: false,
+            });
+            ctx.num_trades += 1;
+        }
     }
 
     fn close_position(
@@ -345,6 +392,8 @@ impl BacktestEngine {
             size: ctx.position.abs(),
             commission: comm,
             pnl,
+            fee: 0.0,
+            is_maker: false,
         });
         ctx.num_trades += 1;
         ctx.position = 0.0;
