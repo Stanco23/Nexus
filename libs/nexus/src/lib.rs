@@ -14,6 +14,7 @@ pub mod engine;
 pub mod ingestion;
 pub mod instrument;
 pub mod mc_wf;
+pub mod optim;
 pub mod portfolio;
 pub mod slippage;
 pub mod sweep;
