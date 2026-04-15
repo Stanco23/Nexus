@@ -2,8 +2,8 @@
 resolver = "2"
 members = [
     "libs/tvc",
-    "libs/nexus",
     "libs/strategy",
+    "libs/nexus",
     "apps/cli",
 ]
 
