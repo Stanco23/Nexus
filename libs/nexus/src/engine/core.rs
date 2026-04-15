@@ -3,6 +3,7 @@
 use crate::book::{OrderBook, OrderEmulator, OrderId, Side};
 use crate::buffer::tick_buffer::{TickBuffer, TradeFlowStats};
 use crate::engine::orders::OrderManager;
+use crate::engine::risk::RiskEngine;
 use crate::instrument::InstrumentId;
 use crate::slippage::SlippageConfig;
 
@@ -136,6 +137,7 @@ pub struct BacktestEngine {
     order_book: OrderBook,
     order_emulator: OrderEmulator,
     order_manager: OrderManager,
+    risk_engine: Option<RiskEngine>,
     data: Option<Vec<(u64, f64, f64, f64)>>,
     result: Option<BacktestResult>,
 }
@@ -150,6 +152,7 @@ impl BacktestEngine {
             order_book: OrderBook::new(),
             order_emulator: OrderEmulator::new(),
             order_manager: OrderManager::new(),
+            risk_engine: None,
             data: None,
             result: None,
         }
@@ -172,6 +175,10 @@ impl BacktestEngine {
             })
             .collect();
         self.data = Some(ticks);
+    }
+
+    pub fn set_risk_engine(&mut self, config: crate::engine::risk::RiskConfig) {
+        self.risk_engine = Some(RiskEngine::new(config, self.initial_equity));
     }
 
     pub fn run<S: Strategy>(&mut self, strategy: &mut S) {
@@ -253,6 +260,18 @@ impl BacktestEngine {
             let mut signal = strategy.on_tick(timestamp, price, size, &mut ctx);
             if sl_tp_signal == Some(Signal::Close) {
                 signal = Signal::Close;
+            }
+
+            // Risk check — block Buy/Sell signals if risk limits would be breached
+            if signal != Signal::Close {
+                if let Some(ref risk) = self.risk_engine {
+                    if let Some(_reason) = risk.check_signal(size, price, ctx.position, ctx.equity, ctx.max_drawdown) {
+                        // Risk limit breached — skip this signal
+                        last_signal = signal;
+                        ctx.update_equity(price);
+                        continue;
+                    }
+                }
             }
 
             if signal != last_signal {
