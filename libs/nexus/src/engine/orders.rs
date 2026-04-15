@@ -1,16 +1,4 @@
 //! Order management — stop-loss, take-profit, and pending orders.
-//!
-//! # Order Types
-//! - `Market`: fill at next tick's price
-//! - `Limit`: fill when market crosses order price
-//! - `Stop`: triggered when market crosses stop price, then filled as market order
-//!
-//! # SL/TP
-//! - SL/TP checked every tick (not per bar)
-//! - When triggered, position is closed at the trigger price (or next tick for stop)
-//!
-//! # Auto-Close
-//! Any open position is automatically closed at the last tick's price when data ends.
 
 use super::{EngineContext, Signal};
 use crate::instrument::InstrumentId;
@@ -20,6 +8,7 @@ pub enum OrderType {
     Market,
     Limit,
     Stop,
+    StopLimit, // triggers when price crosses stop level, fills immediately at current price
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +152,18 @@ impl OrderManager {
                     };
                     if crosses {
                         order.triggered = true;
+                        to_fill.push(i);
+                    }
+                }
+                OrderType::StopLimit => {
+                    // Buy stop: triggers when price rises to or above stop level, then fills at market
+                    // Sell stop: triggers when price falls to or below stop level, then fills at market
+                    let crosses = if order.is_buy() {
+                        current_price >= order.price
+                    } else {
+                        current_price <= order.price
+                    };
+                    if crosses {
                         to_fill.push(i);
                     }
                 }
@@ -318,6 +319,68 @@ mod tests {
     fn test_order_manager_default() {
         let manager = OrderManager::default();
         assert_eq!(manager.num_pending(), 0);
+        assert_eq!(manager.num_filled(), 0);
+    }
+
+    #[test]
+    fn test_stoplimit_buy_triggers_on_rise() {
+        let mut manager = OrderManager::new();
+        let btc_id = InstrumentId::new("BTCUSDT", "BINANCE");
+        let ctx = EngineContext::new(10000.0);
+
+        // Buy StopLimit at 95 — triggers when price rises to or above 95
+        let order = manager.new_order(btc_id, OrderSide::Buy, OrderType::StopLimit, 95.0, 1.0);
+        manager.submit(order);
+
+        assert_eq!(manager.num_pending(), 1);
+
+        // Price still below trigger — no fill
+        manager.check_pending_orders(94.0, &ctx);
+        assert_eq!(manager.num_pending(), 1);
+
+        // Price rises to trigger level — fills immediately
+        manager.check_pending_orders(95.0, &ctx);
+        assert_eq!(manager.num_pending(), 0);
+        assert_eq!(manager.num_filled(), 1);
+    }
+
+    #[test]
+    fn test_stoplimit_sell_triggers_on_fall() {
+        let mut manager = OrderManager::new();
+        let btc_id = InstrumentId::new("BTCUSDT", "BINANCE");
+        let ctx = EngineContext::new(10000.0);
+
+        // Sell StopLimit at 95 — triggers when price falls to or below 95
+        let order = manager.new_order(btc_id, OrderSide::Sell, OrderType::StopLimit, 95.0, 1.0);
+        manager.submit(order);
+
+        assert_eq!(manager.num_pending(), 1);
+
+        // Price still above trigger — no fill
+        manager.check_pending_orders(96.0, &ctx);
+        assert_eq!(manager.num_pending(), 1);
+
+        // Price falls to trigger level — fills immediately
+        manager.check_pending_orders(94.0, &ctx);
+        assert_eq!(manager.num_pending(), 0);
+        assert_eq!(manager.num_filled(), 1);
+    }
+
+    #[test]
+    fn test_stoplimit_does_not_fill_before_trigger() {
+        let mut manager = OrderManager::new();
+        let btc_id = InstrumentId::new("BTCUSDT", "BINANCE");
+        let ctx = EngineContext::new(10000.0);
+
+        // Sell StopLimit at 95
+        let order = manager.new_order(btc_id, OrderSide::Sell, OrderType::StopLimit, 95.0, 1.0);
+        manager.submit(order);
+
+        // Price far above — no fill
+        for price in [100.0, 99.0, 97.0, 96.0].iter() {
+            manager.check_pending_orders(*price, &ctx);
+            assert_eq!(manager.num_pending(), 1, "price={}", price);
+        }
         assert_eq!(manager.num_filled(), 0);
     }
 }
