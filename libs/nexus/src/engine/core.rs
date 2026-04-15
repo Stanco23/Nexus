@@ -1,20 +1,10 @@
-//! Backtest engine — tick-by-tick and bar-mode simulation.
-//!
-//! # Architecture
-//! - `BacktestEngine` — main entry point, runs backtest loop
-//! - `EngineContext` — mutable state during backtest (position, equity, draws)
-//! - `Trade` — recorded fill with PnL
-//! - `Signal` — Buy/Sell/Close from strategy
-//! - `BacktestResult` — final results (equity curve, trades, stats)
-//!
-//! # Commission Math
-//! Applied on BOTH entry AND exit for both long and short:
-//! - Commission: `price * size * rate` on each fill
-//! - Long PnL: `(exit - entry) * size - total_commission`
-//! - Short PnL: `(entry - exit) * size - total_commission`
+//! Backtest engine — tick-by-tick simulation.
 
-use crate::buffer::tick_buffer::TickBuffer;
+use crate::book::{OrderBook, OrderEmulator, OrderId, Side};
+use crate::buffer::tick_buffer::{TickBuffer, TradeFlowStats};
+use crate::engine::orders::OrderManager;
 use crate::instrument::InstrumentId;
+use crate::slippage::SlippageConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -118,7 +108,11 @@ pub struct BacktestEngine {
     _instrument_id: InstrumentId,
     initial_equity: f64,
     commission: CommissionConfig,
-    data: Option<Vec<(u64, f64, f64)>>,
+    slippage_config: SlippageConfig,
+    order_book: OrderBook,
+    order_emulator: OrderEmulator,
+    order_manager: OrderManager,
+    data: Option<Vec<(u64, f64, f64, f64)>>,
     result: Option<BacktestResult>,
 }
 
@@ -128,6 +122,10 @@ impl BacktestEngine {
             _instrument_id: instrument_id,
             initial_equity,
             commission: CommissionConfig::default(),
+            slippage_config: SlippageConfig::new(),
+            order_book: OrderBook::new(),
+            order_emulator: OrderEmulator::new(),
+            order_manager: OrderManager::new(),
             data: None,
             result: None,
         }
@@ -138,13 +136,14 @@ impl BacktestEngine {
     }
 
     pub fn set_tick_buffer(&mut self, buffer: &TickBuffer) {
-        let ticks: Vec<(u64, f64, f64)> = buffer
+        let ticks: Vec<(u64, f64, f64, f64)> = buffer
             .iter()
             .map(|tick| {
                 (
                     tick.timestamp_ns,
                     tick.price_int as f64 / 1_000_000_000.0,
                     tick.size_int as f64 / 1_000_000_000.0,
+                    tick.vpin,
                 )
             })
             .collect();
@@ -157,8 +156,78 @@ impl BacktestEngine {
         let mut last_signal = Signal::Close;
 
         let data = self.data.take().expect("No data set");
-        for (timestamp, price, size) in data {
-            let signal = strategy.on_tick(timestamp, price, size, &mut ctx);
+        for (timestamp, price, size, vpin) in data {
+            // Build TradeFlowStats for OrderBook update
+            let tick = TradeFlowStats {
+                timestamp_ns: timestamp,
+                price_int: (price * 1_000_000_000.0) as i64,
+                size_int: (size * 1_000_000_000.0) as i64,
+                side: 0,
+                cum_buy_volume: 0,
+                cum_sell_volume: 0,
+                vpin,
+                bucket_index: 0,
+            };
+            self.order_book.update_from_trade(&tick);
+
+            // Update order emulator market volume
+            self.order_emulator.update_market_volume(size);
+
+            // Process pending limit order fills — update positions based on queue fills
+            let fills = self.order_emulator.process_fills(price, vpin, timestamp);
+            for fill in &fills {
+                let fill_signal = if fill.side == Side::Buy { Signal::Buy } else { Signal::Sell };
+
+                // If fill is Buy but we have a short position, close it first
+                if fill_signal == Signal::Buy && ctx.position < 0.0 {
+                    self.close_position(fill.timestamp_ns, fill.fill_price, &mut ctx, &mut trades);
+                }
+                // If fill is Sell but we have a long position, close it first
+                if fill_signal == Signal::Sell && ctx.position > 0.0 {
+                    self.close_position(fill.timestamp_ns, fill.fill_price, &mut ctx, &mut trades);
+                }
+
+                // Open or add to position
+                let is_add = ctx.position != 0.0
+                    && ((fill_signal == Signal::Buy && ctx.position > 0.0)
+                        || (fill_signal == Signal::Sell && ctx.position < 0.0));
+
+                if is_add {
+                    // Add to existing position (average in)
+                    let old_pos = ctx.position.abs();
+                    let new_pos = fill.fill_size;
+                    ctx.entry_price = (ctx.entry_price * old_pos + fill.fill_price * new_pos) / (old_pos + new_pos);
+                    ctx.position = if fill_signal == Signal::Buy { old_pos + new_pos } else { -(old_pos + new_pos) };
+                    let comm = self.commission.compute(fill.fill_price, fill.fill_size);
+                    ctx.equity -= comm;
+                    trades.push(Trade {
+                        timestamp_ns: fill.timestamp_ns,
+                        side: fill_signal,
+                        price: fill.fill_price,
+                        size: fill.fill_size,
+                        commission: comm,
+                        pnl: 0.0,
+                    });
+                    ctx.num_trades += 1;
+                } else {
+                    // Open new position
+                    self.open_position(fill.timestamp_ns, fill.fill_price, fill.fill_size, fill_signal, &mut ctx, &mut trades);
+                }
+            }
+
+            // Check SL/TP (takes priority over pending fills)
+            let sl_tp_signal = self.order_manager.check_sl_tp(price, &ctx);
+            let _pending_signal = self.order_manager.check_pending_orders(price, &ctx);
+            let _ = _pending_signal; // suppress unused warning until wired
+
+            // Allow strategy to submit limit orders before signal processing
+            strategy.on_tick_orders(timestamp, price, &mut ctx);
+
+            // Determine final signal for this tick (SL/TP overrides pending)
+            let mut signal = strategy.on_tick(timestamp, price, size, &mut ctx);
+            if sl_tp_signal == Some(Signal::Close) {
+                signal = Signal::Close;
+            }
 
             if signal != last_signal {
                 match signal {
@@ -223,14 +292,19 @@ impl BacktestEngine {
         ctx: &mut EngineContext,
         trades: &mut Vec<Trade>,
     ) {
-        let comm = self.commission.compute(price, size);
+        // Compute slippage: order_size in ticks vs avg tick size
+        let order_size_ticks = (size / 0.001).max(1.0); // rough tick size estimate
+        let impact_bps = self.slippage_config.compute_impact_bps(order_size_ticks, 0.0);
+        let fill_price = price * (1.0 + impact_bps / 10_000.0);
+
+        let comm = self.commission.compute(fill_price, size);
         ctx.equity -= comm;
         ctx.position = if side == Signal::Buy { size } else { -size };
-        ctx.entry_price = price;
+        ctx.entry_price = fill_price;
         trades.push(Trade {
             timestamp_ns: timestamp,
             side,
-            price,
+            price: fill_price,
             size,
             commission: comm,
             pnl: 0.0,
@@ -245,13 +319,17 @@ impl BacktestEngine {
         ctx: &mut EngineContext,
         trades: &mut Vec<Trade>,
     ) {
-        let comm = self.commission.compute(price, ctx.position.abs());
+        let order_size_ticks = (ctx.position.abs() / 0.001).max(1.0);
+        let impact_bps = self.slippage_config.compute_impact_bps(order_size_ticks, 0.0);
+        let fill_price = price * (1.0 - impact_bps / 10_000.0);
+
+        let comm = self.commission.compute(fill_price, ctx.position.abs());
         ctx.equity -= comm;
 
         let pnl = if ctx.position > 0.0 {
-            (price - ctx.entry_price) * ctx.position.abs()
+            (fill_price - ctx.entry_price) * ctx.position.abs()
         } else {
-            (ctx.entry_price - price) * ctx.position.abs()
+            (ctx.entry_price - fill_price) * ctx.position.abs()
         };
         ctx.equity += pnl;
 
@@ -263,7 +341,7 @@ impl BacktestEngine {
         trades.push(Trade {
             timestamp_ns: timestamp,
             side,
-            price,
+            price: fill_price,
             size: ctx.position.abs(),
             commission: comm,
             pnl,
@@ -286,6 +364,18 @@ pub trait Strategy {
         size: f64,
         ctx: &mut EngineContext,
     ) -> Signal;
+
+    /// Optional: submit limit orders before the main signal is processed.
+    /// Default implementation does nothing. Override to submit limit orders
+    /// via `ctx.submit_limit_order(...)`.
+    #[inline(always)]
+    fn on_tick_orders(&mut self, _timestamp_ns: u64, _price: f64, _ctx: &mut EngineContext) {}
+
+    /// Submit a limit order to the emulator queue.
+    /// Can be called from `on_tick_orders`.
+    fn submit_limit_order(&self, price: f64, size: f64, side: Side, timestamp_ns: u64, emulator: &mut OrderEmulator) -> OrderId {
+        emulator.submit_limit(price, size, side, timestamp_ns)
+    }
 }
 
 #[cfg(test)]
