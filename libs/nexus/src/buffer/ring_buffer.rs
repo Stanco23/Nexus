@@ -13,7 +13,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::buffer::buffer_set::InstrumentId;
+use crate::instrument::InstrumentId;
 use tvc::types::{ANCHOR_TICK_SIZE, HEADER_SIZE, INDEX_ENTRY_SIZE};
 use tvc::{AnchorIndexEntry, TradeTick, TvcHeader};
 
@@ -585,8 +585,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_instrument_id_type() {
-        let id: InstrumentId = 12345u64;
-        assert_eq!(id, 12345);
+    fn test_instrument_id_in_buffer() {
+        let id = InstrumentId::new("ETHUSDT", "BINANCE");
+        assert_eq!(id.id, fnv1a_hash(b"ETHUSDT.BINANCE"));
+    }
+
+    fn fnv1a_hash(data: &[u8]) -> u32 {
+        let mut hash: u32 = 0x811c9dc5;
+        for byte in data {
+            hash ^= *byte as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+        hash
     }
 }

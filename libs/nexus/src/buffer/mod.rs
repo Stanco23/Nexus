@@ -9,8 +9,6 @@ pub mod ring_buffer;
 pub mod tick_buffer;
 
 pub use bar_aggregation::{Bar, BarAggregator, BarBuffer, BarIter, BarPeriod};
-pub use buffer_set::{
-    InstrumentId, MergeCursor, MultiInstrumentEvent, RingBufferSet, TickBufferSet,
-};
+pub use buffer_set::{MergeCursor, MultiInstrumentEvent, RingBufferSet, TickBufferSet};
 pub use ring_buffer::{RingBuffer, RingBufferError, RingIter};
 pub use tick_buffer::{TickBuffer, TickBufferError, TickIter, TradeFlowStats};

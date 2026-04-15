@@ -9,8 +9,8 @@
 //! `data/aggregation.pyx` (bar aggregation logic)
 //! `data/wranglers.pyx` (bar types)
 
-use super::buffer_set::InstrumentId;
 use super::tick_buffer::{TickBuffer, TradeFlowStats};
+use crate::instrument::InstrumentId;
 
 /// OHLCV bar structure.
 #[derive(Debug, Clone, PartialEq)]
@@ -265,8 +265,10 @@ mod tests {
     }
 
     #[test]
-    fn test_instrument_id_type() {
-        let id: InstrumentId = 12345u64;
-        assert_eq!(id, 12345);
+    fn test_instrument_id_in_buffers() {
+        let id1 = InstrumentId::new("BTCUSDT", "BINANCE");
+        let id2 = InstrumentId::new("ETHUSDT", "BINANCE");
+        assert_ne!(id1, id2);
+        assert_eq!(id1, id1);
     }
 }

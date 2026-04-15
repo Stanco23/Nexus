@@ -1,12 +1,17 @@
 //! Integration tests for TickBuffer using actual TVC files.
 
 use nexus::buffer::{RingBuffer, TickBuffer};
+use nexus::instrument::InstrumentId;
 use std::fs;
 use std::path::Path;
 use tvc::{TradeTick, TvcWriter};
 
 fn clean_file(path: &Path) {
     let _ = fs::remove_file(path);
+}
+
+fn test_instrument_id() -> InstrumentId {
+    InstrumentId::new("BTCUSDT", "BINANCE")
 }
 
 // =============================================================================
@@ -17,6 +22,8 @@ fn clean_file(path: &Path) {
 fn test_vpin_computation_simple() {
     let path = Path::new("/tmp/test_vpin_simple.tvc");
     clean_file(path);
+
+    let inst_id = test_instrument_id();
 
     // 100 ticks, 50 buckets (2 ticks per bucket)
     let mut writer = TvcWriter::new(path, 1u32, 50, 9).unwrap();
@@ -37,7 +44,7 @@ fn test_vpin_computation_simple() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     let tick_buffer = TickBuffer::from_ring_buffer(&buffer, 50).unwrap();
 
     assert_eq!(tick_buffer.num_ticks(), 100);
@@ -57,6 +64,8 @@ fn test_vpin_computation_simple() {
 fn test_vpin_known_values() {
     let path = Path::new("/tmp/test_vpin_known.tvc");
     clean_file(path);
+
+    let inst_id = test_instrument_id();
 
     // Create 20 ticks with known buy/sell pattern
     // Ticks 0-1: buy 100, sell 0 → VPIN = 1.0
@@ -102,7 +111,7 @@ fn test_vpin_known_values() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     let tick_buffer = TickBuffer::from_ring_buffer(&buffer, 10).unwrap();
 
     assert_eq!(tick_buffer.num_ticks(), 20);
@@ -128,6 +137,8 @@ fn test_tick_buffer_from_ring_buffer() {
     let path = Path::new("/tmp/test_tb_from_rb.tvc");
     clean_file(path);
 
+    let inst_id = test_instrument_id();
+
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1_000_000_000u64;
 
@@ -144,12 +155,12 @@ fn test_tick_buffer_from_ring_buffer() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     assert_eq!(rb.num_ticks(), 100);
 
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
     assert_eq!(tb.num_ticks(), 100);
-    assert_eq!(tb.instrument_id(), 1u64);
+    assert_eq!(tb.instrument_id(), inst_id);
     assert_eq!(tb.num_buckets(), 10);
 
     clean_file(path);
@@ -163,6 +174,8 @@ fn test_tick_buffer_from_ring_buffer() {
 fn test_bucket_vpin() {
     let path = Path::new("/tmp/test_bucket_vpin.tvc");
     clean_file(path);
+
+    let inst_id = test_instrument_id();
 
     let mut writer = TvcWriter::new(path, 1u32, 50, 9).unwrap();
     let start_ts = 1_000_000_000u64;
@@ -182,7 +195,7 @@ fn test_bucket_vpin() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     let tick_buffer = TickBuffer::from_ring_buffer(&buffer, 10).unwrap();
 
     assert_eq!(tick_buffer.num_ticks(), 100);
@@ -220,6 +233,8 @@ fn test_tick_buffer_iter() {
     let path = Path::new("/tmp/test_tb_iter.tvc");
     clean_file(path);
 
+    let inst_id = test_instrument_id();
+
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1_000_000_000u64;
 
@@ -236,7 +251,7 @@ fn test_tick_buffer_iter() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 5).unwrap();
 
     let ticks: Vec<_> = tb.iter().collect();
@@ -260,6 +275,8 @@ fn test_vpin_at_timestamp() {
     let path = Path::new("/tmp/test_vpin_at_ts.tvc");
     clean_file(path);
 
+    let inst_id = test_instrument_id();
+
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1_000_000_000u64;
 
@@ -276,7 +293,7 @@ fn test_vpin_at_timestamp() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     let tick_buffer = TickBuffer::from_ring_buffer(&buffer, 10).unwrap();
 
     // Test VPIN at a known timestamp

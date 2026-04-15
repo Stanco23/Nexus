@@ -1,12 +1,21 @@
 //! Integration tests for RingBuffer using actual TVC files.
 
 use nexus::buffer::RingBuffer;
+use nexus::instrument::InstrumentId;
 use std::fs;
 use std::path::Path;
 use tvc::{TradeTick, TvcWriter};
 
 fn clean_file(path: &Path) {
     let _ = fs::remove_file(path);
+}
+
+fn btc_instrument_id() -> InstrumentId {
+    InstrumentId::new("BTCUSDT", "BINANCE")
+}
+
+fn eth_instrument_id() -> InstrumentId {
+    InstrumentId::new("ETHUSDT", "BINANCE")
 }
 
 // =============================================================================
@@ -17,6 +26,8 @@ fn clean_file(path: &Path) {
 fn test_ring_buffer_two_ticks() {
     let path = Path::new("/tmp/test_two_ticks.tvc");
     clean_file(path);
+
+    let inst_id = btc_instrument_id();
 
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1000u64;
@@ -34,7 +45,7 @@ fn test_ring_buffer_two_ticks() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     assert_eq!(buffer.num_ticks(), 2);
     assert_eq!(buffer.num_anchors(), 1);
 
@@ -50,6 +61,8 @@ fn test_ring_buffer_two_ticks() {
 fn test_ring_buffer_ten_ticks() {
     let path = Path::new("/tmp/test_ten_ticks.tvc");
     clean_file(path);
+
+    let inst_id = btc_instrument_id();
 
     // 10 ticks, anchor every 10 means only tick 0 is anchor
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
@@ -68,7 +81,7 @@ fn test_ring_buffer_ten_ticks() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     assert_eq!(buffer.num_ticks(), 10);
     assert_eq!(buffer.num_anchors(), 1);
 
@@ -90,6 +103,8 @@ fn test_ring_buffer_multiple_anchors() {
     let path = Path::new("/tmp/test_multi_anchor.tvc");
     clean_file(path);
 
+    let inst_id = btc_instrument_id();
+
     // 25 ticks, anchor every 10 -> anchors at tick 0, 10, 20
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1000u64;
@@ -107,7 +122,7 @@ fn test_ring_buffer_multiple_anchors() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     assert_eq!(buffer.num_ticks(), 25);
     assert_eq!(buffer.num_anchors(), 3); // 0, 10, 20
 
@@ -129,6 +144,8 @@ fn test_ring_buffer_seek_to_tick() {
     let path = Path::new("/tmp/test_seek.tvc");
     clean_file(path);
 
+    let inst_id = btc_instrument_id();
+
     // 100 ticks, anchor every 10
     let mut writer = TvcWriter::new(path, 123u32, 10, 9).unwrap();
     let start_ts = 5000u64;
@@ -146,7 +163,7 @@ fn test_ring_buffer_seek_to_tick() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 123u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
 
     // Seek to tick 0
     let (offset, anchor_tick) = buffer.seek_to_tick(0).unwrap();
@@ -180,6 +197,8 @@ fn test_ring_buffer_binary_search_all_ticks() {
     let path = Path::new("/tmp/test_binary_search.tvc");
     clean_file(path);
 
+    let inst_id = btc_instrument_id();
+
     // 100 ticks, anchor every 10
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 10000u64;
@@ -197,7 +216,7 @@ fn test_ring_buffer_binary_search_all_ticks() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
 
     // Verify every tick's timestamp by seeking to it
     for target in [0u64, 5, 9, 10, 15, 20, 50, 99] {
@@ -223,6 +242,8 @@ fn test_ring_buffer_time_range() {
     let path = Path::new("/tmp/test_time_range.tvc");
     clean_file(path);
 
+    let inst_id = btc_instrument_id();
+
     // 1000 ticks at 1000ns intervals, anchor every 100
     let mut writer = TvcWriter::new(path, 1u32, 100, 9).unwrap();
     let start_ts = 1_000_000_000u64; // 1 second
@@ -240,7 +261,7 @@ fn test_ring_buffer_time_range() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
 
     // Iterate range: ticks from ts=1_000_050_000 to 1_000_100_000
     // That's ticks 50 through 100 (51 ticks)
@@ -274,6 +295,8 @@ fn test_ring_buffer_set_single_file() {
     let path = Path::new("/tmp/test_rbset_single.tvc");
     clean_file(path);
 
+    let inst_id = InstrumentId::new("INST111", "BINANCE");
+
     let mut writer = TvcWriter::new(path, 111u32, 50, 9).unwrap();
     for i in 0..200u64 {
         let tick = TradeTick::new(
@@ -288,11 +311,11 @@ fn test_ring_buffer_set_single_file() {
     }
     writer.finalize().unwrap();
 
-    let set = RingBufferSet::single(path, 111u64).unwrap();
+    let set = RingBufferSet::single(path, inst_id).unwrap();
     assert_eq!(set.num_instruments(), 1);
     assert_eq!(set.total_ticks(), 200);
 
-    let buf = set.get(111u64).unwrap();
+    let buf = set.get(inst_id).unwrap();
     assert_eq!(buf.num_ticks(), 200);
 
     clean_file(path);
@@ -304,6 +327,9 @@ fn test_ring_buffer_set_two_instruments() {
     let path2 = Path::new("/tmp/test_rbset_2.tvc");
     clean_file(path1);
     clean_file(path2);
+
+    let inst_id1 = InstrumentId::new("INST1", "BINANCE");
+    let inst_id2 = InstrumentId::new("INST2", "BINANCE");
 
     // Instrument 1: 100 ticks
     let mut w1 = TvcWriter::new(path1, 1u32, 20, 9).unwrap();
@@ -335,15 +361,17 @@ fn test_ring_buffer_set_two_instruments() {
     }
     w2.finalize().unwrap();
 
-    let set =
-        RingBufferSet::from_files([(PathBuf::from(path1), 1u64), (PathBuf::from(path2), 2u64)])
-            .unwrap();
+    let set = RingBufferSet::from_files([
+        (PathBuf::from(path1), inst_id1),
+        (PathBuf::from(path2), inst_id2),
+    ])
+    .unwrap();
 
     assert_eq!(set.num_instruments(), 2);
     assert_eq!(set.total_ticks(), 150);
 
-    let buf1 = set.get(1u64).unwrap();
-    let buf2 = set.get(2u64).unwrap();
+    let buf1 = set.get(inst_id1).unwrap();
+    let buf2 = set.get(inst_id2).unwrap();
     assert_eq!(buf1.num_ticks(), 100);
     assert_eq!(buf2.num_ticks(), 50);
 
@@ -359,6 +387,8 @@ fn test_ring_buffer_set_two_instruments() {
 fn test_ring_iter_exact_size() {
     let path = Path::new("/tmp/test_exact_size.tvc");
     clean_file(path);
+
+    let inst_id = btc_instrument_id();
 
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 100u64;
@@ -376,7 +406,7 @@ fn test_ring_iter_exact_size() {
     }
     writer.finalize().unwrap();
 
-    let buffer = RingBuffer::open(path, 1u64).unwrap();
+    let buffer = RingBuffer::open(path, inst_id).unwrap();
     let iter = buffer.iter();
 
     // Check size_hint

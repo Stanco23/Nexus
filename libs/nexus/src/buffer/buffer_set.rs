@@ -10,11 +10,7 @@ use std::sync::Arc;
 
 use super::ring_buffer::{RingBuffer, RingBufferError};
 use super::tick_buffer::{TickBuffer, TradeFlowStats};
-
-/// Instrument ID type.
-///
-/// Currently using a u64. In production this could be a FNV-1a hash of (exchange, symbol).
-pub type InstrumentId = u64;
+use crate::instrument::InstrumentId;
 
 /// A set of RingBuffers, one per instrument, with a merged anchor index.
 ///
@@ -374,8 +370,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_instrument_id_type() {
-        let id: InstrumentId = 12345u64;
-        assert_eq!(id, 12345);
+    fn test_ring_buffer_set_empty() {
+        let set = RingBufferSet::from_files(std::iter::empty());
+        assert!(set.is_ok());
+        assert_eq!(set.unwrap().num_instruments(), 0);
     }
 }

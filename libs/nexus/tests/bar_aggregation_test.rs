@@ -1,12 +1,17 @@
 //! Integration tests for Bar Aggregation using actual TVC files.
 
 use nexus::buffer::{BarBuffer, BarPeriod, RingBuffer, TickBuffer};
+use nexus::instrument::InstrumentId;
 use std::fs;
 use std::path::Path;
 use tvc::{TradeTick, TvcWriter};
 
 fn clean_file(path: &Path) {
     let _ = fs::remove_file(path);
+}
+
+fn test_instrument_id() -> InstrumentId {
+    InstrumentId::new("BTCUSDT", "BINANCE")
 }
 
 // =============================================================================
@@ -17,6 +22,8 @@ fn clean_file(path: &Path) {
 fn test_bar_buffer_from_tick_buffer() {
     let path = Path::new("/tmp/test_bar_buffer.tvc");
     clean_file(path);
+
+    let inst_id = test_instrument_id();
 
     // Create TVC with 100 ticks over 1 second interval
     let mut writer = TvcWriter::new(path, 1u32, 100, 9).unwrap();
@@ -35,7 +42,7 @@ fn test_bar_buffer_from_tick_buffer() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
 
     // Build 1-second bars
@@ -45,7 +52,7 @@ fn test_bar_buffer_from_tick_buffer() {
     // Should get ~1 bar (actually depends on aggregation)
     assert!(bar_buffer.num_bars() > 0);
     assert_eq!(bar_buffer.period(), BarPeriod::OneSecond);
-    assert_eq!(bar_buffer.instrument_id(), 1u64);
+    assert_eq!(bar_buffer.instrument_id(), inst_id);
 
     clean_file(path);
 }
@@ -54,6 +61,8 @@ fn test_bar_buffer_from_tick_buffer() {
 fn test_bar_aggregation_1m_intervals() {
     let path = Path::new("/tmp/test_bar_1m.tvc");
     clean_file(path);
+
+    let inst_id = test_instrument_id();
 
     // Create TVC with ticks at 1-minute intervals
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
@@ -73,7 +82,7 @@ fn test_bar_aggregation_1m_intervals() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
 
     // Build 1-second bars
@@ -104,6 +113,8 @@ fn test_bar_high_low_tracking() {
     let path = Path::new("/tmp/test_bar_hl.tvc");
     clean_file(path);
 
+    let inst_id = test_instrument_id();
+
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1_000_000_000u64;
 
@@ -122,7 +133,7 @@ fn test_bar_high_low_tracking() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
     let bar_buffer = BarBuffer::from_tick_buffer(&tb, BarPeriod::OneSecond);
 
@@ -139,6 +150,8 @@ fn test_bar_high_low_tracking() {
 fn test_bar_buy_sell_volume() {
     let path = Path::new("/tmp/test_bar_vol.tvc");
     clean_file(path);
+
+    let inst_id = test_instrument_id();
 
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1_000_000_000u64;
@@ -158,7 +171,7 @@ fn test_bar_buy_sell_volume() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
     let bar_buffer = BarBuffer::from_tick_buffer(&tb, BarPeriod::OneSecond);
 
@@ -177,6 +190,8 @@ fn test_bar_iteration() {
     let path = Path::new("/tmp/test_bar_iter.tvc");
     clean_file(path);
 
+    let inst_id = test_instrument_id();
+
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1_000_000_000u64;
 
@@ -193,7 +208,7 @@ fn test_bar_iteration() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
     let bar_buffer = BarBuffer::from_tick_buffer(&tb, BarPeriod::OneSecond);
 
@@ -217,6 +232,8 @@ fn test_bar_output_matches_manual() {
     let path = Path::new("/tmp/test_bar_manual.tvc");
     clean_file(path);
 
+    let inst_id = test_instrument_id();
+
     let mut writer = TvcWriter::new(path, 1u32, 100, 9).unwrap();
     let start_ts = 1_000_000_000u64;
 
@@ -234,7 +251,7 @@ fn test_bar_output_matches_manual() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
 
     // Manually compute expected bar values
@@ -268,6 +285,8 @@ fn test_multiple_bar_periods() {
     let path = Path::new("/tmp/test_multi_period.tvc");
     clean_file(path);
 
+    let inst_id = test_instrument_id();
+
     let mut writer = TvcWriter::new(path, 1u32, 10, 9).unwrap();
     let start_ts = 1_000_000_000u64;
 
@@ -285,7 +304,7 @@ fn test_multiple_bar_periods() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, 1u64).unwrap();
+    let rb = RingBuffer::open(path, inst_id).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
 
     // 1-minute bars: 120 ticks / 60 ticks per minute = 2 bars

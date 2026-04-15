@@ -13,7 +13,7 @@
 //! `backtest/engine.pyx` (VPIN concepts)
 
 use super::ring_buffer::RingBuffer;
-use crate::buffer::buffer_set::InstrumentId;
+use crate::instrument::InstrumentId;
 
 /// Pre-decoded trade tick with VPIN and cumulative volume tracking.
 ///
@@ -220,8 +220,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_instrument_id_type() {
-        let id: InstrumentId = 12345u64;
-        assert_eq!(id, 12345);
+    fn test_trade_flow_stats_creation() {
+        let stats = TradeFlowStats {
+            timestamp_ns: 1000000,
+            price_int: 50_000_000_000_i64,
+            size_int: 1_000_000_000_i64,
+            side: 1,
+            cum_buy_volume: 1000,
+            cum_sell_volume: 500,
+            vpin: 0.5,
+            bucket_index: 0,
+        };
+        assert_eq!(stats.timestamp_ns, 1000000);
+        assert_eq!(stats.price_int, 50_000_000_000_i64);
     }
 }

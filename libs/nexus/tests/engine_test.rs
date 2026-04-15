@@ -1,6 +1,4 @@
 use nexus::engine::{CommissionConfig, EngineContext, Signal, Strategy};
-use nexus::instrument::InstrumentId;
-use std::cell::RefCell;
 
 struct SimpleBuyThenCloseStrategy {
     buy_at_tick: usize,

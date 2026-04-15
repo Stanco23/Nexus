@@ -85,7 +85,7 @@ impl FromStr for Symbol {
 ///
 /// The instrument_id is a 32-bit FNV-1a hash of the normalized string
 /// representation (symbol in uppercase, venue in uppercase, joined by '.').
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct InstrumentId {
     pub id: u32, // FNV-1a hash of "SYMBOL.VENUE"
 }
