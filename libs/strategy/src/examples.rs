@@ -1,7 +1,8 @@
 //! Example strategy implementations.
 
 use crate::context::StrategyCtx;
-use crate::types::{BacktestMode, Bar, InstrumentId, ParameterSchema, Signal, Tick};
+use crate::indicators::{Indicator, Rsi};
+use crate::types::{BacktestMode, Bar, InstrumentId, ParameterSchema, ParameterType, ParameterValue, Signal, Tick};
 use crate::Strategy;
 
 /// EMA Crossover Strategy.
@@ -14,7 +15,6 @@ pub struct EmaCrossStrategy {
     // Runtime state
     fast_ema: f64,
     slow_ema: f64,
-    last_price: f64,
     initialized: bool,
 }
 
@@ -26,23 +26,8 @@ impl EmaCrossStrategy {
             instrument_id,
             fast_ema: 0.0,
             slow_ema: 0.0,
-            last_price: 0.0,
             initialized: false,
         }
-    }
-
-    fn update_ema(&mut self, price: f64) {
-        let alpha = 2.0 / (self.fast_period as f64 + 1.0);
-        if !self.initialized {
-            self.fast_ema = price;
-            self.slow_ema = price;
-            self.initialized = true;
-        } else {
-            self.fast_ema = price * alpha + self.fast_ema * (1.0 - alpha);
-            let slow_alpha = 2.0 / (self.slow_period as f64 + 1.0);
-            self.slow_ema = price * slow_alpha + self.slow_ema * (1.0 - slow_alpha);
-        }
-        self.last_price = price;
     }
 }
 
@@ -60,7 +45,22 @@ impl Strategy for EmaCrossStrategy {
     }
 
     fn parameters(&self) -> Vec<ParameterSchema> {
-        vec![]
+        vec![
+            ParameterSchema {
+                name: "fast_period".into(),
+                param_type: ParameterType::Int,
+                default: ParameterValue::Int(12),
+                bounds: Some((1.0, 200.0)),
+                description: "Fast EMA period".into(),
+            },
+            ParameterSchema {
+                name: "slow_period".into(),
+                param_type: ParameterType::Int,
+                default: ParameterValue::Int(26),
+                bounds: Some((1.0, 200.0)),
+                description: "Slow EMA period".into(),
+            },
+        ]
     }
 
     fn clone_box(&self) -> Box<dyn Strategy> {
@@ -70,7 +70,6 @@ impl Strategy for EmaCrossStrategy {
             instrument_id: self.instrument_id.clone(),
             fast_ema: self.fast_ema,
             slow_ema: self.slow_ema,
-            last_price: self.last_price,
             initialized: self.initialized,
         })
     }
@@ -85,19 +84,28 @@ impl Strategy for EmaCrossStrategy {
             return None;
         }
 
-        self.update_ema(tick.price);
-
-        if !self.initialized || self.last_price == 0.0 {
+        if !self.initialized {
+            self.fast_ema = tick.price;
+            self.slow_ema = tick.price;
+            self.initialized = true;
             return None;
         }
 
+        let prev_fast = self.fast_ema;
+        let prev_slow = self.slow_ema;
+
+        let alpha = 2.0 / (self.fast_period as f64 + 1.0);
+        self.fast_ema = tick.price * alpha + self.fast_ema * (1.0 - alpha);
+        let slow_alpha = 2.0 / (self.slow_period as f64 + 1.0);
+        self.slow_ema = tick.price * slow_alpha + self.slow_ema * (1.0 - slow_alpha);
+
         // Buy signal: fast EMA crosses above slow EMA
-        if self.fast_ema > self.slow_ema && self.last_price < self.slow_ema {
+        if self.fast_ema > self.slow_ema && prev_fast <= prev_slow {
             return Some(Signal::Buy);
         }
 
         // Sell signal: fast EMA crosses below slow EMA
-        if self.fast_ema < self.slow_ema && self.last_price > self.slow_ema {
+        if self.fast_ema < self.slow_ema && prev_fast >= prev_slow {
             return Some(Signal::Sell);
         }
 
@@ -113,7 +121,16 @@ impl Strategy for EmaCrossStrategy {
         if instrument_id != self.instrument_id {
             return None;
         }
-        self.update_ema(bar.close);
+        if !self.initialized {
+            self.fast_ema = bar.close;
+            self.slow_ema = bar.close;
+            self.initialized = true;
+            return None;
+        }
+        let alpha = 2.0 / (self.fast_period as f64 + 1.0);
+        self.fast_ema = bar.close * alpha + self.fast_ema * (1.0 - alpha);
+        let slow_alpha = 2.0 / (self.slow_period as f64 + 1.0);
+        self.slow_ema = bar.close * slow_alpha + self.slow_ema * (1.0 - slow_alpha);
         None
     }
 }
@@ -127,9 +144,8 @@ pub struct RsiStrategy {
     pub oversold: f64,
     pub instrument_id: InstrumentId,
     // Runtime state
-    gains: Vec<f64>,
-    losses: Vec<f64>,
-    last_price: f64,
+    rsi: Rsi,
+    last_signal: Option<Signal>,
 }
 
 impl RsiStrategy {
@@ -144,43 +160,9 @@ impl RsiStrategy {
             overbought,
             oversold,
             instrument_id,
-            gains: Vec::new(),
-            losses: Vec::new(),
-            last_price: 0.0,
+            rsi: Rsi::new(period),
+            last_signal: None,
         }
-    }
-
-    fn compute_rsi(&self) -> f64 {
-        if self.gains.is_empty() {
-            return 50.0;
-        }
-        let avg_gain: f64 = self.gains.iter().sum::<f64>() / self.period as f64;
-        let avg_loss: f64 = self.losses.iter().sum::<f64>() / self.period as f64;
-        if avg_loss == 0.0 {
-            return 100.0;
-        }
-        let rs = avg_gain / avg_loss;
-        100.0 - (100.0 / (1.0 + rs))
-    }
-
-    fn update_rsi(&mut self, price: f64) {
-        if self.last_price == 0.0 {
-            self.last_price = price;
-            return;
-        }
-        let change = price - self.last_price;
-        if change > 0.0 {
-            self.gains.push(change);
-            self.losses.push(0.0);
-        } else {
-            self.gains.push(0.0);
-            self.losses.push(change.abs());
-        }
-        if self.gains.len() > self.period {
-            self.gains.remove(0);
-            self.losses.remove(0);
-        }
-        self.last_price = price;
     }
 }
 
@@ -198,7 +180,29 @@ impl Strategy for RsiStrategy {
     }
 
     fn parameters(&self) -> Vec<ParameterSchema> {
-        vec![]
+        vec![
+            ParameterSchema {
+                name: "period".into(),
+                param_type: ParameterType::Int,
+                default: ParameterValue::Int(14),
+                bounds: Some((2.0, 100.0)),
+                description: "RSI averaging period".into(),
+            },
+            ParameterSchema {
+                name: "overbought".into(),
+                param_type: ParameterType::Float,
+                default: ParameterValue::Float(70.0),
+                bounds: Some((50.0, 95.0)),
+                description: "Overbought threshold".into(),
+            },
+            ParameterSchema {
+                name: "oversold".into(),
+                param_type: ParameterType::Float,
+                default: ParameterValue::Float(30.0),
+                bounds: Some((5.0, 50.0)),
+                description: "Oversold threshold".into(),
+            },
+        ]
     }
 
     fn clone_box(&self) -> Box<dyn Strategy> {
@@ -207,9 +211,8 @@ impl Strategy for RsiStrategy {
             overbought: self.overbought,
             oversold: self.oversold,
             instrument_id: self.instrument_id.clone(),
-            gains: self.gains.clone(),
-            losses: self.losses.clone(),
-            last_price: self.last_price,
+            rsi: self.rsi.clone(),
+            last_signal: self.last_signal,
         })
     }
 
@@ -223,16 +226,18 @@ impl Strategy for RsiStrategy {
             return None;
         }
 
-        self.update_rsi(tick.price);
-        let rsi = self.compute_rsi();
+        let rsi_value = self.rsi.update(tick.price);
+        self.last_signal = None;
 
-        if rsi < self.oversold {
-            Some(Signal::Buy)
-        } else if rsi > self.overbought {
-            Some(Signal::Sell)
-        } else {
-            None
+        if let Some(rsi) = rsi_value {
+            if rsi < self.oversold {
+                self.last_signal = Some(Signal::Buy);
+            } else if rsi > self.overbought {
+                self.last_signal = Some(Signal::Sell);
+            }
         }
+
+        self.last_signal
     }
 
     fn on_bar(
@@ -244,7 +249,7 @@ impl Strategy for RsiStrategy {
         if instrument_id != self.instrument_id {
             return None;
         }
-        self.update_rsi(bar.close);
+        self.rsi.update(bar.close);
         None
     }
 }

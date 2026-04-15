@@ -96,6 +96,7 @@ impl Indicator for Ema {
 // ─── Momentum Indicators ─────────────────────────────────────────────────────
 
 /// Relative Strength Index.
+#[derive(Clone)]
 pub struct Rsi {
     period: usize,
     gains: VecDeque<f64>,
