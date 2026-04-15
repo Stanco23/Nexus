@@ -4,8 +4,10 @@
 
 pub mod core;
 pub mod orders;
+pub mod sizing;
 
 pub use core::{
     BacktestEngine, BacktestResult, CommissionConfig, EngineContext, Signal, Strategy, Trade,
 };
 pub use orders::{Order, OrderManager, OrderSide, OrderType};
+pub use sizing::{Sizing, SizingConfig, SizingMethod};
