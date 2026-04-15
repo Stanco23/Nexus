@@ -1,5 +1,6 @@
 //! Strategy context trait — what strategies can query from the engine.
 
+use crate::signals::SignalCallback;
 use crate::types::{InstrumentId, Order, OrderSide, OrderType, PositionSide, Signal};
 
 /// Strategy execution context — queryable state during backtest runs.
@@ -24,6 +25,9 @@ pub trait StrategyCtx: Send + Sync {
 
     /// Subscribe to one or more instruments.
     fn subscribe_instruments(&mut self, instruments: Vec<InstrumentId>);
+
+    /// Subscribe to a named signal. The callback is invoked when the signal fires.
+    fn subscribe_signal(&mut self, name: &str, callback: SignalCallback);
 
     /// Submit a limit order.
     fn submit_limit(

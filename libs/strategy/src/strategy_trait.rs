@@ -40,6 +40,12 @@ pub trait Strategy: Send + Sync {
         bar: &Bar,
         ctx: &mut dyn StrategyCtx,
     ) -> Option<Signal>;
+
+    /// Called when a subscribed named signal fires.
+    ///
+    /// Default implementation: no-op. Strategies that subscribe to signals
+    /// (e.g., via `StrategyCtx::subscribe_signal`) receive them here.
+    fn on_signal(&mut self, _name: &str, _value: f64, _timestamp_ns: u64) {}
 }
 
 impl Clone for Box<dyn Strategy> {
