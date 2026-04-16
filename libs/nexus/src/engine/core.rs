@@ -1,10 +1,17 @@
 //! Backtest engine — tick-by-tick simulation.
 
+use std::sync::{Arc, Mutex};
+
+use crate::actor::MessageBus;
 use crate::book::{OrderBook, OrderEmulator, OrderId, Side};
 use crate::buffer::tick_buffer::{TickBuffer, TradeFlowStats};
-use crate::engine::orders::OrderManager;
+use crate::cache::Cache;
+use crate::engine::account::OmsType;
+use crate::engine::oms::Oms;
+use crate::engine::orders::{check_sl_tp, OrderManager};
 use crate::engine::risk::RiskEngine;
 use crate::instrument::InstrumentId;
+use crate::messages::{ClientOrderId, OrderFilled, StrategyId, TraderId};
 use crate::slippage::SlippageConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +42,8 @@ pub struct EngineContext {
     pub entry_price: f64,
     pub num_trades: usize,
     pub equity_curve: Vec<f64>,
+    /// Current VPIN value from the most recent tick (used for slippage in close_position).
+    pub current_vpin: f64,
 }
 
 impl EngineContext {
@@ -47,6 +56,7 @@ impl EngineContext {
             entry_price: 0.0,
             num_trades: 0,
             equity_curve: Vec::new(),
+            current_vpin: 0.0,
         }
     }
 
@@ -136,6 +146,8 @@ pub struct BacktestEngine {
     slippage_config: SlippageConfig,
     order_book: OrderBook,
     order_emulator: OrderEmulator,
+    oms: Oms,
+    strategy_id: StrategyId,
     order_manager: OrderManager,
     risk_engine: Option<RiskEngine>,
     data: Option<Vec<(u64, f64, f64, f64)>>,
@@ -143,7 +155,14 @@ pub struct BacktestEngine {
 }
 
 impl BacktestEngine {
-    pub fn new(instrument_id: InstrumentId, initial_equity: f64) -> Self {
+    pub fn new(
+        instrument_id: InstrumentId,
+        initial_equity: f64,
+        oms_type: OmsType,
+        strategy_id: StrategyId,
+        cache: Arc<Mutex<Cache>>,
+        msgbus: Arc<MessageBus>,
+    ) -> Self {
         Self {
             _instrument_id: instrument_id,
             initial_equity,
@@ -151,6 +170,8 @@ impl BacktestEngine {
             slippage_config: SlippageConfig::new(),
             order_book: OrderBook::new(),
             order_emulator: OrderEmulator::new(),
+            oms: Oms::new(cache, msgbus, oms_type),
+            strategy_id,
             order_manager: OrderManager::new(),
             risk_engine: None,
             data: None,
@@ -160,6 +181,10 @@ impl BacktestEngine {
 
     pub fn set_commission(&mut self, rate: f64) {
         self.commission = CommissionConfig::new(rate);
+    }
+
+    pub fn set_slippage_config(&mut self, config: SlippageConfig) {
+        self.slippage_config = config;
     }
 
     pub fn set_tick_buffer(&mut self, buffer: &TickBuffer) {
@@ -188,6 +213,8 @@ impl BacktestEngine {
 
         let data = self.data.take().expect("No data set");
         for (timestamp, price, size, vpin) in data {
+            ctx.current_vpin = vpin;
+
             // Build TradeFlowStats for OrderBook update
             let tick = TradeFlowStats {
                 timestamp_ns: timestamp,
@@ -208,6 +235,26 @@ impl BacktestEngine {
             let fills = self.order_emulator.process_fills(price, vpin, timestamp, self.commission.maker_fee);
             for fill in &fills {
                 let fill_signal = if fill.side == Side::Buy { Signal::Buy } else { Signal::Sell };
+
+                // Apply fill to OMS first (backtest path: limit order fills go through Oms)
+                let order_filled = OrderFilled::new(
+                    TraderId::new("BACKTEST"),
+                    self.strategy_id.clone(),
+                    ClientOrderId::new(&format!("limit-{}", fill.order_id)),
+                    crate::messages::VenueOrderId::new(&fill.order_id.to_string()),
+                    crate::messages::PositionId::new(""),
+                    crate::messages::TradeId::new(""),
+                    format!("{}", self._instrument_id),
+                    if fill.side == Side::Buy { crate::messages::OrderSide::Buy } else { crate::messages::OrderSide::Sell },
+                    fill.fill_size,
+                    fill.fill_price,
+                    timestamp,
+                    timestamp,
+                );
+                self.oms.apply_fill_no_publish(
+                    &ClientOrderId::new(&format!("limit-{}", fill.order_id)),
+                    &order_filled,
+                );
 
                 // If fill is Buy but we have a short position, close it first
                 if fill_signal == Signal::Buy && ctx.position < 0.0 {
@@ -248,16 +295,21 @@ impl BacktestEngine {
                 }
             }
 
-            // Check SL/TP (takes priority over pending fills)
-            let sl_tp_signal = self.order_manager.check_sl_tp(price, &ctx);
-            let _pending_signal = self.order_manager.check_pending_orders(price, &ctx);
-            let _ = _pending_signal; // suppress unused warning until wired
+            // Process pending fills (trader-submitted orders carry intent priority)
+            let pending_signal = self.order_manager.check_pending_orders(price);
 
             // Allow strategy to submit limit orders before signal processing
             strategy.on_tick_orders(timestamp, price, &mut ctx);
 
-            // Determine final signal for this tick (SL/TP overrides pending)
+            // Determine final signal for this tick:
+            // 1. Start with strategy signal
+            // 2. Pending fills override strategy (trader intent > algorithm)
             let mut signal = strategy.on_tick(timestamp, price, size, &mut ctx);
+            if let Some(ps) = pending_signal {
+                signal = ps;
+            }
+            // 3. SL/TP always wins (circuit breaker — overrides everything)
+            let sl_tp_signal = check_sl_tp(self.order_manager.pending_orders(), ctx.position, price);
             if sl_tp_signal == Some(Signal::Close) {
                 signal = Signal::Close;
             }
@@ -364,6 +416,26 @@ impl BacktestEngine {
         ctx.entry_price = avg_fill_price;
 
         for fill in &fills {
+            // Apply market order fill to OMS
+            let order_filled = OrderFilled::new(
+                TraderId::new("BACKTEST"),
+                self.strategy_id.clone(),
+                ClientOrderId::new(&format!("market-{}", fill.order_id)),
+                crate::messages::VenueOrderId::new(&fill.order_id.to_string()),
+                crate::messages::PositionId::new(""),
+                crate::messages::TradeId::new(""),
+                format!("{}", self._instrument_id),
+                if fill.side == Side::Buy { crate::messages::OrderSide::Buy } else { crate::messages::OrderSide::Sell },
+                fill.fill_size,
+                fill.fill_price,
+                timestamp,
+                timestamp,
+            );
+            self.oms.apply_fill_no_publish(
+                &ClientOrderId::new(&format!("market-{}", fill.order_id)),
+                &order_filled,
+            );
+
             trades.push(Trade {
                 timestamp_ns: fill.timestamp_ns,
                 side,
@@ -386,7 +458,7 @@ impl BacktestEngine {
         trades: &mut Vec<Trade>,
     ) {
         let order_size_ticks = (ctx.position.abs() / 0.001).max(1.0);
-        let impact_bps = self.slippage_config.compute_impact_bps(order_size_ticks, 0.0);
+        let impact_bps = self.slippage_config.compute_impact_bps(order_size_ticks, ctx.current_vpin);
         let fill_price = price * (1.0 - impact_bps / 10_000.0);
 
         let comm = self.commission.compute(fill_price, ctx.position.abs());

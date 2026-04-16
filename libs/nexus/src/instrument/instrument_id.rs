@@ -162,7 +162,7 @@ impl fmt::Display for IdError {
 impl std::error::Error for IdError {}
 
 /// Compute FNV-1a hash of a byte string (32-bit).
-fn fnv1a_hash(data: &[u8]) -> u32 {
+pub fn fnv1a_hash(data: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c9dc5;
     for byte in data {
         hash ^= *byte as u32;

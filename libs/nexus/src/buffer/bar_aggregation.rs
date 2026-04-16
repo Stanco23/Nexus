@@ -24,6 +24,7 @@ pub struct Bar {
     pub buy_volume: i64,
     pub sell_volume: i64,
     pub tick_count: u32,
+    pub instrument_id: InstrumentId,
 }
 
 /// Bar time period in nanoseconds.
@@ -63,20 +64,23 @@ impl BarPeriod {
 
 /// Aggregator for building bars from tick data.
 pub struct BarAggregator {
+    instrument_id: InstrumentId,
     period_ns: u64,
     current_bar: Option<Bar>,
 }
 
 impl BarAggregator {
-    pub fn new(period: BarPeriod) -> Self {
+    pub fn new(period: BarPeriod, instrument_id: InstrumentId) -> Self {
         Self {
+            instrument_id,
             period_ns: period.as_ns(),
             current_bar: None,
         }
     }
 
-    pub fn with_period_ns(period_ns: u64) -> Self {
+    pub fn with_period_ns(period_ns: u64, instrument_id: InstrumentId) -> Self {
         Self {
+            instrument_id,
             period_ns,
             current_bar: None,
         }
@@ -122,6 +126,7 @@ impl BarAggregator {
             buy_volume: buy_vol,
             sell_volume: sell_vol,
             tick_count: 1,
+            instrument_id: self.instrument_id,
         });
     }
 
@@ -144,6 +149,25 @@ impl BarAggregator {
         self.current_bar.take()
     }
 
+    /// Called by DataEngine on each clock advance.
+    /// If the timestamp crosses a bar period boundary and a bar is open,
+    /// closes and returns it. This enables clock-driven bar closing
+    /// independent of tick arrivals.
+    pub fn advance_time(&mut self, timestamp_ns: u64) -> Option<Bar> {
+        let bar_start = self.bar_start(timestamp_ns);
+
+        if let Some(ref mut bar) = self.current_bar {
+            if bar.timestamp_ns < bar_start {
+                // Clock moved past this bar's period — close it.
+                self.current_bar.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.current_bar.is_none()
     }
@@ -151,7 +175,7 @@ impl BarAggregator {
 
 /// Build bars from a TickBuffer.
 pub fn build_bars(tick_buffer: &TickBuffer, period: BarPeriod) -> Vec<Bar> {
-    let mut aggregator = BarAggregator::new(period);
+    let mut aggregator = BarAggregator::new(period, tick_buffer.instrument_id());
     let mut bars = Vec::new();
 
     for tick in tick_buffer.iter() {

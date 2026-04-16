@@ -122,6 +122,35 @@ impl OrderEmulator {
         }
     }
 
+    /// New emulator with a custom slippage configuration.
+    pub fn new_with_config(config: SlippageConfig) -> Self {
+        Self {
+            slippage_config: config,
+            ..Self::new()
+        }
+    }
+
+    /// Cancel a specific queued order by ID.
+    /// Returns true if the order was found and removed.
+    pub fn cancel_order(&mut self, order_id: OrderId) -> bool {
+        // Remove from pending Vec
+        if let Some(pos) = self.pending.iter().position(|qo| qo.order_id == order_id) {
+            let qo = self.pending.remove(pos);
+            // Remove from bid or ask queue
+            let price_key = qo.price_int;
+            let queues = if qo.side == Side::Buy {
+                &mut self.bid_queues
+            } else {
+                &mut self.ask_queues
+            };
+            if let Some(level) = queues.get_mut(&price_key) {
+                level.orders.retain(|&id| id != order_id);
+            }
+            return true;
+        }
+        false
+    }
+
     /// Submit a limit order to the queue at the specified price level.
     pub fn submit_limit(
         &mut self,
@@ -184,6 +213,19 @@ impl OrderEmulator {
         avg_market_volume: f64,
         maker_fee: f64,
     ) -> Option<FillEvent> {
+        // Check price crossing before fill probability:
+        // - BUY limit: fills when market price drops to or below the limit price
+        //   (I want to buy at P or better — lower is better for buyer)
+        // - SELL limit: fills when market price rises to or above the limit price
+        //   (I want to sell at P or better — higher is better for seller)
+        let price_crossed = match qo.side {
+            Side::Buy => current_price <= qo.price,
+            Side::Sell => current_price >= qo.price,
+        };
+        if !price_crossed {
+            return None;
+        }
+
         let prob = {
             let base_prob = 1.0 / (1.0 + qo.queue_position as f64 * 0.1);
             let volume_ratio = (market_volume / avg_market_volume).clamp(0.1, 2.0);

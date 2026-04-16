@@ -1,25 +1,8 @@
-//! VPIN slippage model — realistic fill simulation using Volume-synchronized Probability of Informed Trading.
-//!
-//! # VPIN Formula
-//! VPIN = |cum_buy - cum_sell| / (cum_buy + cum_sell)
-//! VPIN is already computed in TickBuffer per bucket.
-//!
-//! # Slippage Model
-//! - `compute_fill_delay()`: delay based on adverse selection probability
-//! - `compute_impact_bps()`: price impact based on order size and VPIN
-//! - Combined: `fill_price = market_price_at(timestamp + delay) * (1 + impact_bps / 10000)`
-//!
-//! # Constants
-//! - Adverse probability: `vpin * 0.5`
-//! - Delay ticks: `ceil(order_size * adverse_prob * 1.5)`
-//! - Delay cap: 200ms
-//! - Size impact: `min(sqrt(order_size)/100, 10.0)` bps
-//! - VPIN impact: `min(vpin * 5.0, 5.0)` bps
-//! - Total impact cap: 15 bps
+//! VPIN slippage model — fill delay and price impact using Volume-synchronized Probability of Informed Trading.
 
 use std::f64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct SlippageConfig {
     pub delay_multiplier: f64,
     pub delay_cap_ns: u64,

@@ -38,6 +38,10 @@ cargo test --workspace     # all tests
 
 A phase is complete only when: zero warnings + all tests pass + integration test + wired to system.
 
+## Nautilus Source Convention
+
+Before implementing any phase, read the referenced Nautilus source file(s). Path convention: `~/Nautilus/nautilus_trader/nautilus_trader/<path>`. This prevents stub code and ensures Nexus behavior matches Nautilus production. The roadmap entry for each phase lists the specific source files to read first.
+
 ## No AI/UI/DSL
 
 Core engine only. No AI features, no UI, no strategy DSL. Plain Rust strategies via `Box<dyn Strategy>`.

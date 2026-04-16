@@ -3,6 +3,7 @@
 //! Provides a central registry for all instruments with fast lookup
 //! by instrument_id and validation of instrument compatibility.
 
+use crate::instrument::instrument_id::fnv1a_hash;
 use crate::instrument::Instrument;
 use std::collections::HashMap;
 
@@ -32,14 +33,8 @@ impl InstrumentRegistry {
 
     /// Get an instrument by symbol and venue.
     pub fn get_by_symbol(&self, symbol: &str, venue: &str) -> Option<&Instrument> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hasher;
         let raw = format!("{}.{}", symbol.to_uppercase(), venue.to_uppercase());
-        let mut h = DefaultHasher::new();
-        for byte in raw.as_bytes() {
-            h.write_u8(*byte);
-        }
-        let id = (h.finish() & 0xFFFFFFFF) as u32;
+        let id = fnv1a_hash(raw.as_bytes());
         self.get(id)
     }
 

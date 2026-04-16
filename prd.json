@@ -1,0 +1,141 @@
+{
+  "project": "Nexus Phase 5.3 \u2014 Order Management System (OMS)",
+  "phase": "5.3",
+  "dependsOn": [
+    "5.2"
+  ],
+  "exitCriteria": "Oms central order state machine wired across all modes (live, paper, backtest). position_id assigned at submit time. OrderState transitions explicit. Cache.oms_orders authoritative.",
+  "stories": [
+    {
+      "id": "US-5.3-01",
+      "name": "Create engine/oms.rs \u2014 OrderState, OmsOrder, Oms",
+      "description": "Create libs/nexus/src/engine/oms.rs with OrderState enum, OmsOrder struct, Oms struct with Arc<Cache>, Arc<MsgBus>, PositionIdGenerator, OmsType. Methods: submit_order, apply_accepted, apply_fill, apply_fill_no_publish, cancel, apply_rejection.",
+      "acceptanceCriteria": [
+        "OrderState enum has variants: Pending, Accepted, PartiallyFilled, Filled, Cancelled, Rejected",
+        "OmsOrder struct has all required fields: client_order_id, venue_order_id: Option<VenueOrderId>, position_id, state: OrderState, filled_qty, last_fill_price, submitted_at_ns, strategy_id, instrument_id, order_side",
+        "Oms struct holds cache: Arc<Cache>, msgbus: Arc<MsgBus>, position_id_gen: PositionIdGenerator, oms_type: OmsType",
+        "Oms::new(cache, msgbus, oms_type) compiles and constructs Oms with all fields",
+        "Oms::submit_order() calls position_id_gen.next_with_oms() and returns PositionId",
+        "Oms::apply_accepted(), apply_fill(), apply_fill_no_publish(), cancel(), apply_rejection() all compile with correct signatures",
+        "cargo build -p nexus compiles engine/oms.rs with zero warnings"
+      ],
+      "priority": "high",
+      "passes": true
+    },
+    {
+      "id": "US-5.3-02",
+      "name": "Add Cache::oms_orders map + indices + update_oms_order",
+      "description": "Add oms_orders HashMap, new index fields (open/closed/strategy/instrument), update_oms_order() with full index maintenance, get_oms_order(). Modify get_order() to return None for OMS orders during transition.",
+      "acceptanceCriteria": [
+        "Cache struct has oms_orders: HashMap<ClientOrderId, OmsOrder>",
+        "Cache struct has index_oms_orders_open: HashSet<ClientOrderId>",
+        "Cache struct has index_oms_orders_closed: HashSet<ClientOrderId>",
+        "Cache struct has index_oms_orders_strategy: HashMap<StrategyId, HashSet<ClientOrderId>>",
+        "Cache struct has index_oms_orders_instrument: HashMap<InstrumentId, HashSet<ClientOrderId>>",
+        "Cache::update_oms_order(order: OmsOrder) inserts into oms_orders AND updates all indices",
+        "Cache::get_oms_order(client_order_id) -> Option<&OmsOrder> added",
+        "Cache::get_order() returns None when oms_orders contains the order (transition signal)",
+        "cargo build -p nexus compiles with zero warnings"
+      ],
+      "priority": "high",
+      "passes": true
+    },
+    {
+      "id": "US-5.3-03",
+      "name": "Wire Oms into ExecutionClient (live path)",
+      "description": "ExecutionClient owns an Oms instance. submit_order(): oms.submit_order() -> HTTP place_order -> returns (VenueOrderId, PositionId). apply_accepted() called from handle_execution_report() on WS NEW event. Fill/cancel/reject flow through Oms.",
+      "acceptanceCriteria": [
+        "ExecutionClient struct has oms: Oms field",
+        "ExecutionClient::new() constructs Oms::new(cache.clone(), Arc::new(msgbus), oms_type)",
+        "ExecutionClient::submit_order(&mut self, submit: SubmitOrder) -> Result<(VenueOrderId, PositionId), BinanceApiError>",
+        "submit_order calls oms.submit_order() then http.place_order() then returns (venue_order_id, position_id)",
+        "handle_execution_report() calls oms.apply_accepted() on NEW status",
+        "handle_execution_report() calls oms.apply_fill() on PARTIALLY_FILLED/FILLED status",
+        "handle_execution_report() calls oms.cancel() on CANCELED/EXPIRED status",
+        "handle_execution_report() calls oms.apply_rejection() on REJECTED status",
+        "pending_orders HashMap removed from ExecutionClient",
+        "cargo build -p nexus compiles with zero warnings"
+      ],
+      "priority": "high",
+      "passes": true
+    },
+    {
+      "id": "US-5.3-04",
+      "name": "Wire Oms into PaperBroker (paper path)",
+      "description": "PaperBroker replaces client_position_map and client_order_map with Oms instance. process_order() calls oms.submit_order() then oms.apply_fill_no_publish(). cancel_order() calls oms.cancel(). No double-publishing since fills are returned directly.",
+      "acceptanceCriteria": [
+        "PaperBroker struct replaces client_position_map/client_order_map with oms: Oms",
+        "PaperBroker::new() constructs Oms::new(cache.clone(), Arc::new(msgbus), oms_type)",
+        "process_order() calls oms.submit_order() for position_id",
+        "process_order() calls oms.apply_fill_no_publish() for fills (not apply_fill to avoid double-publish)",
+        "cancel_order() calls oms.cancel()",
+        "client_position_map and client_order_map fields removed",
+        "cargo build -p nexus compiles with zero warnings"
+      ],
+      "priority": "high",
+      "passes": true
+    },
+    {
+      "id": "US-5.3-05",
+      "name": "Wire Oms into BacktestEngine (backtest path)",
+      "description": "BacktestEngine owns an Oms instance with strategy_id. Constructor takes oms_type, strategy_id, cache, msgbus as new params. Order submissions go through Oms::submit_order() in run() loop. Limit fills go through Oms::apply_fill() in process_fills(). Market fills go through Oms::apply_fill() in open_position(). check_pending_orders and check_sl_tp extracted as standalone functions.",
+      "acceptanceCriteria": [
+        "BacktestEngine::new() takes oms_type: OmsType, strategy_id: StrategyId, cache: Arc<Cache>, msgbus: Arc<MsgBus> as new params",
+        "BacktestEngine struct has oms: Oms and strategy_id: StrategyId fields",
+        "BacktestEngine constructs Oms::new(cache, Arc::new(msgbus), oms_type)",
+        "order_manager: OrderManager field removed from BacktestEngine struct",
+        "run() loop calls self.oms.submit_order() when order is submitted",
+        "process_fills() calls self.oms.apply_fill() before open_position()",
+        "open_position() calls self.oms.apply_fill() for market order fills",
+        "check_pending_orders() and check_sl_tp() extracted as standalone functions in orders.rs",
+        "cargo test -p nexus --lib passes with migrated tests"
+      ],
+      "priority": "high",
+      "passes": true
+    },
+    {
+      "id": "US-5.3-06",
+      "name": "Update engine/mod.rs exports + retire OrderManager",
+      "description": "Export Oms, OmsOrder, OrderState from engine/mod.rs. Remove OrderManager struct from BacktestEngine. Order type with SL/TP stays in orders.rs.",
+      "acceptanceCriteria": [
+        "engine/mod.rs has 'pub mod oms' and 'pub use oms::{Oms, OmsOrder, OrderState}'",
+        "engine/orders.rs not deleted \u2014 Order type with SL/TP fields stays",
+        "OrderManager struct removed from BacktestEngine",
+        "cargo build -p nexus compiles with zero warnings"
+      ],
+      "priority": "high",
+      "passes": true
+    },
+    {
+      "id": "US-5.3-07",
+      "name": "Zero warnings, all tests pass",
+      "description": "Final verification: build clean, all tests pass, clippy clean.",
+      "acceptanceCriteria": [
+        "cargo build -p nexus produces zero warnings",
+        "cargo test -p nexus --lib passes all tests",
+        "cargo clippy -p nexus --deny warnings passes",
+        "New OMS unit tests in engine/oms.rs pass"
+      ],
+      "priority": "high",
+      "passes": true
+    }
+  ],
+  "notes": {
+    "architecture": {
+      "oms_location": "engine/oms.rs \u2014 shared by backtest, live, and paper",
+      "cache_state": "oms_orders becomes authoritative; orders map deprecated during transition",
+      "position_id": "generated at submit_order time via PositionIdGenerator.next_with_oms()",
+      "msgbus_wiring": "Oms stores Arc<MsgBus>, self-publishes without requiring mutable caller reference",
+      "backtest_fill_paths": "limit orders: process_fills() -> Oms::apply_fill(); market orders: open_position() -> Oms::apply_fill()",
+      "paper_no_double_publish": "PaperBroker uses apply_fill_no_publish() since fills are returned directly"
+    },
+    "known_limitations": [
+      "get_order() returns None for OMS orders during transition \u2014 should add #[deprecated] note in Phase 5.4",
+      "Backtest path has no VenueOrderId mechanism (not meaningful for backtest)"
+    ],
+    "deferred": [
+      "Phase 5.4: Remove legacy orders map, migrate all get_order() callers to get_oms_order()",
+      "Phase 5.4: Add #[deprecated] to get_order()"
+    ]
+  }
+}

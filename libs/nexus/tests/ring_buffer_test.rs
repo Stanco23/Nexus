@@ -237,7 +237,6 @@ fn test_ring_buffer_binary_search_all_ticks() {
 // =============================================================================
 
 #[test]
-#[ignore] // TODO: implement time range iteration correctly
 fn test_ring_buffer_time_range() {
     let path = Path::new("/tmp/test_time_range.tvc");
     clean_file(path);

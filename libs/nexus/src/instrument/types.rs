@@ -6,6 +6,7 @@
 use crate::instrument::enums::{
     AssetClass, ExerciseStyle, InstrumentClass, OptionKind, SettlementType,
 };
+use crate::instrument::instrument_id::fnv1a_hash;
 use serde::{Deserialize, Serialize};
 
 /// Base instrument with all common fields.
@@ -66,14 +67,8 @@ impl Instrument {
         quote_currency: &str,
         kind: InstrumentKind,
     ) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hasher;
         let raw = format!("{}.{}", symbol.to_uppercase(), venue.to_uppercase());
-        let mut h = DefaultHasher::new();
-        for byte in raw.as_bytes() {
-            h.write_u8(*byte);
-        }
-        let id = (h.finish() & 0xFFFFFFFF) as u32;
+        let id = fnv1a_hash(raw.as_bytes());
 
         Self {
             id,
@@ -509,14 +504,5 @@ mod tests {
         assert_ne!(h1, h2);
         // But stable across calls
         assert_eq!(h1, fnv1a_hash(b"BTCUSDT.BINANCE"));
-    }
-
-    fn fnv1a_hash(data: &[u8]) -> u32 {
-        let mut hash: u32 = 0x811c9dc5;
-        for byte in data {
-            hash ^= *byte as u32;
-            hash = hash.wrapping_mul(0x01000193);
-        }
-        hash
     }
 }

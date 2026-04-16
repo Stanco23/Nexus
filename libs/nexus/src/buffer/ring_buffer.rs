@@ -245,6 +245,97 @@ impl RingBuffer {
         Ok((entry.byte_offset as usize, entry.tick_index))
     }
 
+    /// Binary search to find the anchor at or before the given timestamp.
+    ///
+    /// Returns (byte_offset, tick_index, decoded_tick) for the anchor.
+    /// Uses estimated tick position + anchor walk to efficiently locate the target.
+    pub fn seek_to_time_ns(&self, target_ns: u64) -> Result<(usize, u64, TradeTick), RingBufferError> {
+        // Quick bounds check
+        if target_ns < self.header.start_time_ns {
+            return Err(RingBufferError::TickNotFound(target_ns));
+        }
+
+        let duration_ns = self.header.end_time_ns.saturating_sub(self.header.start_time_ns);
+        let num_ticks = self.header.num_ticks.saturating_sub(1);
+        let avg_tick_ns = if num_ticks > 0 {
+            duration_ns / num_ticks
+        } else {
+            1000
+        };
+
+        let estimated_tick = if avg_tick_ns > 0 {
+            ((target_ns - self.header.start_time_ns) / avg_tick_ns)
+                .min(self.header.num_ticks.saturating_sub(1))
+        } else {
+            0
+        };
+
+        // Binary search on anchor tick_index to find anchor <= estimated_tick
+        let mut left = 0;
+        let mut right = self.anchor_index.len();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            if self.anchor_index[mid].tick_index <= estimated_tick {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        // left is first entry where tick_index > estimated_tick
+        // So left-1 is the anchor we want (at or before estimated position)
+        let mut start_slot = left.saturating_sub(1).max(0);
+        let mut offset = self.anchor_index[start_slot].byte_offset as usize;
+        let mut tick_index = self.anchor_index[start_slot].tick_index;
+
+        // Decode anchor at this position
+        let mut last_tick = self.decode_anchor_at(offset)?;
+
+        // If anchor timestamp already > target_ns, we're past — return this anchor
+        if last_tick.timestamp_ns > target_ns {
+            return Ok((offset, tick_index, last_tick));
+        }
+
+        // Advance offset past the anchor we just decoded
+        offset += ANCHOR_TICK_SIZE;
+        tick_index += 1;
+
+        // Walk forward through deltas/anchors until timestamp >= target_ns or end of buffer
+        loop {
+            if tick_index >= self.header.num_ticks {
+                break;
+            }
+            if last_tick.timestamp_ns >= target_ns {
+                break;
+            }
+
+            // Check if next tick is an anchor slot
+            let next_anchor_tick = ((tick_index / self.anchor_interval as u64) + 1) * self.anchor_interval as u64;
+
+            if tick_index + 1 == next_anchor_tick && start_slot + 1 < self.anchor_index.len() {
+                // Next tick is an anchor — advance to it
+                start_slot += 1;
+                offset = self.anchor_index[start_slot].byte_offset as usize;
+                last_tick = self.decode_anchor_at(offset)?;
+                tick_index += 1;
+            } else {
+                // Delta tick
+                let result = self.decode_delta_at(offset, &last_tick);
+                match result {
+                    Ok((tick, consumed)) => {
+                        offset += consumed;
+                        last_tick = tick;
+                        tick_index += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        Ok((offset, tick_index, last_tick))
+    }
+
     /// Get the first anchor byte offset (start of data after header).
     pub fn first_anchor_offset(&self) -> usize {
         HEADER_SIZE
@@ -349,7 +440,7 @@ impl RingBuffer {
             const TIMESTAMP_EXTRA_SHIFT: u32 = 20;
             const OVERFLOW_SIDE_SHIFT: u32 = 20;
             const OVERFLOW_FLAGS_SHIFT: u32 = 21;
-            const TIMESTAMP_DELTA_MASK: u32 = 0xFFFFF;
+            const TIMESTAMP_DELTA_MASK: u32 = 0xFFFFF; // 20 bits, matches types.rs
 
             let extra_bits = (((ts_extra_raw >> 1) & 0x7FFF) as u64) << TIMESTAMP_EXTRA_SHIFT;
             let base_packed = u32::from_le_bytes([
@@ -392,9 +483,9 @@ impl RingBuffer {
                 self.mmap[byte_offset + 3],
             ]);
 
-            const TIMESTAMP_DELTA_MASK: u32 = 0xFFFFF;
-            const PRICE_ZIGZAG_MASK: u32 = 0x7FFFF;
-            const PRICE_ZIGZAG_SHIFT: u32 = 20;
+            const TIMESTAMP_DELTA_MASK: u32 = 0xFFFFF; // 20 bits, matches types.rs
+            const PRICE_ZIGZAG_MASK: u32 = 0x7FFFF; // 19 bits, matches types.rs
+            const PRICE_ZIGZAG_SHIFT: u32 = 20; // matches types.rs
 
             let ts_delta = packed & TIMESTAMP_DELTA_MASK;
             let price_zigzag_raw = (packed >> PRICE_ZIGZAG_SHIFT) & PRICE_ZIGZAG_MASK;
@@ -480,22 +571,25 @@ impl<'a> RingIter<'a> {
         }
     }
 
-    /// Create an iterator for a time range.
-    fn range(buffer: &'a RingBuffer, _start_ns: u64, end_ns: u64) -> Self {
-        let first_offset = buffer.first_anchor_offset();
-        let first_tick = buffer
-            .decode_anchor_at(first_offset)
-            .expect("Failed to decode first anchor");
+    /// Create an iterator for a time range [start_ns, end_ns].
+    fn range(buffer: &'a RingBuffer, start_ns: u64, end_ns: u64) -> Self {
+        let (offset, tick_index, first_tick) = buffer
+            .seek_to_time_ns(start_ns)
+            .expect("Failed to seek to start_ns");
+
+        let anchor_interval = buffer.anchor_interval() as u64;
+        let current_anchor_index = tick_index / anchor_interval;
+        let next_anchor_tick = (current_anchor_index + 1) * anchor_interval;
 
         Self {
             buffer,
-            current_offset: first_offset,
-            current_tick_index: 0,
+            current_offset: offset,
+            current_tick_index: tick_index,
             last_tick: first_tick,
             end_ns,
             started: false,
-            next_anchor_tick: buffer.anchor_interval() as u64,
-            anchor_slot: 1,
+            next_anchor_tick,
+            anchor_slot: current_anchor_index as usize + 1,
         }
     }
 
@@ -518,23 +612,37 @@ impl<'a> Iterator for RingIter<'a> {
         }
 
         // Check end_ns before returning
-        if self.last_tick.timestamp_ns > self.end_ns {
+        // For iter(): end_ns = u64::MAX, use > check (original behavior)
+        // For iter_range(): end_ns = specific value, use >= check (exclusive end)
+        let past_end = if self.end_ns == u64::MAX {
+            self.last_tick.timestamp_ns > self.end_ns
+        } else {
+            self.last_tick.timestamp_ns >= self.end_ns
+        };
+        if past_end {
             return None;
         }
 
-        // On first iteration, return the first anchor (tick 0)
+        // On first iteration, return the initial tick
+        // For iter(): the initial tick is always an anchor, advance by ANCHOR_TICK_SIZE
+        // For iter_range(): the initial tick could be an anchor OR a delta, don't advance
         if !self.started {
             self.started = true;
-            self.current_offset += ANCHOR_TICK_SIZE;
-            self.current_tick_index += 1;
-            self.anchor_slot = 1;
+            // Only advance if this is a full iteration (end_ns == u64::MAX)
+            if self.end_ns == u64::MAX {
+                self.current_offset += ANCHOR_TICK_SIZE;
+                self.current_tick_index += 1;
+                self.anchor_slot = 1;
+            }
+            // For range iteration, don't advance - the seek already positioned us correctly
 
             return Some(self.last_tick);
         }
 
-        // Check if we're at the next anchor in the sequence
-        if (self.anchor_slot as u64) < self.buffer.anchor_index().len() as u64
-            && self.current_tick_index == self.buffer.anchor_index()[self.anchor_slot].tick_index
+        // Check if the current position is at an anchor (we've already decoded it, checking from current position)
+        let next_idx = self.anchor_slot;
+        if next_idx < self.buffer.anchor_index().len()
+            && self.current_tick_index == self.buffer.anchor_index()[next_idx].tick_index
         {
             match self.buffer.decode_anchor_at(self.current_offset) {
                 Ok(tick) => {

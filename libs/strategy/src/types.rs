@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+// Re-export from nexus for use across strategy implementations
+pub use nexus::messages::{OmsType, PositionId, StrategyId};
+
 /// Bar OHLCV structure for bar-mode backtesting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bar {
