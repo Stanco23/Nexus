@@ -47,3 +47,33 @@ pub struct SubscribeBars {
 pub struct UnsubscribeBars {
     pub endpoint: String,
 }
+
+/// Subscribe to quote ticks for an instrument.
+#[derive(Debug, Clone)]
+pub struct SubscribeQuotes {
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub instrument_id: InstrumentId,
+    pub endpoint: String,
+}
+
+/// Unsubscribe from quote ticks.
+#[derive(Debug, Clone)]
+pub struct UnsubscribeQuotes {
+    pub endpoint: String,
+}
+
+/// Subscribe to order book updates for an instrument.
+#[derive(Debug, Clone)]
+pub struct SubscribeOrderBooks {
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub instrument_id: InstrumentId,
+    pub endpoint: String,
+}
+
+/// Unsubscribe from order book updates.
+#[derive(Debug, Clone)]
+pub struct UnsubscribeOrderBooks {
+    pub endpoint: String,
+}

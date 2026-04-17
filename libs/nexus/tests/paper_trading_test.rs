@@ -1,6 +1,6 @@
 //! Paper Trading Integration Tests
 
-use nexus::actor::MessageBus;
+use nexus::actor::{MessageBus, TestClock};
 use nexus::book::{OrderBook, OrderEmulator, Side};
 use nexus::cache::Cache;
 use nexus::engine::account::{Account, AccountId, Currency, OmsType};
@@ -289,7 +289,7 @@ fn test_data_engine_process_trade() {
     use nexus::data::DataEngine;
     use nexus::instrument::InstrumentId;
 
-    let mut engine = DataEngine::new();
+    let mut engine = DataEngine::new(Box::new(TestClock::new()));
     let btc = InstrumentId::new("BTCUSDT", "BINANCE");
 
     // Subscribe to BTC trades

@@ -27,6 +27,8 @@ hmac = "0.12"
 hex = "0.4"
 secrecy = "0.4"
 serde_urlencoded = "0.1"
+base64 = "0.22"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -17,7 +17,7 @@ use crate::engine::orders::Order;
 use crate::instrument::{InstrumentId, Venue};
 use crate::instrument::registry::InstrumentRegistry;
 use crate::instrument::Instrument as InstrumentDef;
-use crate::messages::{ClientOrderId, PositionId, StrategyId};
+use crate::messages::{ClientOrderId, PositionId, StrategyId, VenueOrderId};
 use crate::engine::oms::{OmsOrder, OrderState};
 
 // =============================================================================
@@ -176,8 +176,11 @@ pub struct Cache {
     index_oms_orders_closed: HashSet<ClientOrderId>,
     index_oms_orders_strategy: HashMap<StrategyId, HashSet<ClientOrderId>>,
     index_oms_orders_instrument: HashMap<InstrumentId, HashSet<ClientOrderId>>,
+    index_oms_orders_venue: HashMap<VenueOrderId, ClientOrderId>,
     index_positions_open: HashSet<PositionId>,
     index_positions_closed: HashSet<PositionId>,
+    // Synthetic instruments index — maps underlying symbol to synthetic IDs
+    index_synthetics_underlying: HashMap<String, Vec<InstrumentId>>,
 
     #[allow(dead_code)]
     // Capacity
@@ -220,8 +223,10 @@ impl Cache {
             index_oms_orders_closed: HashSet::new(),
             index_oms_orders_strategy: HashMap::new(),
             index_oms_orders_instrument: HashMap::new(),
+            index_oms_orders_venue: HashMap::new(),
             index_positions_open: HashSet::new(),
             index_positions_closed: HashSet::new(),
+            index_synthetics_underlying: HashMap::new(),
             tick_capacity,
             bar_capacity,
             database: None,
@@ -260,8 +265,10 @@ impl Cache {
             index_oms_orders_closed: HashSet::new(),
             index_oms_orders_strategy: HashMap::new(),
             index_oms_orders_instrument: HashMap::new(),
+            index_oms_orders_venue: HashMap::new(),
             index_positions_open: HashSet::new(),
             index_positions_closed: HashSet::new(),
+            index_synthetics_underlying: HashMap::new(),
             tick_capacity: 1000,
             bar_capacity: 1000,
             registry: None,
@@ -391,6 +398,17 @@ impl Cache {
         self.positions.get(id)
     }
 
+    /// Get position by InstrumentId.
+    /// Returns the first open position for the instrument, if any.
+    pub fn get_position_for_instrument(&self, instrument_id: &InstrumentId) -> Option<&Position> {
+        self.index_instrument_positions
+            .get(instrument_id)
+            .and_then(|ids| ids.iter().find(|id| {
+                self.positions.get(id).map(|p| p.quantity != 0.0).unwrap_or(false)
+            }))
+            .and_then(|id| self.positions.get(id))
+    }
+
     /// Get all open positions.
     pub fn get_positions_open(&self) -> Vec<&Position> {
         self.index_positions_open
@@ -451,7 +469,7 @@ impl Cache {
     }
 
     /// Update an OMS order in the cache.
-    /// Maintains all OMS indices (open/closed, strategy, instrument).
+    /// Maintains all OMS indices (open/closed, strategy, instrument, venue).
     pub fn update_oms_order(&mut self, order: OmsOrder) {
         let client_order_id = order.client_order_id.clone();
         let strategy_id = order.strategy_id.clone();
@@ -461,8 +479,11 @@ impl Cache {
         // Insert/update in oms_orders map
         self.oms_orders.insert(client_order_id.clone(), order);
 
+        // Determine terminal state
+        let state = self.oms_orders.get(&client_order_id).map(|o| o.state.clone()).unwrap_or(OrderState::Pending);
+
         // Update open/closed indices based on state
-        match &self.oms_orders.get(&client_order_id).map(|o| o.state.clone()).unwrap_or(OrderState::Pending) {
+        match &state {
             OrderState::Pending | OrderState::Accepted | OrderState::PartiallyFilled => {
                 self.index_oms_orders_open.insert(client_order_id.clone());
                 self.index_oms_orders_closed.remove(&client_order_id);
@@ -470,6 +491,17 @@ impl Cache {
             OrderState::Filled | OrderState::Cancelled | OrderState::Rejected => {
                 self.index_oms_orders_open.remove(&client_order_id);
                 self.index_oms_orders_closed.insert(client_order_id.clone());
+                // Remove from venue secondary index on terminal state
+                if let Some(venue_id) = self.oms_orders.get(&client_order_id).and_then(|o| o.venue_order_id.clone()) {
+                    self.index_oms_orders_venue.remove(&venue_id);
+                }
+            }
+        }
+
+        // Update venue_order_id secondary index (only for non-terminal states)
+        if let OrderState::Pending | OrderState::Accepted | OrderState::PartiallyFilled = &state {
+            if let Some(venue_id) = self.oms_orders.get(&client_order_id).and_then(|o| o.venue_order_id.clone()) {
+                self.index_oms_orders_venue.insert(venue_id, client_order_id.clone());
             }
         }
 
@@ -491,9 +523,52 @@ impl Cache {
         self.oms_orders.get(id)
     }
 
+    /// Get an OMS order by venue_order_id (secondary lookup).
+    /// Used when WS messages carry exchange_order_id.
+    pub fn get_oms_order_by_venue(&self, venue_order_id: &VenueOrderId) -> Option<&OmsOrder> {
+        self.index_oms_orders_venue
+            .get(venue_order_id)
+            .and_then(|coid| self.oms_orders.get(coid))
+    }
+
+    /// Get a ClientOrderId from a VenueOrderId (for reconciliation).
+    pub fn get_client_order_id_by_venue(&self, venue_order_id: &VenueOrderId) -> Option<ClientOrderId> {
+        self.index_oms_orders_venue.get(venue_order_id).cloned()
+    }
+
     /// Get a mutable reference to the OMS orders map for Oms.
     pub(crate) fn oms_orders_mut(&mut self) -> &mut HashMap<ClientOrderId, OmsOrder> {
         &mut self.oms_orders
+    }
+
+    /// Update the venue secondary index when an order is accepted.
+    pub(crate) fn oms_update_venue_index(&mut self, venue_order_id: VenueOrderId, client_order_id: ClientOrderId) {
+        self.index_oms_orders_venue.insert(venue_order_id, client_order_id);
+    }
+
+    /// Get open OMS order client_order_ids for a strategy.
+    pub(crate) fn oms_get_open_for_strategy(&self, strategy_id: &StrategyId) -> Vec<ClientOrderId> {
+        self.index_oms_orders_strategy
+            .get(strategy_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    /// Get open OMS order client_order_ids.
+    pub(crate) fn oms_get_open_order_ids(&self) -> Vec<ClientOrderId> {
+        self.index_oms_orders_open.iter().cloned().collect()
+    }
+
+    /// Check if OMS orders contains a client_order_id.
+    pub(crate) fn oms_contains(&self, coid: &ClientOrderId) -> bool {
+        self.oms_orders.contains_key(coid)
+    }
+
+    /// Get a mutable reference to an OMS order.
+    pub(crate) fn oms_get_mut(&mut self, coid: &ClientOrderId) -> Option<&mut OmsOrder> {
+        self.oms_orders.get_mut(coid)
     }
 
     /// Update a position in the cache.
@@ -519,18 +594,32 @@ impl Cache {
         }
 
         // Update instrument index
-        self.index_instrument_positions
-            .entry(instrument_id)
-            .or_default()
-            .insert(position_id.clone());
+        if quantity == 0.0 {
+            // Position closed — remove from instrument index
+            if let Some(ids) = self.index_instrument_positions.get_mut(&instrument_id) {
+                ids.remove(&position_id);
+            }
+        } else {
+            self.index_instrument_positions
+                .entry(instrument_id)
+                .or_default()
+                .insert(position_id.clone());
+        }
 
         // Update strategy index
-        self.index_strategy_positions
-            .entry(strategy_id)
-            .or_default()
-            .insert(position_id.clone());
+        if quantity == 0.0 {
+            // Position closed — remove from strategy index
+            if let Some(ids) = self.index_strategy_positions.get_mut(&strategy_id) {
+                ids.remove(&position_id);
+            }
+        } else {
+            self.index_strategy_positions
+                .entry(strategy_id)
+                .or_default()
+                .insert(position_id.clone());
+        }
 
-        // maintain venue position index
+        // maintain venue position index (venue index keeps ALL positions, not just open)
         self.index_venue_positions
             .entry(venue)
             .or_default()
@@ -564,6 +653,29 @@ impl Cache {
             raw_symbol,
         };
         self.instruments.insert(InstrumentId { id: instrument.id }, Arc::new(cache_instrument));
+    }
+
+    /// Add a synthetic instrument and populate the underlying index.
+    pub fn add_synthetic(&mut self, synthetic: SyntheticInstrument) {
+        // Extract underlying symbol from formula (format "SYMBOL.venue + SYMBOL.venue" or similar)
+        let formula = &synthetic.formula;
+        let underlying = formula.split_whitespace()
+            .next()
+            .unwrap_or("UNKNOWN")
+            .split('.')
+            .next()
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        self.index_synthetics_underlying
+            .entry(underlying)
+            .or_default()
+            .push(synthetic.id);
+        self.synthetics.insert(synthetic.id, Arc::new(synthetic));
+    }
+
+    /// Get synthetic instruments by underlying symbol.
+    pub fn get_synthetics_by_underlying(&self, symbol: &str) -> Vec<InstrumentId> {
+        self.index_synthetics_underlying.get(symbol).cloned().unwrap_or_default()
     }
 }
 

@@ -15,6 +15,10 @@ use sha2::Sha256;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
+use async_trait::async_trait;
+
+use crate::live::exchange::{Exchange, ExchangeError};
+use crate::live::normalizer::{BinanceSymbolNormalizer, SymbolNormalizer};
 use crate::messages::{
     CancelOrder, ClientOrderId, OrderSide, SubmitOrder, TimeInForce, VenueOrderId,
 };
@@ -73,6 +77,8 @@ pub struct BinanceHttpAdapter {
     client: Client,
     /// Rate limiter: tracks remaining request weight.
     rate_limiter: Arc<RwLock<RateLimiter>>,
+    /// Symbol normalizer for this adapter.
+    normalizer: BinanceSymbolNormalizer,
 }
 
 /// Simple token-bucket rate limiter for Binance API request weights.
@@ -146,12 +152,13 @@ impl BinanceHttpAdapter {
             base_url: base_url.to_string(),
             client,
             rate_limiter: Arc::new(RwLock::new(RateLimiter::new(1200.0, 1200.0))),
+            normalizer: BinanceSymbolNormalizer,
         }
     }
 
     /// Place a market or limit order.
     /// Returns the venue-assigned order ID on success.
-    pub async fn place_order(&self, order: &SubmitOrder) -> Result<VenueOrderId, BinanceApiError> {
+    pub async fn place_order_impl(&self, order: &SubmitOrder) -> Result<VenueOrderId, BinanceApiError> {
         let weight = match order.order_type {
             crate::messages::OrderType::Market => 1,
             crate::messages::OrderType::Limit => 1,
@@ -170,15 +177,14 @@ impl BinanceHttpAdapter {
         let params = self.build_order_params(order);
         let response: OrderResponse = self
             .signed_post("/api/v3/order", params)
-            .await
-            .map_err(|e| e)?;
+            .await?;
 
         Ok(VenueOrderId::new(&response.order_id.to_string()))
     }
 
     /// Cancel an order.
     /// Returns `true` if the order was successfully cancelled.
-    pub async fn cancel_order(&self, cancel: &CancelOrder) -> Result<bool, BinanceApiError> {
+    pub async fn cancel_order_impl(&self, cancel: &CancelOrder) -> Result<bool, BinanceApiError> {
         {
             let mut limiter = self.rate_limiter.write().await;
             limiter.acquire(1).await.map_err(|retry_ms| BinanceApiError::RateLimited {
@@ -213,14 +219,13 @@ impl BinanceHttpAdapter {
 
         let _: CancelResponse = self
             .signed_delete("/api/v3/order", params)
-            .await
-            .map_err(|e| e)?;
+            .await?;
 
         Ok(true)
     }
 
     /// Get order status by client order ID.
-    pub async fn get_order_status(
+    pub async fn get_order_status_impl(
         &self,
         client_order_id: &ClientOrderId,
         symbol: &str,
@@ -242,14 +247,13 @@ impl BinanceHttpAdapter {
 
         let response: OrderStatusResponse = self
             .signed_get("/api/v3/order", params)
-            .await
-            .map_err(|e| e)?;
+            .await?;
 
         Ok(response)
     }
 
     /// Get account balance information.
-    pub async fn get_account_info(&self) -> Result<AccountInfoResponse, BinanceApiError> {
+    pub async fn get_account_info_impl(&self) -> Result<AccountInfoResponse, BinanceApiError> {
         {
             let mut limiter = self.rate_limiter.write().await;
             limiter.acquire(10).await.map_err(|retry_ms| BinanceApiError::RateLimited {
@@ -262,7 +266,7 @@ impl BinanceHttpAdapter {
     }
 
     /// Get all open orders.
-    pub async fn get_open_orders(&self) -> Result<Vec<OrderInfoResponse>, BinanceApiError> {
+    pub async fn get_open_orders_impl(&self) -> Result<Vec<OrderInfoResponse>, BinanceApiError> {
         {
             let mut limiter = self.rate_limiter.write().await;
             limiter.acquire(3).await.map_err(|retry_ms| BinanceApiError::RateLimited {
@@ -274,6 +278,75 @@ impl BinanceHttpAdapter {
             .signed_get("/api/v3/openOrders", vec![])
             .await?;
         Ok(response)
+    }
+
+    /// Get a fresh listen-key for WebSocket user data stream.
+    /// Post to POST /api/v3/userDataStream, extract listenKey from response.
+    pub async fn get_listen_key(&self) -> Result<String, BinanceApiError> {
+        {
+            let mut limiter = self.rate_limiter.write().await;
+            limiter.acquire(1).await.map_err(|retry_ms| BinanceApiError::RateLimited {
+                retry_after_ms: retry_ms,
+            })?;
+        }
+
+        let url = format!("{}/api/v3/userDataStream", self.base_url);
+        let response: ListenKeyResponse = self
+            .do_post(&url)
+            .await?;
+
+        Ok(response.listen_key)
+    }
+
+    /// Modify an existing order's price and/or quantity.
+    ///
+    /// Uses Binance `POST /api/v3/order` with orderId or origClientOrderId.
+    /// The `side` parameter is REQUIRED — Binance rejects modifies without it.
+    ///
+    /// Returns the new VenueOrderId on success.
+    pub async fn modify_order_impl(
+        &self,
+        client_order_id: &ClientOrderId,
+        venue_order_id: Option<&VenueOrderId>,
+        side: OrderSide,
+        new_price: Option<f64>,
+        new_quantity: Option<f64>,
+        symbol: &str,
+    ) -> Result<VenueOrderId, BinanceApiError> {
+        {
+            let mut limiter = self.rate_limiter.write().await;
+            limiter.acquire(1).await.map_err(|retry_ms| BinanceApiError::RateLimited {
+                retry_after_ms: retry_ms,
+            })?;
+        }
+
+        let mut params = vec![
+            ("symbol".to_string(), symbol.to_uppercase()),
+            ("side".to_string(), side_to_binance(side).to_string()),
+            ("type".to_string(), "LIMIT".to_string()),
+            ("newClientOrderId".to_string(), client_order_id.to_string()),
+        ];
+
+        if let Some(vid) = venue_order_id {
+            params.push(("orderId".to_string(), vid.to_string()));
+        } else {
+            params.push(("origClientOrderId".to_string(), client_order_id.to_string()));
+        }
+
+        if let Some(p) = new_price {
+            params.push(("price".to_string(), format!("{}", p)));
+        }
+        if let Some(q) = new_quantity {
+            params.push(("quantity".to_string(), format_order_qty(q)));
+        }
+
+        params.push(("recvWindow".to_string(), "5000".to_string()));
+
+        let response: OrderResponse = self
+            .signed_post("/api/v3/order", params)
+            .await?;
+
+        Ok(VenueOrderId::new(&response.order_id.to_string()))
     }
 
     // -------------------------------------------------------------------------
@@ -314,11 +387,7 @@ impl BinanceHttpAdapter {
     }
 
     fn symbol_from_instrument(&self, instrument_id: &str) -> String {
-        instrument_id
-            .split('.')
-            .next()
-            .unwrap_or(instrument_id)
-            .to_uppercase()
+        self.normalizer.to_exchange_symbol(instrument_id)
     }
 
     async fn signed_get<T: for<'de> Deserialize<'de>>(
@@ -516,23 +585,23 @@ struct CancelResponse {
 #[allow(dead_code)]
 pub struct OrderStatusResponse {
     #[serde(rename = "orderId")]
-    order_id: u64,
+    pub order_id: u64,
     #[serde(rename = "clientOrderId")]
-    client_order_id: String,
+    pub client_order_id: String,
     #[serde(rename = "symbol")]
-    symbol: String,
+    pub symbol: String,
     #[serde(rename = "price")]
-    price: String,
+    pub price: String,
     #[serde(rename = "origQty")]
-    orig_qty: String,
+    pub orig_qty: String,
     #[serde(rename = "executedQty")]
-    executed_qty: String,
+    pub executed_qty: String,
     #[serde(rename = "status")]
-    status: String,
+    pub status: String,
     #[serde(rename = "type")]
-    order_type: String,
+    pub order_type: String,
     #[serde(rename = "side")]
-    side: String,
+    pub side: String,
 }
 
 /// Response type for account info queries.
@@ -570,32 +639,38 @@ struct BalanceInfo {
     locked: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ListenKeyResponse {
+    #[serde(rename = "listenKey")]
+    listen_key: String,
+}
+
 /// Response type for open orders queries.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct OrderInfoResponse {
     #[serde(rename = "symbol")]
-    symbol: String,
+    pub symbol: String,
     #[serde(rename = "orderId")]
-    order_id: u64,
+    pub order_id: u64,
     #[serde(rename = "clientOrderId")]
-    client_order_id: String,
+    pub client_order_id: String,
     #[serde(rename = "price")]
-    price: String,
+    pub price: String,
     #[serde(rename = "origQty")]
-    orig_qty: String,
+    pub orig_qty: String,
     #[serde(rename = "executedQty")]
-    executed_qty: String,
+    pub executed_qty: String,
     #[serde(rename = "status")]
-    status: String,
+    pub status: String,
     #[serde(rename = "type")]
-    order_type: String,
+    pub order_type: String,
     #[serde(rename = "side")]
-    side: String,
+    pub side: String,
     #[serde(rename = "time")]
-    time: Option<u64>,
+    pub time: Option<u64>,
     #[serde(rename = "updateTime")]
-    update_time: Option<u64>,
+    pub update_time: Option<u64>,
 }
 
 // =============================================================================
@@ -638,7 +713,7 @@ fn format_order_qty(qty: f64) -> String {
 }
 
 /// Build a URL query string from params. Simple implementation.
-fn build_query_string(params: &[(String, String)]) -> String {
+pub(crate) fn build_query_string(params: &[(String, String)]) -> String {
     params
         .iter()
         .map(|(k, v)| format!("{}={}", urlencoding_encode(k), urlencoding_encode(v)))
@@ -669,6 +744,135 @@ fn extract_error_code(body: &str) -> Option<i32> {
         .nth(1)
         .and_then(|s| s.split(',').next())
         .and_then(|s| s.trim().parse().ok())
+}
+
+// =============================================================================
+// From BinanceApiError to ExchangeError (explicit, no silent Into)
+// =============================================================================
+
+impl From<BinanceApiError> for ExchangeError {
+    fn from(err: BinanceApiError) -> Self {
+        match err {
+            BinanceApiError::NetworkError(msg) => ExchangeError::NetworkError(msg),
+            BinanceApiError::RateLimited { retry_after_ms } => {
+                ExchangeError::RateLimited { retry_after_ms }
+            }
+            BinanceApiError::AuthFailed => ExchangeError::AuthFailed,
+            BinanceApiError::InvalidSignature => ExchangeError::InvalidSignature,
+            BinanceApiError::InsufficientBalance => ExchangeError::InsufficientBalance,
+            BinanceApiError::OrderNotFound => ExchangeError::OrderNotFound,
+            BinanceApiError::Unknown(msg) => ExchangeError::Unknown(msg),
+        }
+    }
+}
+
+impl From<ExchangeError> for BinanceApiError {
+    fn from(err: ExchangeError) -> Self {
+        match err {
+            ExchangeError::NetworkError(msg) => BinanceApiError::NetworkError(msg),
+            ExchangeError::RateLimited { retry_after_ms } => {
+                BinanceApiError::RateLimited { retry_after_ms }
+            }
+            ExchangeError::AuthFailed => BinanceApiError::AuthFailed,
+            ExchangeError::InvalidSignature => BinanceApiError::InvalidSignature,
+            ExchangeError::InsufficientBalance => BinanceApiError::InsufficientBalance,
+            ExchangeError::OrderNotFound => BinanceApiError::OrderNotFound,
+            ExchangeError::RiskRejected(reason) => BinanceApiError::Unknown(reason.to_string()),
+            ExchangeError::Unknown(msg) => BinanceApiError::Unknown(msg),
+        }
+    }
+}
+
+// =============================================================================
+// Exchange trait implementation for BinanceHttpAdapter
+// =============================================================================
+
+/// Convert Binance AccountInfoResponse to the unified exchange::AccountInfoResponse.
+fn binance_account_to_exchange(
+    resp: crate::live::http_adapter::AccountInfoResponse,
+) -> crate::live::exchange::AccountInfoResponse {
+    crate::live::exchange::AccountInfoResponse {
+        balances: resp
+            .balances
+            .into_iter()
+            .map(|b| crate::live::exchange::AssetBalance {
+                asset: b.asset,
+                free: b.free,
+                locked: b.locked,
+            })
+            .collect(),
+    }
+}
+
+#[async_trait]
+impl Exchange for BinanceHttpAdapter {
+    async fn place_order(&self, order: &SubmitOrder) -> Result<VenueOrderId, ExchangeError> {
+        self.place_order_impl(order).await.map_err(|e| e.into())
+    }
+
+    async fn cancel_order(&self, cancel: &CancelOrder) -> Result<bool, ExchangeError> {
+        self.cancel_order_impl(cancel).await.map_err(|e| e.into())
+    }
+
+    async fn modify_order(
+        &self,
+        client_order_id: &ClientOrderId,
+        venue_order_id: Option<&VenueOrderId>,
+        side: crate::messages::OrderSide,
+        new_price: Option<f64>,
+        new_quantity: Option<f64>,
+        symbol: &str,
+    ) -> Result<VenueOrderId, ExchangeError> {
+        self.modify_order_impl(client_order_id, venue_order_id, side, new_price, new_quantity, symbol)
+            .await
+            .map_err(|e| e.into())
+    }
+
+    async fn get_order_status(
+        &self,
+        client_order_id: &ClientOrderId,
+        symbol: &str,
+    ) -> Result<crate::live::http_adapter::OrderStatusResponse, ExchangeError> {
+        self.get_order_status_impl(client_order_id, symbol)
+            .await
+            .map_err(|e| e.into())
+    }
+
+    async fn get_open_orders(&self) -> Result<Vec<crate::live::http_adapter::OrderInfoResponse>, ExchangeError> {
+        self.get_open_orders_impl().await.map_err(|e| e.into())
+    }
+
+    async fn get_account_info(&self) -> Result<crate::live::exchange::AccountInfoResponse, ExchangeError> {
+        self.get_account_info_impl()
+            .await
+            .map(binance_account_to_exchange)
+            .map_err(|e| e.into())
+    }
+
+    async fn fetch_listen_key(&self) -> Result<String, ExchangeError> {
+        self.get_listen_key()
+            .await
+            .map_err(|e| e.into())
+    }
+
+    async fn place_order_list(
+        &self,
+        orders: &[SubmitOrder],
+    ) -> Result<Vec<VenueOrderId>, ExchangeError> {
+        // Binance OCO/OTO: place parent order first, then attach child orders via contingency
+        if orders.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut venue_order_ids = Vec::with_capacity(orders.len());
+
+        for order in orders {
+            let venue_id = self.place_order_impl(order).await.map_err(|e| ExchangeError::from(e))?;
+            venue_order_ids.push(venue_id);
+        }
+
+        Ok(venue_order_ids)
+    }
 }
 
 // =============================================================================

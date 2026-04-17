@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+pub use crate::actor::Message;
 
 pub use crate::engine::account::OmsType;
 pub use crate::instrument::{InstrumentId, Venue};
@@ -418,6 +419,7 @@ pub struct OrderSubmitted {
     pub ts_event: u64,
     pub ts_init: u64,
 }
+impl Message for OrderSubmitted {}
 
 impl OrderSubmitted {
     #[allow(clippy::too_many_arguments)]
@@ -466,6 +468,7 @@ pub struct OrderAccepted {
     pub ts_event: u64,
     pub ts_init: u64,
 }
+impl Message for OrderAccepted {}
 
 impl OrderAccepted {
     pub fn from_submitted(submitted: &OrderSubmitted) -> Self {
@@ -505,6 +508,7 @@ pub struct OrderFilled {
     pub ts_event: u64,
     pub ts_init: u64,
 }
+impl Message for OrderFilled {}
 
 impl OrderFilled {
     #[allow(clippy::too_many_arguments)]
@@ -576,6 +580,7 @@ pub struct OrderPartiallyFilled {
     pub ts_event: u64,
     pub ts_init: u64,
 }
+impl Message for OrderPartiallyFilled {}
 
 /// Order cancelled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,6 +594,7 @@ pub struct OrderCancelled {
     pub ts_init: u64,
     pub reason: Option<String>,
 }
+impl Message for OrderCancelled {}
 
 /// Order rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -602,6 +608,7 @@ pub struct OrderRejected {
     pub ts_init: u64,
     pub reason: String,
 }
+impl Message for OrderRejected {}
 
 /// Order modified.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,6 +621,7 @@ pub struct OrderModified {
     pub ts_event: u64,
     pub ts_init: u64,
 }
+impl Message for OrderModified {}
 
 // =============================================================================
 // SECTION 5: Position Events

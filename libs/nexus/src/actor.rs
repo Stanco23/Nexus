@@ -73,7 +73,7 @@ pub trait Clock {
     /// When the deadline is reached, `handler` is called with the `TimeEvent`.
     /// If no handler is provided, the default handler (if registered) receives it.
     /// The name must be unique per clock.
-    fn set_timer(&mut self, name: &str, deadline_ns: u64, handler: Box<dyn FnMut(TimeEvent)>);
+    fn set_timer(&mut self, name: &str, deadline_ns: u64, payload: Vec<u8>, handler: Box<dyn FnMut(TimeEvent)>);
 
     /// Set a one-shot timer with no specific handler (uses default handler).
     fn set_timer_anonymous(&mut self, name: &str, deadline_ns: u64);
@@ -161,7 +161,7 @@ impl Clock for SystemClock {
         0
     }
 
-    fn set_timer(&mut self, _name: &str, _deadline_ns: u64, _handler: Box<dyn FnMut(TimeEvent)>) {
+    fn set_timer(&mut self, _name: &str, _deadline_ns: u64, _payload: Vec<u8>, _handler: Box<dyn FnMut(TimeEvent)>) {
         // No-op: SystemClock timers are handled by the external event loop
     }
 
@@ -226,6 +226,8 @@ struct TimerData {
     callback: Option<Box<dyn FnMut(TimeEvent)>>,
     /// Whether the timer was already cancelled during this advance cycle.
     cancelled: bool,
+    /// Payload data passed when timer was set.
+    payload: Vec<u8>,
 }
 
 impl TestClock {
@@ -265,7 +267,7 @@ impl Clock for TestClock {
         self.timers.len()
     }
 
-    fn set_timer(&mut self, name: &str, deadline_ns: u64, handler: Box<dyn FnMut(TimeEvent)>) {
+    fn set_timer(&mut self, name: &str, deadline_ns: u64, payload: Vec<u8>, handler: Box<dyn FnMut(TimeEvent)>) {
         self.timers.insert(
             name.to_string(),
             TimerData {
@@ -274,6 +276,7 @@ impl Clock for TestClock {
                 stop_ns: None,
                 callback: Some(handler),
                 cancelled: false,
+                payload,
             },
         );
     }
@@ -287,6 +290,7 @@ impl Clock for TestClock {
                 stop_ns: None,
                 callback: None,
                 cancelled: false,
+                payload: Vec::new(),
             },
         );
     }
@@ -314,6 +318,7 @@ impl Clock for TestClock {
                 stop_ns,
                 callback: Some(handler),
                 cancelled: false,
+                payload: Vec::new(),
             },
         );
     }
@@ -352,7 +357,7 @@ impl Clock for TestClock {
                 let event = TimeEvent {
                     id: 0,
                     name: name.clone(),
-                    payload: Vec::new(),
+                    payload: timer.payload.clone(),
                     timestamp_ns: timer.deadline_ns,
                 };
 
@@ -376,12 +381,14 @@ impl Clock for TestClock {
                     }
                     timer.deadline_ns = next_deadline;
                     timer.cancelled = false;
+                    let payload_clone = timer.payload.clone();
                     to_reschedule.push((name.clone(), TimerData {
                         deadline_ns: timer.deadline_ns,
                         interval_ns: timer.interval_ns,
                         stop_ns: timer.stop_ns,
                         callback: timer.callback.take(), // move callback out
                         cancelled: false,
+                        payload: payload_clone,
                     }));
                 } else {
                     to_remove.push(name.clone());
@@ -858,6 +865,7 @@ fn timestamp_iso() -> String {
 pub struct Component {
     pub id: u64,
     pub name: &'static str,
+    pub trader_id: TraderId,
     clock: Box<dyn Clock>,
     msgbus: MessageBus,
     logger: Logger,
@@ -869,6 +877,7 @@ impl Component {
     pub fn new(
         id: u64,
         name: &'static str,
+        trader_id: TraderId,
         clock: Box<dyn Clock>,
         msgbus: MessageBus,
         logger: Logger,
@@ -876,6 +885,7 @@ impl Component {
         Self {
             id,
             name,
+            trader_id,
             clock,
             msgbus,
             logger,
@@ -1191,7 +1201,7 @@ impl GenericActor {
     ) -> Self {
         let trader_id_str = trader_id.to_string();
         let logger = Logger::new(name);
-        let component = Component::new(id, name, clock, msgbus, logger);
+        let component = Component::new(id, name, trader_id.clone(), clock, msgbus, logger);
         Self {
             component,
             trader_id,
@@ -1284,7 +1294,7 @@ mod tests {
             fired_clone.borrow_mut().push(e.name.clone());
         });
 
-        clock.set_timer("cb_timer", 2000, handler);
+        clock.set_timer("cb_timer", 2000, Vec::new(), handler);
 
         let events = clock.advance_time(2000);
         assert_eq!(events.len(), 1);
@@ -1748,7 +1758,7 @@ mod tests {
         let bus = MessageBus::new();
         let clock = Box::new(TestClock::new());
         let logger = Logger::new("test_component");
-        let mut comp = Component::new(1, "TestComponent", clock, bus.clone(), logger);
+        let mut comp = Component::new(1, "TestComponent", TraderId::new("TEST-Trader"), clock, bus.clone(), logger);
 
         assert_eq!(comp.state(), ComponentState::PreInitialized);
 
@@ -1767,7 +1777,7 @@ mod tests {
         let bus = MessageBus::new();
         let clock = Box::new(TestClock::new());
         let logger = Logger::new("subscriber");
-        let comp = Component::new(10, "Subscriber", clock, bus.clone(), logger);
+        let comp = Component::new(10, "Subscriber", TraderId::new("TEST-Trader"), clock, bus.clone(), logger);
 
         let received = Rc::new(RefCell::new(false));
         let received_clone = Rc::clone(&received);
@@ -1858,7 +1868,7 @@ mod tests {
         let bus = MessageBus::new();
         let clock = Box::new(TestClock::new());
         let logger = Logger::new("state_tester");
-        let mut comp = Component::new(42, "StateTester", clock, bus.clone(), logger);
+        let mut comp = Component::new(42, "StateTester", TraderId::new("TEST-Trader"), clock, bus.clone(), logger);
 
         let received_events = Rc::new(RefCell::new(Vec::new()));
         let received_events_clone = Rc::clone(&received_events);

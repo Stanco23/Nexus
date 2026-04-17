@@ -5,6 +5,7 @@
 //!
 //! Nautilus source: `adapters/binance/websocket/user.py`
 
+use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::live::exchange::{ExchangeWs as ExchangeWsTrait, WsError as ExchangeWsError, WsMessage as ExchangeWsMessage};
 use crate::messages::OrderSide;
 
 // =============================================================================
@@ -20,6 +22,7 @@ use crate::messages::OrderSide;
 
 /// Incoming WebSocket message from Binance.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum WsMessage {
     /// Order execution report (fill, partial fill, accepted, cancelled, rejected).
     ExecutionReport(ExecutionReport),
@@ -247,6 +250,7 @@ impl BinanceWsAdapter {
         if let Some(msg) = read.next().await {
             let text = msg.map_err(|e| WsError::RecvFailed(e.to_string()))?;
             let text = text.into_text().map_err(|e| WsError::RecvFailed(e.to_string()))?;
+            #[allow(clippy::collapsible_if)]
             if !text.contains("\"result\":null") && !text.contains("\"result\": null") {
                 if text.contains("\"error\"") {
                     return Err(WsError::SubscribeFailed(text.to_string()));
@@ -315,7 +319,7 @@ impl BinanceWsAdapter {
 
     /// Receive the next WebSocket message.
     /// Returns `None` if the connection is closed.
-    pub async fn recv(&mut self) -> Result<WsMessage, WsError> {
+    pub async fn recv_impl(&mut self) -> Result<WsMessage, WsError> {
         if let Some(rx) = &mut self.recv_rx {
             rx.recv()
                 .await
@@ -336,6 +340,14 @@ impl BinanceWsAdapter {
         }
         self.connected = false;
         Ok(())
+    }
+
+    /// Reconnect using a new listen key.
+    pub async fn reconnect_impl(&mut self, listen_key: &str) -> Result<(), WsError> {
+        self.close().await?;
+        let ws_url = format!("{}/{}", self.ws_url.trim_end_matches('/'), listen_key);
+        self.ws_url = ws_url;
+        self.connect().await
     }
 
     /// Parse a raw Binance WebSocket JSON message into a `WsMessage`.
@@ -604,8 +616,106 @@ impl std::fmt::Display for WsError {
 impl std::error::Error for WsError {}
 
 // =============================================================================
-// Tests
+// From ws_adapter::WsError to exchange::WsError
 // =============================================================================
+
+impl From<WsError> for ExchangeWsError {
+    fn from(err: WsError) -> Self {
+        match err {
+            WsError::ConnectionFailed(msg) => ExchangeWsError::ConnectionFailed(msg),
+            WsError::ConnectionClosed => ExchangeWsError::ConnectionClosed,
+            WsError::NotConnected => ExchangeWsError::NotConnected,
+            WsError::RecvFailed(msg) => ExchangeWsError::RecvFailed(msg),
+            WsError::SendFailed(msg) => ExchangeWsError::SendFailed(msg),
+            WsError::SubscribeFailed(msg) => ExchangeWsError::SubscribeFailed(msg),
+            WsError::ParseError(msg) => ExchangeWsError::ParseError(msg),
+        }
+    }
+}
+
+// =============================================================================
+// From ws_adapter::WsMessage to exchange::WsMessage
+// =============================================================================
+
+impl From<WsMessage> for ExchangeWsMessage {
+    fn from(msg: WsMessage) -> Self {
+        match msg {
+            WsMessage::ExecutionReport(r) => ExchangeWsMessage::BinanceExec(crate::live::exchange::BinanceExecutionReport {
+                event_time: r.event_time,
+                symbol: r.symbol,
+                client_order_id: r.client_order_id,
+                exchange_order_id: r.exchange_order_id,
+                side: r.side,
+                order_type: r.order_type,
+                time_in_force: r.time_in_force,
+                quantity: r.quantity,
+                price: r.price,
+                stop_price: r.stop_price,
+                last_fill_qty: r.last_fill_qty,
+                accumulated_qty: r.accumulated_qty,
+                last_fill_price: r.last_fill_price,
+                commission: r.commission,
+                commission_asset: r.commission_asset,
+                trade_time: r.trade_time,
+                trade_id: r.trade_id,
+                is_on_book: r.is_on_book,
+                is_maker: r.is_maker,
+                order_status: r.order_status,
+                reject_reason: r.reject_reason,
+            }),
+            WsMessage::BalanceUpdate(b) => ExchangeWsMessage::BinanceBalance(crate::live::exchange::BinanceBalanceUpdate {
+                asset: b.asset,
+                balance: b.balance,
+                is_deposit: b.is_deposit,
+            }),
+            WsMessage::AccountUpdate(a) => ExchangeWsMessage::BinanceAccount(crate::live::exchange::BinanceAccountUpdate {
+                event_time: a.event_time,
+                balances: a.balances.into_iter().map(|b| crate::live::exchange::BinanceBalanceInfo {
+                    asset: b.asset,
+                    free: b.free,
+                    locked: b.locked,
+                }).collect(),
+            }),
+            WsMessage::ListStatus(l) => ExchangeWsMessage::BinanceListStatus(crate::live::exchange::BinanceListStatus {
+                list_status_type: l.list_status_type,
+                list_order_status: l.list_order_status,
+                list_client_order_id: l.list_client_order_id,
+                list_id: l.list_id,
+                symbol: l.symbol,
+                orders: l.orders.into_iter().map(|o| crate::live::exchange::BinanceListOrder {
+                    symbol: o.symbol,
+                    order_id: o.order_id,
+                    client_order_id: o.client_order_id,
+                }).collect(),
+            }),
+            WsMessage::ListenKeyExpired => ExchangeWsMessage::ListenKeyExpired,
+            WsMessage::Unknown(s) => ExchangeWsMessage::Unknown(s),
+        }
+    }
+}
+
+// =============================================================================
+// ExchangeWs trait implementation for BinanceWsAdapter
+// =============================================================================
+
+#[async_trait]
+impl ExchangeWsTrait for BinanceWsAdapter {
+    async fn connect(&mut self) -> Result<(), ExchangeWsError> {
+        self.connect().await.map_err(|e| e.into())
+    }
+
+    async fn close(&mut self) -> Result<(), ExchangeWsError> {
+        self.close().await.map_err(|e| e.into())
+    }
+
+    async fn reconnect(&mut self, listen_key: &str) -> Result<(), ExchangeWsError> {
+        self.reconnect_impl(listen_key).await.map_err(|e| e.into())
+    }
+
+    async fn recv(&mut self) -> Result<ExchangeWsMessage, ExchangeWsError> {
+        self.recv_impl().await.map(|msg| msg.into()).map_err(|e| e.into())
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -10,6 +10,9 @@
 //! - **Drawdown circuit breaker**: halt new entries if equity drawdown > threshold
 //! - **Daily loss limit**: disable new orders after daily loss exceeds threshold
 //! - **Order size cap**: per-order maximum size
+//! - **Trading state machine**: Active → ReduceOnly → Halted transitions
+
+use crate::actor::TradingState;
 
 /// Risk configuration parameters.
 #[derive(Debug, Clone)]
@@ -76,6 +79,8 @@ pub struct RiskEngine {
     peak_equity: f64,
     daily_loss: f64,
     daily_start_equity: f64,
+    /// Live trading state machine — transitions: Active → ReduceOnly → Halted
+    trading_state: TradingState,
 }
 
 impl RiskEngine {
@@ -85,6 +90,59 @@ impl RiskEngine {
             peak_equity: initial_equity,
             daily_loss: 0.0,
             daily_start_equity: initial_equity,
+            trading_state: TradingState::Active,
+        }
+    }
+
+    /// Get the current trading state.
+    pub fn trading_state(&self) -> TradingState {
+        self.trading_state
+    }
+
+    /// Reset trading state to Active (after recovery or end-of-day).
+    pub fn reset_state(&mut self) {
+        self.trading_state = TradingState::Active;
+    }
+
+    /// Called after each fill to evaluate equity and trigger state transitions.
+    pub fn on_trade(&mut self, equity: f64) {
+        // Update peak equity
+        if equity > self.peak_equity {
+            self.peak_equity = equity;
+        }
+
+        let drawdown = if self.peak_equity > 0.0 {
+            (self.peak_equity - equity) / self.peak_equity
+        } else {
+            0.0
+        };
+
+        // State transitions based on equity
+        match self.trading_state {
+            TradingState::Active => {
+                // Active → ReduceOnly: drawdown exceeds threshold
+                if drawdown > self.config.max_drawdown_pct {
+                    self.trading_state = TradingState::ReduceOnly;
+                }
+            }
+            TradingState::ReduceOnly => {
+                // ReduceOnly → Halted: daily loss exceeds limit
+                let daily_loss_pct = if self.daily_start_equity > 0.0 {
+                    self.daily_loss / self.daily_start_equity
+                } else {
+                    0.0
+                };
+                if daily_loss_pct >= self.config.daily_loss_limit_pct {
+                    self.trading_state = TradingState::Halted;
+                }
+                // ReduceOnly → Active: equity recovers above peak
+                if drawdown == 0.0 {
+                    self.trading_state = TradingState::Active;
+                }
+            }
+            TradingState::Halted => {
+                // Halted can only be manually reset
+            }
         }
     }
 
@@ -99,6 +157,20 @@ impl RiskEngine {
         _equity: f64,
         max_drawdown_pct: f64,
     ) -> Option<&'static str> {
+        // State-based rejection first
+        match self.trading_state {
+            TradingState::Halted => {
+                return Some("trading_halted");
+            }
+            TradingState::ReduceOnly => {
+                // Reject new entries (orders that increase position size)
+                if order_size > 0.0 {
+                    return Some("reduce_only_no_new_entries");
+                }
+            }
+            TradingState::Active => {}
+        }
+
         // Order size cap
         if order_size > self.config.max_order_size {
             return Some("order_size_exceeded");
@@ -294,5 +366,67 @@ mod tests {
         // Equity drops but peak stays
         risk.update_peak(9_800.0);
         assert_eq!(risk.peak_equity(), 10_500.0);
+    }
+
+    #[test]
+    fn test_trading_state_starts_active() {
+        let risk = RiskEngine::new(RiskConfig::default(), 10_000.0);
+        assert_eq!(risk.trading_state(), TradingState::Active);
+    }
+
+    #[test]
+    fn test_trading_state_reduce_only_on_drawdown() {
+        let config = RiskConfig::new().with_max_drawdown_pct(0.10); // 10%
+        let mut risk = RiskEngine::new(config, 10_000.0);
+        assert_eq!(risk.trading_state(), TradingState::Active);
+        // Drop equity to 8900 (11% drawdown) → transition to ReduceOnly
+        risk.on_trade(8_900.0);
+        assert_eq!(risk.trading_state(), TradingState::ReduceOnly);
+    }
+
+    #[test]
+    fn test_trading_state_halted_on_daily_loss() {
+        let config = RiskConfig::new()
+            .with_max_drawdown_pct(0.05)
+            .with_daily_loss_limit_pct(0.05); // 5%
+        let mut risk = RiskEngine::new(config, 10_000.0);
+        // Trigger ReduceOnly first
+        risk.on_trade(9_400.0); // 6% drawdown
+        assert_eq!(risk.trading_state(), TradingState::ReduceOnly);
+        // Record daily loss exceeding limit
+        risk.record_loss(600.0); // 6% of 10k
+        risk.on_trade(9_400.0); // trigger transition check
+        assert_eq!(risk.trading_state(), TradingState::Halted);
+    }
+
+    #[test]
+    fn test_trading_state_rejects_orders_when_halted() {
+        let config = RiskConfig::new()
+            .with_max_drawdown_pct(0.05)
+            .with_daily_loss_limit_pct(0.05);
+        let mut risk = RiskEngine::new(config, 10_000.0);
+        risk.on_trade(9_000.0); // 10% drawdown → ReduceOnly
+        risk.record_loss(600.0); // 6% daily loss
+        risk.on_trade(9_000.0); // → Halted
+
+        // All new orders rejected
+        let result = risk.check_order(1.0, 100.0, 0.0, 9_000.0, 0.0);
+        assert_eq!(result, Some("trading_halted"));
+    }
+
+    #[test]
+    fn test_trading_state_reset_to_active() {
+        let config = RiskConfig::new()
+            .with_max_drawdown_pct(0.05)
+            .with_daily_loss_limit_pct(0.05);
+        let mut risk = RiskEngine::new(config, 10_000.0);
+        risk.on_trade(9_000.0);
+        risk.record_loss(600.0);
+        risk.on_trade(9_000.0); // Halted
+        assert_eq!(risk.trading_state(), TradingState::Halted);
+
+        // Manual reset
+        risk.reset_state();
+        assert_eq!(risk.trading_state(), TradingState::Active);
     }
 }

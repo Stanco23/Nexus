@@ -285,7 +285,7 @@ mod tests {
         fn timestamp_ns(&self) -> u64 { 0 }
         fn timer_names(&self) -> Vec<String> { vec![] }
         fn timer_count(&self) -> usize { 0 }
-        fn set_timer(&mut self, _: &str, _: u64, _: Box<dyn FnMut(nexus::actor::TimeEvent)>) {}
+        fn set_timer(&mut self, _: &str, _: u64, _: Vec<u8>, _: Box<dyn FnMut(nexus::actor::TimeEvent)>) {}
         fn set_timer_anonymous(&mut self, _: &str, _: u64) {}
         fn set_timer_repeating(&mut self, _: &str, _: u64, _: u64, _: Option<u64>, _: Box<dyn FnMut(nexus::actor::TimeEvent)>, _: bool) {}
         fn cancel_timer(&mut self, _: &str) {}

@@ -6,7 +6,10 @@
 //! - For each matching subscription, delivers data via registered callbacks
 //! - BarAggregator.advance_time() driven by clock ticks for time-based bar closing
 
+use crate::actor::Clock;
+use crate::buffer::bar_aggregation::BarAggregator;
 use crate::buffer::tick_buffer::TradeFlowStats;
+use crate::cache::{Bar as CacheBar, OrderBook, QuoteTick};
 use crate::data::messages::{BarType, SubscribeBars, SubscribeTrades, UnsubscribeBars, UnsubscribeTrades};
 use crate::instrument::InstrumentId;
 use std::collections::HashMap;
@@ -17,22 +20,39 @@ use std::sync::Arc;
 pub enum DataSubscription {
     Trades { instrument_id: InstrumentId },
     Bars { bar_type: BarType },
+    Quotes { instrument_id: InstrumentId },
+    OrderBooks { instrument_id: InstrumentId },
 }
 
 /// DataEngine — subscription management and routing for live data.
 pub struct DataEngine {
+    /// Clock for scheduling bar-close timers.
+    clock: Box<dyn Clock>,
     /// Subscriptions: actor endpoint → subscription params.
     subscriptions: HashMap<String, DataSubscription>,
     /// Callbacks: actor endpoint → tick receiver callback.
     /// Phase 5.5 replaces this with full MsgBus integration.
     tick_callbacks: HashMap<String, Arc<dyn Fn(TradeFlowStats) + Send + Sync>>,
+    /// Quote tick callbacks.
+    quote_callbacks: HashMap<String, Arc<dyn Fn(QuoteTick) + Send + Sync>>,
+    /// Order book callbacks.
+    ob_callbacks: HashMap<String, Arc<dyn Fn(OrderBook) + Send + Sync>>,
+    /// Bar callbacks (uses cache::Bar).
+    bar_callbacks: HashMap<String, Arc<dyn Fn(CacheBar) + Send + Sync>>,
+    /// Bar aggregators keyed by BarType.
+    bar_aggregators: HashMap<BarType, BarAggregator>,
 }
 
 impl DataEngine {
-    pub fn new() -> Self {
+    pub fn new(clock: Box<dyn Clock>) -> Self {
         Self {
+            clock,
             subscriptions: HashMap::new(),
             tick_callbacks: HashMap::new(),
+            quote_callbacks: HashMap::new(),
+            ob_callbacks: HashMap::new(),
+            bar_callbacks: HashMap::new(),
+            bar_aggregators: HashMap::new(),
         }
     }
 
@@ -46,19 +66,107 @@ impl DataEngine {
         self.tick_callbacks.insert(endpoint, Arc::new(callback));
     }
 
+    /// Register a quote tick callback for an endpoint.
+    #[allow(dead_code)]
+    pub fn register_quote_callback<F>(&mut self, endpoint: String, callback: F)
+    where
+        F: Fn(QuoteTick) + Send + Sync + 'static,
+    {
+        self.quote_callbacks.insert(endpoint, Arc::new(callback));
+    }
+
+    /// Register an order book callback for an endpoint.
+    #[allow(dead_code)]
+    pub fn register_ob_callback<F>(&mut self, endpoint: String, callback: F)
+    where
+        F: Fn(OrderBook) + Send + Sync + 'static,
+    {
+        self.ob_callbacks.insert(endpoint, Arc::new(callback));
+    }
+
+    /// Register a bar callback for an endpoint.
+    #[allow(dead_code)]
+    pub fn register_bar_callback<F>(&mut self, endpoint: String, callback: F)
+    where
+        F: Fn(CacheBar) + Send + Sync + 'static,
+    {
+        self.bar_callbacks.insert(endpoint, Arc::new(callback));
+    }
+
+    /// Advance the clock — updates all bar aggregators and routes completed bars.
+    pub fn advance_clock(&mut self, timestamp_ns: u64) {
+        // Collect raw buffer bars first to avoid borrow conflict
+        let raw_bars: Vec<(BarType, crate::buffer::bar_aggregation::Bar)> = self
+            .bar_aggregators
+            .iter_mut()
+            .filter_map(|(bar_type, aggregator)| {
+                aggregator.advance_time(timestamp_ns).map(|bar| (bar_type.clone(), bar))
+            })
+            .collect();
+
+        for (bar_type, bar) in raw_bars {
+            let cache_bar = self.buffer_bar_to_cache_bar(&bar);
+            self.process_bar(&cache_bar, &bar_type);
+        }
+    }
+
+    fn buffer_bar_to_cache_bar(&self, bar: &crate::buffer::bar_aggregation::Bar) -> CacheBar {
+        CacheBar {
+            ts_event: bar.timestamp_ns,
+            ts_init: bar.timestamp_ns,
+            open: bar.open as f64,
+            high: bar.high as f64,
+            low: bar.low as f64,
+            close: bar.close as f64,
+            volume: bar.volume as f64,
+            buy_volume: bar.buy_volume as f64,
+            sell_volume: bar.sell_volume as f64,
+            tick_count: bar.tick_count,
+            instrument_id: bar.instrument_id,
+        }
+    }
+
     /// Process an incoming trade tick from an adapter.
     /// Looks up all subscriptions for the given instrument_id and routes to each endpoint.
     pub fn process_trade(&mut self, tick: &TradeFlowStats, instrument_id: InstrumentId) {
         for (endpoint, sub) in &self.subscriptions {
-            match sub {
-                DataSubscription::Trades {
-                    instrument_id: sub_instrument_id,
-                } => {
-                    if *sub_instrument_id == instrument_id {
-                        self.route_trade_to_endpoint(endpoint, tick.clone());
-                    }
+            if let DataSubscription::Trades { instrument_id: sub_instrument_id } = sub {
+                if *sub_instrument_id == instrument_id {
+                    self.route_trade_to_endpoint(endpoint, tick.clone());
                 }
-                DataSubscription::Bars { .. } => {}
+            }
+        }
+    }
+
+    /// Process an incoming quote tick from an adapter.
+    pub fn process_quote(&self, tick: &QuoteTick, instrument_id: InstrumentId) {
+        for (endpoint, sub) in &self.subscriptions {
+            if let DataSubscription::Quotes { instrument_id: sub_instrument_id } = sub {
+                if *sub_instrument_id == instrument_id {
+                    self.route_quote_to_endpoint(endpoint, tick.clone());
+                }
+            }
+        }
+    }
+
+    /// Process an incoming order book update from an adapter.
+    pub fn process_orderbook(&self, book: &OrderBook, instrument_id: InstrumentId) {
+        for (endpoint, sub) in &self.subscriptions {
+            if let DataSubscription::OrderBooks { instrument_id: sub_instrument_id } = sub {
+                if *sub_instrument_id == instrument_id {
+                    self.route_ob_to_endpoint(endpoint, book.clone());
+                }
+            }
+        }
+    }
+
+    /// Process an incoming bar from an aggregator or adapter.
+    pub fn process_bar(&self, bar: &CacheBar, bar_type: &BarType) {
+        for (endpoint, sub) in &self.subscriptions {
+            if let DataSubscription::Bars { bar_type: sub_bar_type } = sub {
+                if bar_type == sub_bar_type {
+                    self.route_bar_to_endpoint(endpoint, bar.clone());
+                }
             }
         }
     }
@@ -66,6 +174,24 @@ impl DataEngine {
     fn route_trade_to_endpoint(&self, endpoint: &str, tick: TradeFlowStats) {
         if let Some(cb) = self.tick_callbacks.get(endpoint) {
             cb(tick);
+        }
+    }
+
+    fn route_quote_to_endpoint(&self, endpoint: &str, tick: QuoteTick) {
+        if let Some(cb) = self.quote_callbacks.get(endpoint) {
+            cb(tick);
+        }
+    }
+
+    fn route_ob_to_endpoint(&self, endpoint: &str, book: OrderBook) {
+        if let Some(cb) = self.ob_callbacks.get(endpoint) {
+            cb(book);
+        }
+    }
+
+    fn route_bar_to_endpoint(&self, endpoint: &str, bar: CacheBar) {
+        if let Some(cb) = self.bar_callbacks.get(endpoint) {
+            cb(bar);
         }
     }
 
@@ -86,6 +212,35 @@ impl DataEngine {
 
     /// Handle a subscribe bars message.
     pub fn subscribe_bars(&mut self, msg: SubscribeBars) {
+        let period_ns: u64 = 60_000_000_000;
+
+        // Create aggregator if not exists
+        let _ = self.bar_aggregators.entry(msg.bar_type.clone()).or_insert_with(|| {
+            BarAggregator::with_period_ns(period_ns, msg.bar_type.0.split('-').next().map(|s| {
+                crate::instrument::InstrumentId::new(s, "BINANCE")
+            }).unwrap_or_else(|| crate::instrument::InstrumentId::new("UNKNOWN", "BINANCE")))
+        });
+
+        let timer_name = format!("bar_close_{}", msg.bar_type.0);
+        let current_ns = self.clock.timestamp_ns();
+        let next_boundary = ((current_ns / period_ns) + 1) * period_ns;
+
+        let engine_ptr = self as *mut DataEngine;
+        self.clock.set_timer_repeating(
+            &timer_name,
+            period_ns,
+            next_boundary,
+            None,
+            Box::new(move |event| {
+                // SAFETY: DataEngine must live at least as long as the timer handler.
+                unsafe {
+                    let engine = &mut *engine_ptr;
+                    engine.advance_clock(event.timestamp_ns);
+                }
+            }),
+            false, // fire_immediately = false
+        );
+
         self.subscriptions.insert(
             msg.endpoint,
             DataSubscription::Bars { bar_type: msg.bar_type },
@@ -95,29 +250,70 @@ impl DataEngine {
     /// Handle an unsubscribe bars message.
     pub fn unsubscribe_bars(&mut self, msg: UnsubscribeBars) {
         self.subscriptions.remove(&msg.endpoint);
+        // Note: we keep the aggregator around for now — it may still close bars on clock advance
+    }
+
+    /// Handle a subscribe quotes message.
+    pub fn subscribe_quotes(&mut self, msg: crate::data::messages::SubscribeQuotes) {
+        self.subscriptions.insert(
+            msg.endpoint,
+            DataSubscription::Quotes {
+                instrument_id: msg.instrument_id,
+            },
+        );
+    }
+
+    /// Handle an unsubscribe quotes message.
+    pub fn unsubscribe_quotes(&mut self, msg: crate::data::messages::UnsubscribeQuotes) {
+        self.subscriptions.remove(&msg.endpoint);
+    }
+
+    /// Handle a subscribe order books message.
+    pub fn subscribe_orderbooks(&mut self, msg: crate::data::messages::SubscribeOrderBooks) {
+        self.subscriptions.insert(
+            msg.endpoint,
+            DataSubscription::OrderBooks {
+                instrument_id: msg.instrument_id,
+            },
+        );
+    }
+
+    /// Handle an unsubscribe order books message.
+    pub fn unsubscribe_orderbooks(&mut self, msg: crate::data::messages::UnsubscribeOrderBooks) {
+        self.subscriptions.remove(&msg.endpoint);
     }
 
     /// Return the number of active subscriptions.
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.len()
     }
+
+    /// Replay historical ticks through the data engine.
+    /// Iterates ticks in order and calls process_trade for each.
+    pub fn replay(&mut self, ticks: &[TradeFlowStats], instrument_id: InstrumentId) {
+        for tick in ticks {
+            self.process_trade(tick, instrument_id);
+        }
+    }
 }
 
 impl Default for DataEngine {
     fn default() -> Self {
-        Self::new()
+        panic!("DataEngine::default() requires a Clock — use DataEngine::new(clock) instead")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::TestClock;
     use crate::instrument::InstrumentId;
     use crate::messages::{StrategyId, TraderId};
 
     #[test]
     fn test_subscribe_and_unsubscribe_trades() {
-        let mut engine = DataEngine::new();
+        let clock = Box::new(TestClock::new());
+        let mut engine = DataEngine::new(clock);
         assert_eq!(engine.subscription_count(), 0);
 
         engine.subscribe_trades(SubscribeTrades {
@@ -136,7 +332,8 @@ mod tests {
 
     #[test]
     fn test_subscribe_and_unsubscribe_bars() {
-        let mut engine = DataEngine::new();
+        let clock = Box::new(TestClock::new());
+        let mut engine = DataEngine::new(clock);
 
         engine.subscribe_bars(SubscribeBars {
             trader_id: TraderId::new("trader-001"),
@@ -154,7 +351,8 @@ mod tests {
 
     #[test]
     fn test_multiple_subscriptions() {
-        let mut engine = DataEngine::new();
+        let clock = Box::new(TestClock::new());
+        let mut engine = DataEngine::new(clock);
         let btc = InstrumentId::new("BTCUSDT", "BINANCE");
         let eth = InstrumentId::new("ETHUSDT", "BINANCE");
 

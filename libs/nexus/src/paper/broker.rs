@@ -20,6 +20,7 @@ pub struct PaperTrade {
     pub timestamp_ns: u64,
     pub client_order_id: ClientOrderId,
     pub instrument_id: InstrumentId,
+    pub venue: String,
     pub side: OrderSide,
     pub fill_price: f64,
     pub size: f64,
@@ -127,6 +128,7 @@ impl PaperBroker {
                             instrument_id,
                             submit.order_side,
                             false,
+                            venue_str.to_string(),
                         );
                         // Update OMS state without publishing (PaperBroker already published)
                         self.oms.apply_fill_no_publish(&client_order_id, &filled);
@@ -163,6 +165,7 @@ impl PaperBroker {
                             instrument_id,
                             submit.order_side,
                             true,
+                            venue_str.to_string(),
                         );
                         // Update OMS state without publishing
                         self.oms.apply_fill_no_publish(&client_order_id, &filled);
@@ -201,10 +204,12 @@ impl PaperBroker {
                 InstrumentId::new("LIMIT-FILL", "PAPER"),
                 OrderSide::Buy,
                 true,
+                "PAPER".to_string(),
             );
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_fill(
         &mut self,
         fill: FillEvent,
@@ -213,12 +218,14 @@ impl PaperBroker {
         instrument_id: InstrumentId,
         order_side: OrderSide,
         is_maker: bool,
+        venue: String,
     ) -> OrderFilled {
         // Record in paper trades log
         self.paper_trades.push(PaperTrade {
             timestamp_ns: fill.timestamp_ns,
             client_order_id: client_order_id.clone(),
             instrument_id,
+            venue: venue.clone(),
             side: Self::to_messages_side(fill.side),
             fill_price: fill.fill_price,
             size: fill.fill_size,
@@ -250,7 +257,7 @@ impl PaperBroker {
             venue_order_id: VenueOrderId::new(&format!("PAPER-{}", fill.order_id)),
             position_id,
             trade_id: Self::make_trade_id(fill.order_id, fill.timestamp_ns),
-            instrument_id: format!("{}.{}", instrument_id.id, venue_str(instrument_id)),
+            instrument_id: format!("{}.{}", instrument_id.id, venue),
             order_side,
             filled_qty: fill.fill_size,
             fill_price: fill.fill_price,
@@ -271,12 +278,4 @@ impl PaperBroker {
     pub fn paper_trades(&self) -> &[PaperTrade] {
         &self.paper_trades
     }
-}
-
-/// Helper to get venue string from InstrumentId (id encodes symbol.venue).
-/// Since InstrumentId is just {id: u32}, we store the raw string on the struct for display.
-fn venue_str(_instrument_id: InstrumentId) -> &'static str {
-    // InstrumentId.id is a u32 hash — can't reverse it.
-    // For OrderFilled.instrument_id (String field), we use a placeholder.
-    "PAPER"
 }
