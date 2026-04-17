@@ -150,8 +150,6 @@ pub struct BinanceWsAdapter {
     recv_rx: Option<mpsc::Receiver<WsMessage>>,
     /// Flag indicating if connected.
     connected: bool,
-    /// Reconnect attempt count.
-    reconnect_attempts: u32,
 }
 
 /// Outgoing WebSocket messages (subscribe/unsubscribe).
@@ -177,37 +175,60 @@ impl BinanceWsAdapter {
             send_tx: None,
             recv_rx: None,
             connected: false,
-            reconnect_attempts: 0,
         }
     }
 
     /// Establish WebSocket connection and subscribe to user data streams.
-    /// On disconnect, automatically reconnects with exponential backoff.
+    /// Spawns receive_loop which handles reconnection with exponential backoff.
     pub async fn connect(&mut self) -> Result<(), WsError> {
-        self.do_connect().await?;
-
-        // Spawn the receive loop
         let (send_tx, send_rx) = mpsc::channel::<WsOutgoing>(32);
+        let (recv_tx, recv_rx) = mpsc::channel::<WsMessage>(64);
         let ws_url = self.ws_url.clone();
 
-        // Spawn async receive + reconnect loop
         tokio::spawn(async move {
-            Self::receive_loop(ws_url, send_rx).await;
+            Self::receive_loop(ws_url, send_rx, recv_tx).await;
         });
 
         self.send_tx = Some(send_tx);
+        self.recv_rx = Some(recv_rx);
         self.connected = true;
         Ok(())
     }
 
-    async fn do_connect(&mut self) -> Result<(), WsError> {
-        let (ws_stream, _) = connect_async(&self.ws_url)
+    /// Receive loop: connects, subscribes, handles messages, reconnects on disconnect.
+    async fn receive_loop(
+        ws_url: String,
+        mut send_rx: mpsc::Receiver<WsOutgoing>,
+        mut recv_tx: mpsc::Sender<WsMessage>,
+    ) {
+        let mut attempts: u32 = 0;
+        loop {
+            match Self::ws_receive_loop(&ws_url, &mut send_rx, &mut recv_tx).await {
+                Ok(()) => break,
+                Err(WsError::ConnectionClosed) => {
+                    let backoff_ms = Self::compute_backoff(attempts);
+                    attempts = attempts.saturating_add(1);
+                    sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                Err(_e) => break,
+            }
+        }
+    }
+
+    /// Single connection receive loop: connects, subscribes, handles bidirectional messages.
+    async fn ws_receive_loop(
+        ws_url: &str,
+        send_rx: &mut mpsc::Receiver<WsOutgoing>,
+        recv_tx: &mut mpsc::Sender<WsMessage>,
+    ) -> Result<(), WsError> {
+        let (ws_stream, _) = connect_async(ws_url)
             .await
             .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Subscribe to execution report and balance update streams
+        // Subscribe to user data stream
         let subscribe_msg = serde_json::json!({
             "method": "SUBSCRIBE",
             "params": [
@@ -226,78 +247,63 @@ impl BinanceWsAdapter {
         if let Some(msg) = read.next().await {
             let text = msg.map_err(|e| WsError::RecvFailed(e.to_string()))?;
             let text = text.into_text().map_err(|e| WsError::RecvFailed(e.to_string()))?;
-            // Binance sends {"result": null, "id": 1} on success
             if !text.contains("\"result\":null") && !text.contains("\"result\": null") {
-                // Check if it's an error
                 if text.contains("\"error\"") {
                     return Err(WsError::SubscribeFailed(text.to_string()));
                 }
             }
         }
 
-        self.connected = true;
-        self.reconnect_attempts = 0;
-        Ok(())
-    }
-
-    /// Spawned receive loop. Handles messages and reconnection.
-    async fn receive_loop(ws_url: String, mut send_rx: mpsc::Receiver<WsOutgoing>) {
+        // Message loop — handle incoming WS messages and outgoing commands
         loop {
-            let result = Self::ws_receive_loop(&ws_url, &mut send_rx).await;
-            match result {
-                Ok(()) => break,
-                Err(WsError::ConnectionClosed) => {
-                    // Reconnect with backoff
-                    let attempts = 0u32; // TODO: track properly
-                    let backoff_ms = Self::compute_backoff(attempts);
-                    sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(msg)) => {
+                            match msg {
+                                Message::Text(text) => {
+                                    if text.contains("eventStreamTerminated") {
+                                        return Err(WsError::ConnectionClosed);
+                                    }
+                                    if let Some(ws_msg) = Self::parse_message(&text) {
+                                        let _ = recv_tx.send(ws_msg).await;
+                                    }
+                                }
+                                Message::Ping(data) => {
+                                    let _ = write.send(Message::Pong(data)).await;
+                                }
+                                Message::Close(_) => {
+                                    return Err(WsError::ConnectionClosed);
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(Err(e)) => return Err(WsError::RecvFailed(e.to_string())),
+                        None => return Ok(()),
+                    }
                 }
-                Err(_e) => {
-                    // Log and exit
-                    break;
+                outgoing = send_rx.recv() => {
+                    match outgoing {
+                        Some(WsOutgoing::Unsubscribe(streams)) => {
+                            let msg = serde_json::json!({
+                                "method": "UNSUBSCRIBE",
+                                "params": streams,
+                                "id": 2
+                            });
+                            let _ = write.send(Message::Text(msg.to_string().into())).await;
+                        }
+                        Some(WsOutgoing::Ping) => {
+                            // Keepalive ping — flush the write side
+                            let _ = write.flush().await;
+                        }
+                        Some(WsOutgoing::Subscribe(_)) => {
+                            // Subscriptions handled at connect time
+                        }
+                        None => {}
+                    }
                 }
             }
         }
-    }
-
-    async fn ws_receive_loop(
-        ws_url: &str,
-        _send_rx: &mut mpsc::Receiver<WsOutgoing>,
-    ) -> Result<(), WsError> {
-        let (ws_stream, _) = connect_async(ws_url)
-            .await
-            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // Receive loop
-        while let Some(msg) = read.next().await {
-            let msg = msg.map_err(|e| WsError::RecvFailed(e.to_string()))?;
-
-            match msg {
-                Message::Text(text) => {
-                    // Check for event stream terminated
-                    if text.contains("eventStreamTerminated") {
-                        return Err(WsError::ConnectionClosed);
-                    }
-                    // Parse the message
-                    if let Some(ws_msg) = Self::parse_message(&text) {
-                        // Send to application (would be channel in real impl)
-                        let _ = ws_msg;
-                    }
-                }
-                Message::Ping(data) => {
-                    let _ = write.send(Message::Pong(data)).await;
-                }
-                Message::Close(_) => {
-                    return Err(WsError::ConnectionClosed);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
     }
 
     /// Compute exponential backoff: 1s, 2s, 4s, ..., max 60s.
