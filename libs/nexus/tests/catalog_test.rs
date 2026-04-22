@@ -23,6 +23,10 @@ fn entry(symbol: &str, start: u64, end: u64, path: &str) -> CatalogEntry {
         num_ticks: 100000,
         file_path: path.to_string(),
         checksum: "abc123".to_string(),
+        created_at_ns: 0,
+        source_adapter: String::new(),
+        is_complete: true,
+        partial_range: None,
     }
 }
 

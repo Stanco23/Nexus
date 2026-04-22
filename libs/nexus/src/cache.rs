@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::database::{Database, DatabaseError, SqliteDatabase};
 use crate::engine::account::{Account, AccountId, Position};
 use crate::engine::orders::Order;
+pub use crate::buffer::BarType;
 use crate::instrument::{InstrumentId, Venue};
 use crate::instrument::registry::InstrumentRegistry;
 use crate::instrument::Instrument as InstrumentDef;
@@ -101,25 +102,10 @@ pub struct Instrument {
     pub raw_symbol: String,
 }
 
-/// Synthetic instrument — derived from a formula.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SyntheticInstrument {
-    pub id: InstrumentId,
-    pub formula: String,
-}
+pub use crate::instrument::SyntheticInstrument;
 
-/// Bar type identifier — describes how a bar was aggregated.
-///
-/// Format: `{instrument_id}-{period}-{aggregation}`
-/// Example: `BTCUSDT.BINANCE-1m-BETWEEN`
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BarType(pub String);
-
-impl BarType {
-    pub fn new(instrument_id: &InstrumentId, period_name: &str) -> Self {
-        Self(format!("{}-{}-BETWEEN", instrument_id, period_name))
-    }
-}
+/// Bar type — re-exported from buffer module for cache use.
+/// Uses buffer::BarType which has symbol + venue + spec + aggregation_source.
 
 /// Order book — level 2 bid/ask.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,7 +282,7 @@ impl Cache {
                 .or_default()
                 .insert(coid.clone());
             cache.index_instrument_orders
-                .entry(order.instrument_id)
+                .entry(order.instrument_id.clone())
                 .or_default()
                 .insert(coid.clone());
             if order.filled {
@@ -321,7 +307,7 @@ impl Cache {
                 .or_default()
                 .insert(pid.clone());
             cache.index_instrument_positions
-                .entry(pos.instrument_id)
+                .entry(pos.instrument_id.clone())
                 .or_default()
                 .insert(pid.clone());
             if pos.quantity == 0.0 {
@@ -436,7 +422,7 @@ impl Cache {
     pub fn update_order(&mut self, order: Order) {
         let client_order_id = order.client_order_id.clone();
         let strategy_id = order.strategy_id.clone();
-        let instrument_id = order.instrument_id; // InstrumentId is Copy
+        let instrument_id = order.instrument_id.clone();
         let filled = order.filled;
 
         // Insert/update in orders map (order consumed here)
@@ -577,7 +563,7 @@ impl Cache {
     pub fn update_position(&mut self, position: Position) {
         let position_id = position.position_id.clone();
         let strategy_id = position.strategy_id.clone();
-        let instrument_id = position.instrument_id; // InstrumentId is Copy
+        let instrument_id = position.instrument_id.clone();
         let quantity = position.quantity;
         let venue = position.venue.clone();
 
@@ -638,7 +624,7 @@ impl Cache {
 
     /// Get an instrument by InstrumentId (hash-based).
     /// Delegates to the InstrumentRegistry for authoritative lookups.
-    pub fn get_instrument(&self, instrument_id: InstrumentId) -> Option<&InstrumentDef> {
+    pub fn get_instrument(&self, instrument_id: InstrumentId) -> Option<InstrumentDef> {
         self.registry.as_ref()?.get(instrument_id.id)
     }
 
@@ -648,29 +634,28 @@ impl Cache {
     /// to the cache's Instrument stub (with InstrumentId/raw_symbol).
     pub fn add_instrument(&mut self, instrument: InstrumentDef) {
         let raw_symbol = format!("{}.{}", instrument.symbol, instrument.venue);
+        let instrument_id = InstrumentId::new(&instrument.symbol, &instrument.venue);
         let cache_instrument = Instrument {
-            id: InstrumentId { id: instrument.id },
+            id: instrument_id.clone(),
             raw_symbol,
         };
-        self.instruments.insert(InstrumentId { id: instrument.id }, Arc::new(cache_instrument));
+        self.instruments.insert(instrument_id, Arc::new(cache_instrument));
     }
 
     /// Add a synthetic instrument and populate the underlying index.
     pub fn add_synthetic(&mut self, synthetic: SyntheticInstrument) {
-        // Extract underlying symbol from formula (format "SYMBOL.venue + SYMBOL.venue" or similar)
-        let formula = &synthetic.formula;
-        let underlying = formula.split_whitespace()
-            .next()
-            .unwrap_or("UNKNOWN")
-            .split('.')
-            .next()
-            .unwrap_or("UNKNOWN")
-            .to_string();
+        // Use the first component as the underlying for indexing
+        let underlying = if synthetic.component_names.is_empty() {
+            "UNKNOWN"
+        } else {
+            &synthetic.component_names[0]
+        };
+        let synthetic_id = synthetic.id.clone();
         self.index_synthetics_underlying
-            .entry(underlying)
+            .entry(underlying.to_string())
             .or_default()
-            .push(synthetic.id);
-        self.synthetics.insert(synthetic.id, Arc::new(synthetic));
+            .push(synthetic_id.clone());
+        self.synthetics.insert(synthetic_id, Arc::new(synthetic));
     }
 
     /// Get synthetic instruments by underlying symbol.
@@ -909,7 +894,7 @@ mod tests {
             1,
             crate::messages::ClientOrderId::new("ORD-001"),
             StrategyId::new("strat-A"),
-            instrument_a,
+            instrument_a.clone(),
             venue.clone(),
             OOrderSide::Buy,
             OOrderType::Market,
@@ -925,7 +910,7 @@ mod tests {
             2,
             crate::messages::ClientOrderId::new("ORD-002"),
             StrategyId::new("strat-A"),
-            instrument_a,
+            instrument_a.clone(),
             venue.clone(),
             OOrderSide::Buy,
             OOrderType::Market,
@@ -941,7 +926,7 @@ mod tests {
             3,
             crate::messages::ClientOrderId::new("ORD-003"),
             StrategyId::new("strat-B"),
-            instrument_b,
+            instrument_b.clone(),
             venue.clone(),
             OOrderSide::Sell,
             OOrderType::Market,
@@ -956,7 +941,7 @@ mod tests {
         // Save a position
         let pos = crate::engine::account::Position::new(
             crate::messages::PositionId::new("POS-001"),
-            instrument_a,
+            instrument_a.clone(),
             StrategyId::new("strat-A"),
             venue,
             crate::messages::OrderSide::Buy,
@@ -1008,7 +993,7 @@ mod tests {
             1,
             crate::messages::ClientOrderId::new("ORD-KILL"),
             StrategyId::new("strat-X"),
-            instrument,
+            instrument.clone(),
             venue.clone(),
             OOrderSide::Buy,
             OOrderType::Market,
@@ -1088,7 +1073,7 @@ mod tests {
         // Create positions for same strategy/instrument but different venues (Hedge mode)
         let pos1 = Position::new(
             gen.next_with_oms(&venue_binance, &strategy, &instrument, OmsType::Hedge),
-            instrument,
+            instrument.clone(),
             strategy.clone(),
             venue_binance.clone(),
             OrderSide::Buy,

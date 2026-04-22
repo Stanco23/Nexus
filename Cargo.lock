@@ -1281,6 +1281,7 @@ dependencies = [
  "hmac",
  "memmap2",
  "nalgebra",
+ "once_cell",
  "rand 0.8.5",
  "rayon",
  "reqwest",

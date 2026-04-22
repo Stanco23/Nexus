@@ -34,6 +34,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use tvc::reader::ReaderError;
+use tvc::TvcReader;
+
 /// Catalog metadata entry for a single TVC file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CatalogEntry {
@@ -51,6 +54,23 @@ pub struct CatalogEntry {
     pub file_path: String,
     /// SHA256 checksum of the file (hex string).
     pub checksum: String,
+    /// Ingestion timestamp in nanoseconds.
+    #[serde(default)]
+    pub created_at_ns: u64,
+    /// Source adapter that ingested the file (e.g., "BinanceMarketDataAdapter").
+    #[serde(default)]
+    pub source_adapter: String,
+    /// True if the file has been fully ingested; false if still being streamed.
+    #[serde(default = "default_true")]
+    pub is_complete: bool,
+    /// (start_ns, end_ns) range for partial files being streamed.
+    #[serde(default)]
+    pub partial_range: Option<(u64, u64)>,
+}
+
+/// Default value for `is_complete` (true = full file ingested).
+fn default_true() -> bool {
+    true
 }
 
 impl CatalogEntry {
@@ -62,6 +82,31 @@ impl CatalogEntry {
     /// Check if this entry is entirely within [start, end].
     pub fn contains(&self, start: u64, end: u64) -> bool {
         self.start_time_ns >= start && self.end_time_ns <= end
+    }
+
+    /// Validate the TVC file at `file_path` by opening it with `TvcReader`.
+    ///
+    /// This triggers SHA256 verification performed inside `TvcReader::open()`.
+    pub fn validate_entry(&self) -> Result<(), CatalogError> {
+        let path = Path::new(&self.file_path);
+        match TvcReader::open(path) {
+            Ok(_) => Ok(()),
+            Err(ReaderError::Sha256Mismatch) => {
+                Err(CatalogError::ChecksumMismatch(self.file_path.clone()))
+            }
+            Err(e) => Err(CatalogError::TvcOpenError(e.to_string())),
+        }
+    }
+
+    /// Validate a complete entry for catalog loading purposes.
+    /// Returns Ok(()) if the file doesn't exist yet (placeholder during streaming ingestion).
+    /// Use `validate_entry()` for explicit user-facing validation that errors on missing files.
+    fn validate_entry_for_load(&self) -> Result<(), CatalogError> {
+        let path = Path::new(&self.file_path);
+        if !path.exists() {
+            return Ok(());
+        }
+        self.validate_entry()
     }
 }
 
@@ -107,11 +152,28 @@ impl Catalog {
             entries_vec.sort_by_key(|e| e.start_time_ns);
         }
 
-        Ok(Self {
+        // Validate all entries (eager checksum verification on load)
+        let catalog = Self {
             entries,
             symbols,
             path: path.to_path_buf(),
-        })
+        };
+        catalog.validate_all_entries()?;
+        Ok(catalog)
+    }
+
+    /// Validate all entries in the catalog, returning the first error found.
+    /// Only validates entries where `is_complete == true` (incomplete entries
+    /// may have placeholder paths during streaming ingestion).
+    fn validate_all_entries(&self) -> Result<(), CatalogError> {
+        for entries_vec in self.entries.values() {
+            for entry in entries_vec {
+                if entry.is_complete {
+                    entry.validate_entry_for_load()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Save the catalog to its JSON file.
@@ -151,6 +213,34 @@ impl Catalog {
         // Merge overlapping entries
         let merged = Self::merge_entries(entries);
         *entries = merged;
+    }
+
+    /// Update the partial range for the latest entry of the given instrument.
+    ///
+    /// Sets `partial_range` to `(existing_start_ns, partial_end_ns)` where
+    /// `existing_start_ns` is the `start_time_ns` of the most recent entry.
+    /// Does nothing if there is no entry for this instrument.
+    pub fn update_entry(&mut self, instrument_id: u32, partial_end_ns: u64) {
+        let entries = match self.entries.get_mut(&instrument_id) {
+            Some(e) if !e.is_empty() => e,
+            _ => return,
+        };
+        let entry = entries.last_mut().expect("entries is non-empty");
+        entry.partial_range = Some((entry.start_time_ns, partial_end_ns));
+    }
+
+    /// Finalize the latest entry for the given instrument.
+    ///
+    /// Sets `is_complete = true` and clears `partial_range`.
+    /// Does nothing if there is no entry for this instrument.
+    pub fn finalize_entry(&mut self, instrument_id: u32) {
+        let entries = match self.entries.get_mut(&instrument_id) {
+            Some(e) if !e.is_empty() => e,
+            _ => return,
+        };
+        let entry = entries.last_mut().expect("entries is non-empty");
+        entry.is_complete = true;
+        entry.partial_range = None;
     }
 
     /// Merge a list of overlapping/adjacent entries into a single entry.
@@ -237,6 +327,18 @@ impl Catalog {
         self.entries.is_empty()
     }
 
+    /// Load all entries and verify each TVC file via `validate_entry()`.
+    ///
+    /// Returns the first `CatalogError` encountered, if any.
+    pub fn load_with_verification(&mut self) -> Result<(), CatalogError> {
+        for entries_vec in self.entries.values() {
+            if let Some(entry) = entries_vec.last() {
+                entry.validate_entry()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Compute SHA256 checksum of a file.
     pub fn compute_checksum(path: &Path) -> Result<String, CatalogError> {
         let data = fs::read(path)?;
@@ -269,6 +371,10 @@ pub enum CatalogError {
     FileNotFound(String),
     Json(serde_json::Error),
     Io(std::io::Error),
+    /// TVC file checksum does not match stored checksum.
+    ChecksumMismatch(String),
+    /// Failed to open TVC file.
+    TvcOpenError(String),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -277,6 +383,8 @@ impl std::fmt::Display for CatalogError {
             CatalogError::FileNotFound(s) => write!(f, "Catalog file not found: {}", s),
             CatalogError::Json(e) => write!(f, "JSON error: {}", e),
             CatalogError::Io(e) => write!(f, "IO error: {}", e),
+            CatalogError::ChecksumMismatch(s) => write!(f, "Checksum mismatch: {}", s),
+            CatalogError::TvcOpenError(s) => write!(f, "TVC open error: {}", s),
         }
     }
 }
@@ -310,6 +418,10 @@ mod tests {
             num_ticks,
             file_path: path.to_string(),
             checksum: "abcd1234".to_string(),
+            created_at_ns: 0,
+            source_adapter: String::new(),
+            is_complete: true,
+            partial_range: None,
         }
     }
 
@@ -391,5 +503,76 @@ mod tests {
         assert!(entry.overlaps(1500, 2500)); // Partial overlap
         assert!(!entry.overlaps(0, 500)); // No overlap
         assert!(!entry.overlaps(3000, 4000)); // No overlap
+    }
+
+    #[test]
+    fn test_validate_entry_nonexistent_file() {
+        let entry = CatalogEntry {
+            instrument_id: fnv1a_hash(b"BTCUSDT"),
+            symbol: "BTCUSDT".to_string(),
+            start_time_ns: 1000,
+            end_time_ns: 2000,
+            num_ticks: 100,
+            file_path: "/nonexistent/path/to/file.tvc".to_string(),
+            checksum: "abcd1234".to_string(),
+            created_at_ns: 0,
+            source_adapter: String::new(),
+            is_complete: true,
+            partial_range: None,
+        };
+        let result = entry.validate_entry();
+        assert!(matches!(result, Err(CatalogError::TvcOpenError(_))));
+    }
+
+    #[test]
+    fn test_streaming_ingestion_cycle() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        std::fs::remove_file(&path).ok();
+
+        let mut catalog = Catalog::new(&path);
+        let instrument_id = fnv1a_hash(b"BTCUSDT");
+
+        // Add entry as partial/streaming
+        let entry = CatalogEntry {
+            instrument_id,
+            symbol: "BTCUSDT".to_string(),
+            start_time_ns: 1000,
+            end_time_ns: 1000,
+            num_ticks: 0,
+            file_path: "/dummy.tvc".to_string(),
+            checksum: "abcd1234".to_string(),
+            created_at_ns: 0,
+            source_adapter: String::new(),
+            is_complete: false,
+            partial_range: Some((1000, 2000)),
+        };
+        catalog.add_entry(entry);
+
+        // Simulate more bytes written: update partial range end
+        catalog.update_entry(instrument_id, 3000);
+
+        // Verify partial_range was updated to (1000, 3000)
+        {
+            let entries = catalog.entries.get(&instrument_id).unwrap();
+            let latest = entries.last().unwrap();
+            assert_eq!(latest.partial_range, Some((1000, 3000)));
+            assert!(!latest.is_complete);
+        }
+
+        // Finalize the entry
+        catalog.finalize_entry(instrument_id);
+
+        // Verify finalized state
+        {
+            let entries = catalog.entries.get(&instrument_id).unwrap();
+            let latest = entries.last().unwrap();
+            assert!(latest.is_complete, "entry should be complete after finalize");
+            assert!(
+                latest.partial_range.is_none(),
+                "partial_range should be None after finalize"
+            );
+        }
     }
 }

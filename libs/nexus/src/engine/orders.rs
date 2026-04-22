@@ -3,14 +3,17 @@
 use serde::{Deserialize, Serialize};
 use crate::engine::core::Signal;
 use crate::instrument::{InstrumentId, Venue};
-use crate::messages::{ClientOrderId, PositionId, StrategyId};
+use crate::messages::{ClientOrderId, PositionId, StrategyId, TimeInForce};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderType {
     Market,
     Limit,
     Stop,
-    StopLimit, // triggers when price crosses stop level, fills immediately at current price
+    StopLimit,
+    MarketIfTouched,
+    TrailingStopMarket,
+    TrailingStopLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +38,10 @@ pub struct Order {
     pub filled: bool,
     pub triggered: bool,
     pub position_id: Option<PositionId>,
+    pub time_in_force: Option<TimeInForce>,
+    pub expire_time_ns: Option<u64>,
+    /// Trailing delta for trailing stop orders.
+    pub trailing_delta: Option<f64>,
 }
 
 impl Order {
@@ -67,6 +74,9 @@ impl Order {
             filled: false,
             triggered: false,
             position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
         }
     }
 
@@ -91,6 +101,7 @@ impl Order {
     pub fn trigger_price(&self) -> Option<f64> {
         match self.order_type {
             OrderType::Stop if !self.triggered => Some(self.price),
+            OrderType::MarketIfTouched if !self.triggered => Some(self.price),
             _ => None,
         }
     }
@@ -143,6 +154,25 @@ pub fn check_pending_orders(
                     current_price <= order.price
                 };
                 if crosses {
+                    to_fill.push(i);
+                }
+            }
+            OrderType::MarketIfTouched => {
+                let crosses = if order.is_buy() {
+                    current_price >= order.price
+                } else {
+                    current_price <= order.price
+                };
+                if crosses && !order.triggered {
+                    order.triggered = true;
+                    to_fill.push(i);
+                }
+            }
+            OrderType::TrailingStopMarket | OrderType::TrailingStopLimit => {
+                // Trailing stops are managed externally with a callback price;
+                // for now, they are triggered when first checked (placeholder)
+                if !order.triggered {
+                    order.triggered = true;
                     to_fill.push(i);
                 }
             }

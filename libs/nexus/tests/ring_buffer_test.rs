@@ -178,11 +178,11 @@ fn test_ring_buffer_seek_to_tick() {
     assert_eq!(tick.sequence, 10);
 
     // Seek to tick 55 (should find anchor at 50)
-    let (offset, anchor_tick) = buffer.seek_to_tick(55).unwrap();
+    let (_offset, anchor_tick) = buffer.seek_to_tick(55).unwrap();
     assert_eq!(anchor_tick, 50);
 
     // Seek to tick 99 (should find anchor at 90)
-    let (offset, anchor_tick) = buffer.seek_to_tick(99).unwrap();
+    let (_offset, anchor_tick) = buffer.seek_to_tick(99).unwrap();
     assert_eq!(anchor_tick, 90);
 
     clean_file(path);
@@ -310,11 +310,11 @@ fn test_ring_buffer_set_single_file() {
     }
     writer.finalize().unwrap();
 
-    let set = RingBufferSet::single(path, inst_id).unwrap();
+    let set = RingBufferSet::single(path, inst_id.clone()).unwrap();
     assert_eq!(set.num_instruments(), 1);
     assert_eq!(set.total_ticks(), 200);
 
-    let buf = set.get(inst_id).unwrap();
+    let buf = set.get(&inst_id).unwrap();
     assert_eq!(buf.num_ticks(), 200);
 
     clean_file(path);
@@ -361,16 +361,16 @@ fn test_ring_buffer_set_two_instruments() {
     w2.finalize().unwrap();
 
     let set = RingBufferSet::from_files([
-        (PathBuf::from(path1), inst_id1),
-        (PathBuf::from(path2), inst_id2),
+        (PathBuf::from(path1), inst_id1.clone()),
+        (PathBuf::from(path2), inst_id2.clone()),
     ])
     .unwrap();
 
     assert_eq!(set.num_instruments(), 2);
     assert_eq!(set.total_ticks(), 150);
 
-    let buf1 = set.get(inst_id1).unwrap();
-    let buf2 = set.get(inst_id2).unwrap();
+    let buf1 = set.get(&inst_id1).unwrap();
+    let buf2 = set.get(&inst_id2).unwrap();
     assert_eq!(buf1.num_ticks(), 100);
     assert_eq!(buf2.num_ticks(), 50);
 

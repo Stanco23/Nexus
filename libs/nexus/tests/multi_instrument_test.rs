@@ -1,6 +1,6 @@
 //! Integration tests for TickBufferSet and multi-instrument data handling.
 
-use nexus::buffer::{MergeCursor, TickBufferSet};
+use nexus::buffer::TickBufferSet;
 use nexus::instrument::InstrumentId;
 use std::fs;
 use std::path::Path;
@@ -61,13 +61,13 @@ fn test_tick_buffer_set_from_files() {
     let id2 = InstrumentId::new("INST2", "BINANCE");
     let id3 = InstrumentId::new("INST3", "BINANCE");
     let buffer_set =
-        TickBufferSet::from_files([(path1.to_path_buf(), id1), (path2.to_path_buf(), id2)])
+        TickBufferSet::from_files([(path1.to_path_buf(), id1.clone()), (path2.to_path_buf(), id2.clone())])
             .unwrap();
 
     assert_eq!(buffer_set.num_instruments(), 2);
-    assert!(buffer_set.get(id1).is_some());
-    assert!(buffer_set.get(id2).is_some());
-    assert!(buffer_set.get(id3).is_none()); // Non-existent
+    assert!(buffer_set.get(&id1).is_some());
+    assert!(buffer_set.get(&id2).is_some());
+    assert!(buffer_set.get(&id3).is_none()); // Non-existent
 
     clean_file(path1);
     clean_file(path2);
@@ -117,7 +117,7 @@ fn test_merge_cursor_time_ordering() {
     let id1 = InstrumentId::new("INST1", "BINANCE");
     let id2 = InstrumentId::new("INST2", "BINANCE");
     let buffer_set =
-        TickBufferSet::from_files([(path1.to_path_buf(), id1), (path2.to_path_buf(), id2)])
+        TickBufferSet::from_files([(path1.to_path_buf(), id1.clone()), (path2.to_path_buf(), id2.clone())])
             .unwrap();
 
     let mut cursor = buffer_set.merge_cursor();
@@ -182,7 +182,7 @@ fn test_merge_cursor_peek() {
     writer2.finalize().unwrap();
 
     let buffer_set =
-        TickBufferSet::from_files([(path1.to_path_buf(), id1), (path2.to_path_buf(), id2)])
+        TickBufferSet::from_files([(path1.to_path_buf(), id1.clone()), (path2.to_path_buf(), id2.clone())])
             .unwrap();
 
     let mut cursor = buffer_set.merge_cursor();
@@ -235,7 +235,7 @@ fn test_merge_cursor_single_instrument() {
     writer.finalize().unwrap();
 
     let id1 = InstrumentId::new("INST1", "BINANCE");
-    let buffer_set = TickBufferSet::from_files([(path.to_path_buf(), id1)]).unwrap();
+    let buffer_set = TickBufferSet::from_files([(path.to_path_buf(), id1.clone())]).unwrap();
 
     let mut cursor = buffer_set.merge_cursor();
     let mut count = 0;
@@ -272,7 +272,7 @@ fn test_merge_cursor_has_next() {
     writer.finalize().unwrap();
 
     let id1 = InstrumentId::new("INST1", "BINANCE");
-    let buffer_set = TickBufferSet::from_files([(path.to_path_buf(), id1)]).unwrap();
+    let buffer_set = TickBufferSet::from_files([(path.to_path_buf(), id1.clone())]).unwrap();
 
     let mut cursor = buffer_set.merge_cursor();
 
@@ -296,7 +296,7 @@ fn test_tick_buffer_set_num_instruments() {
     clean_file(path2);
     clean_file(path3);
 
-    let mut create_file = |p: &Path, id: u64| {
+    let create_file = |p: &Path, id: u64| {
         let mut w = TvcWriter::new(p, id as u32, 10, 9).unwrap();
         let ts = 1_000_000_000u64 + id * 1_000_000_000;
         for i in 0..5u64 {

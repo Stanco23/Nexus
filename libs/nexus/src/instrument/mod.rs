@@ -17,13 +17,17 @@
 //! - `TokenizedAsset` — tokenized securities
 
 pub mod enums;
+pub mod expressions;
 pub mod instrument_id;
 pub mod registry;
 pub mod synthetic;
+pub mod tick_scheme;
 pub mod types;
 
 pub use enums::{AssetClass, InstrumentClass, OptionKind};
-pub use instrument_id::{InstrumentId, Venue};
+pub use expressions::{CompiledExpression, EvalError, ParseExpressionError};
+pub use instrument_id::{InstrumentId, Venue, fnv1a_hash};
 pub use registry::InstrumentRegistry;
-pub use synthetic::{parse_formula, Formula, SyntheticInstrument};
+pub use synthetic::{parse_formula as parse_synthetic_formula, Formula, SyntheticInstrument};
+pub use tick_scheme::{FixedTickScheme, TieredTickScheme, TickScheme, TickTier};
 pub use types::Instrument;

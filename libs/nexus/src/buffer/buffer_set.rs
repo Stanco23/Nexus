@@ -29,7 +29,7 @@ pub struct RingBufferSet {
 /// A single entry in the merged anchor index.
 ///
 /// References a specific anchor in a specific file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MergedAnchor {
     /// Global tick index across all instruments.
     pub global_tick_index: u64,
@@ -52,13 +52,13 @@ impl RingBufferSet {
         let mut total_ticks: u64 = 0;
 
         for (path, instrument_id) in files {
-            let buffer = Arc::new(RingBuffer::open(&path, instrument_id)?);
+            let buffer = Arc::new(RingBuffer::open(&path, instrument_id.clone())?);
             let num_ticks = buffer.num_ticks();
 
             // Collect anchors from this buffer
             for entry in buffer.anchor_index().iter() {
                 all_anchors.push(AnchorInfo {
-                    instrument_id,
+                    instrument_id: instrument_id.clone(),
                     byte_offset: entry.byte_offset,
                     local_tick_index: entry.tick_index,
                 });
@@ -68,8 +68,8 @@ impl RingBufferSet {
             buffers.insert(instrument_id, buffer);
         }
 
-        // Sort by instrument_id, then by local_tick_index
-        all_anchors.sort_by_key(|a| (a.instrument_id, a.local_tick_index));
+        // Sort by instrument_id (u32 id field), then by local_tick_index
+        all_anchors.sort_by_key(|a| (a.instrument_id.id, a.local_tick_index));
 
         // Build merged anchor index - group by instrument
         let mut merged_anchors: Vec<MergedAnchor> = Vec::new();
@@ -78,9 +78,9 @@ impl RingBufferSet {
         let mut instrument_start_tick: u64 = 0;
 
         for anchor in &all_anchors {
-            if Some(anchor.instrument_id) != current_instrument {
+            if Some(&anchor.instrument_id) != current_instrument.as_ref() {
                 // New instrument - update global offset
-                current_instrument = Some(anchor.instrument_id);
+                current_instrument = Some(anchor.instrument_id.clone());
                 if let Some(buffer) = buffers.get(&anchor.instrument_id) {
                     // Ticks from this instrument start at current global offset
                     instrument_start_tick = global_offset;
@@ -90,7 +90,7 @@ impl RingBufferSet {
 
             merged_anchors.push(MergedAnchor {
                 global_tick_index: instrument_start_tick + anchor.local_tick_index,
-                instrument_id: anchor.instrument_id,
+                instrument_id: anchor.instrument_id.clone(),
                 byte_offset: anchor.byte_offset,
                 local_tick_index: anchor.local_tick_index,
             });
@@ -127,8 +127,8 @@ impl RingBufferSet {
     }
 
     /// Get a reference to a specific instrument's RingBuffer.
-    pub fn get(&self, instrument_id: InstrumentId) -> Option<&Arc<RingBuffer>> {
-        self.buffers.get(&instrument_id)
+    pub fn get(&self, instrument_id: &InstrumentId) -> Option<&Arc<RingBuffer>> {
+        self.buffers.get(instrument_id)
     }
 
     /// Get the merged anchor index.
@@ -165,7 +165,7 @@ impl RingBufferSet {
 
     /// Get all instrument IDs.
     pub fn instrument_ids(&self) -> Vec<InstrumentId> {
-        self.buffers.keys().copied().collect()
+        self.buffers.keys().cloned().collect()
     }
 
     /// Iterate all instruments' buffers.
@@ -200,10 +200,10 @@ impl TickBufferSet {
         let mut instrument_ids: Vec<InstrumentId> = Vec::new();
 
         for (path, instrument_id) in files {
-            let rb = RingBuffer::open(&path, instrument_id)?;
+            let rb = RingBuffer::open(&path, instrument_id.clone())?;
             let tb = TickBuffer::from_ring_buffer(&rb, 50)
                 .map_err(|e| RingBufferError::InvalidHeader(e.to_string()))?;
-            buffers.insert(instrument_id, Arc::new(tb));
+            buffers.insert(instrument_id.clone(), Arc::new(tb));
             instrument_ids.push(instrument_id);
         }
 
@@ -224,7 +224,7 @@ impl TickBufferSet {
         for (instrument_id, rb) in ring_buffers {
             let tb = TickBuffer::from_ring_buffer(&rb, num_buckets)
                 .map_err(|e| RingBufferError::InvalidHeader(e.to_string()))?;
-            buffers.insert(instrument_id, Arc::new(tb));
+            buffers.insert(instrument_id.clone(), Arc::new(tb));
             instrument_ids.push(instrument_id);
         }
 
@@ -245,8 +245,8 @@ impl TickBufferSet {
     }
 
     /// Get a reference to a specific instrument's TickBuffer.
-    pub fn get(&self, instrument_id: InstrumentId) -> Option<&Arc<TickBuffer>> {
-        self.buffers.get(&instrument_id)
+    pub fn get(&self, instrument_id: &InstrumentId) -> Option<&Arc<TickBuffer>> {
+        self.buffers.get(instrument_id)
     }
 
     /// Create a merge cursor for time-ordered iteration across all instruments.
@@ -282,10 +282,10 @@ impl<'a> MergeCursor<'a> {
     fn new(buffer_set: &'a TickBufferSet) -> Self {
         let mut iterators = Vec::new();
 
-        for &instrument_id in buffer_set.instrument_ids() {
-            if let Some(tb) = buffer_set.get(instrument_id) {
+        for instrument_id in buffer_set.instrument_ids() {
+            if let Some(tb) = buffer_set.get(&instrument_id) {
                 iterators.push(MergeState {
-                    instrument_id,
+                    instrument_id: instrument_id.clone(),
                     buffer: tb,
                     next_index: 0,
                 });
@@ -319,7 +319,7 @@ impl<'a> MergeCursor<'a> {
             let state = &mut self.iterators[idx];
             if let Some(tick) = state.buffer.get(state.next_index) {
                 self.current_event = Some(MultiInstrumentEvent {
-                    instrument_id: state.instrument_id,
+                    instrument_id: state.instrument_id.clone(),
                     tick,
                 });
                 state.next_index += 1;

@@ -13,8 +13,8 @@
       "acceptanceCriteria": [
         "OrderState enum has variants: Pending, Accepted, PartiallyFilled, Filled, Cancelled, Rejected",
         "OmsOrder struct has all required fields: client_order_id, venue_order_id: Option<VenueOrderId>, position_id, state: OrderState, filled_qty, last_fill_price, submitted_at_ns, strategy_id, instrument_id, order_side",
-        "Oms struct holds cache: Arc<Cache>, msgbus: Arc<MsgBus>, position_id_gen: PositionIdGenerator, oms_type: OmsType",
-        "Oms::new(cache, msgbus, oms_type) compiles and constructs Oms with all fields",
+        "Oms struct holds cache: Arc<Cache>, msgbus: Arc<MsgBus>, position_id_gen: PositionIdGenerator, oms_type: OmsType, account: Option<Arc<Mutex<Account>>>",
+        "Oms::new(cache, msgbus, oms_type, account) compiles and constructs Oms with all fields",
         "Oms::submit_order() calls position_id_gen.next_with_oms() and returns PositionId",
         "Oms::apply_accepted(), apply_fill(), apply_fill_no_publish(), cancel(), apply_rejection() all compile with correct signatures",
         "cargo build -p nexus compiles engine/oms.rs with zero warnings"
@@ -46,7 +46,7 @@
       "description": "ExecutionClient owns an Oms instance. submit_order(): oms.submit_order() -> HTTP place_order -> returns (VenueOrderId, PositionId). apply_accepted() called from handle_execution_report() on WS NEW event. Fill/cancel/reject flow through Oms.",
       "acceptanceCriteria": [
         "ExecutionClient struct has oms: Oms field",
-        "ExecutionClient::new() constructs Oms::new(cache.clone(), Arc::new(msgbus), oms_type)",
+        "ExecutionClient receives a pre-constructed Oms (passed as argument to new())",
         "ExecutionClient::submit_order(&mut self, submit: SubmitOrder) -> Result<(VenueOrderId, PositionId), BinanceApiError>",
         "submit_order calls oms.submit_order() then http.place_order() then returns (venue_order_id, position_id)",
         "handle_execution_report() calls oms.apply_accepted() on NEW status",
@@ -65,7 +65,7 @@
       "description": "PaperBroker replaces client_position_map and client_order_map with Oms instance. process_order() calls oms.submit_order() then oms.apply_fill_no_publish(). cancel_order() calls oms.cancel(). No double-publishing since fills are returned directly.",
       "acceptanceCriteria": [
         "PaperBroker struct replaces client_position_map/client_order_map with oms: Oms",
-        "PaperBroker::new() constructs Oms::new(cache.clone(), Arc::new(msgbus), oms_type)",
+        "PaperBroker::new() constructs Oms::new(cache.clone(), Arc::new(msgbus), oms_type, None)",
         "process_order() calls oms.submit_order() for position_id",
         "process_order() calls oms.apply_fill_no_publish() for fills (not apply_fill to avoid double-publish)",
         "cancel_order() calls oms.cancel()",
@@ -82,7 +82,7 @@
       "acceptanceCriteria": [
         "BacktestEngine::new() takes oms_type: OmsType, strategy_id: StrategyId, cache: Arc<Cache>, msgbus: Arc<MsgBus> as new params",
         "BacktestEngine struct has oms: Oms and strategy_id: StrategyId fields",
-        "BacktestEngine constructs Oms::new(cache, Arc::new(msgbus), oms_type)",
+        "BacktestEngine constructs Oms::new(cache, Arc::new(msgbus), oms_type, None)",
         "order_manager: OrderManager field removed from BacktestEngine struct",
         "run() loop calls self.oms.submit_order() when order is submitted",
         "process_fills() calls self.oms.apply_fill() before open_position()",

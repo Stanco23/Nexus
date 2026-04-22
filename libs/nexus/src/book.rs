@@ -73,6 +73,7 @@ pub struct FillEvent {
 struct QueueLevel {
     orders: Vec<OrderId>,       // order IDs in FIFO order
     timestamp_ns: u64,          // time first order was placed
+    order_count: u64,           // number of orders at this level (queue depth)
 }
 
 impl QueueLevel {
@@ -80,6 +81,7 @@ impl QueueLevel {
         Self {
             orders: Vec::new(),
             timestamp_ns: u64::MAX,
+            order_count: 0,
         }
     }
 
@@ -88,6 +90,7 @@ impl QueueLevel {
             self.timestamp_ns = timestamp_ns;
         }
         self.orders.push(order_id);
+        self.order_count += 1;
     }
 }
 
@@ -432,6 +435,8 @@ pub struct LevelFill {
     pub size_filled: f64,
     /// Remaining size at this level after partial fill (0 if fully consumed).
     pub remaining_at_level: f64,
+    /// Number of orders at this price level (queue depth for this level).
+    pub queue_depth: u64,
 }
 
 impl LevelFill {
@@ -442,8 +447,14 @@ impl LevelFill {
 
 #[derive(Debug, Clone)]
 pub struct OrderBook {
+    /// Bid price levels: price_int → size
     pub bids: BTreeMap<i64, f64>,
+    /// Ask price levels: price_int → size
     pub asks: BTreeMap<i64, f64>,
+    /// Bid queue depths: price_int → number of orders at this level
+    bid_queue_depths: BTreeMap<i64, u64>,
+    /// Ask queue depths: price_int → number of orders at this level
+    ask_queue_depths: BTreeMap<i64, u64>,
     pub last_price: f64,
     pub last_size: f64,
     pub last_side: u8,
@@ -457,6 +468,8 @@ impl OrderBook {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            bid_queue_depths: BTreeMap::new(),
+            ask_queue_depths: BTreeMap::new(),
             last_price: 0.0,
             last_size: 0.0,
             last_side: 0,
@@ -535,8 +548,10 @@ impl OrderBook {
         let price_int = (price * 1_000_000_000.0) as i64;
         if side == 1 {
             *self.bids.entry(price_int).or_insert(0.0) += size;
+            *self.bid_queue_depths.entry(price_int).or_insert(0) += 1;
         } else {
             *self.asks.entry(price_int).or_insert(0.0) += size;
+            *self.ask_queue_depths.entry(price_int).or_insert(0) += 1;
         }
     }
 
@@ -553,8 +568,33 @@ impl OrderBook {
                 book_side.remove(&price_int);
             }
         }
-        // If price level doesn't exist, there's nothing to remove — passive order
-        // was already filled or never existed; this is fine for the synthetic model.
+        // Decrement queue depth at this level.
+        let queue_depths = if side == 1 {
+            &mut self.bid_queue_depths
+        } else {
+            &mut self.ask_queue_depths
+        };
+        if let Some(depth) = queue_depths.get_mut(&price_int) {
+            *depth -= 1;
+            if *depth == 0 {
+                queue_depths.remove(&price_int);
+            }
+        }
+    }
+
+    /// Validate that a price aligns to the given tick size (price_increment).
+    /// Returns true if the price is a valid tick multiple from min_price.
+    pub fn validate_price_increment(price: f64, tick_size: f64, min_price: f64) -> bool {
+        if tick_size <= 0.0 || price < min_price {
+            return false;
+        }
+        let offset = (price - min_price) / tick_size;
+        (offset - offset.round()).abs() < 1e-9
+    }
+
+    /// Validate that a price aligns to the instrument's tick size.
+    pub fn validate_price(&self, price: f64, tick_size: f64) -> bool {
+        Self::validate_price_increment(price, tick_size, 0.0)
     }
 
     /// Walk the order book and compute fills for a market order.
@@ -579,10 +619,12 @@ impl OrderBook {
                 }
                 let size_at_level = available.min(remaining);
                 let remaining_at_level = available - size_at_level;
+                let queue_depth = self.ask_queue_depths.get(&price_int).copied().unwrap_or(1);
                 fills.push(LevelFill {
                     price_int,
                     size_filled: size_at_level,
                     remaining_at_level,
+                    queue_depth,
                 });
                 remaining -= size_at_level;
             }
@@ -594,16 +636,86 @@ impl OrderBook {
                 }
                 let size_at_level = available.min(remaining);
                 let remaining_at_level = available - size_at_level;
+                let queue_depth = self.bid_queue_depths.get(&price_int).copied().unwrap_or(1);
                 fills.push(LevelFill {
                     price_int,
                     size_filled: size_at_level,
                     remaining_at_level,
+                    queue_depth,
                 });
                 remaining -= size_at_level;
             }
         }
 
         fills
+    }
+}
+
+/// Incremental order book delta update.
+///
+/// Represents a set of changes to apply to the order book
+/// rather than a full book snapshot.
+#[derive(Debug, Clone)]
+pub struct OrderBookDelta {
+    pub price_int: i64,
+    pub size_delta: f64,   // positive = add, negative = remove
+    pub side: Side,
+}
+
+impl OrderBookDelta {
+    pub fn new(price_int: i64, size_delta: f64, side: Side) -> Self {
+        Self { price_int, size_delta, side }
+    }
+
+    pub fn price(&self) -> f64 {
+        self.price_int as f64 / 1_000_000_000.0
+    }
+}
+
+/// A batch of order book deltas to apply atomically.
+#[derive(Debug, Clone, Default)]
+pub struct OrderBookDeltas {
+    pub deltas: Vec<OrderBookDelta>,
+    pub timestamp_ns: u64,
+}
+
+impl OrderBookDeltas {
+    pub fn new(timestamp_ns: u64) -> Self {
+        Self {
+            deltas: Vec::new(),
+            timestamp_ns,
+        }
+    }
+
+    pub fn add_bid(&mut self, price_int: i64, size_delta: f64) {
+        self.deltas.push(OrderBookDelta::new(price_int, size_delta, Side::Buy));
+    }
+
+    pub fn add_ask(&mut self, price_int: i64, size_delta: f64) {
+        self.deltas.push(OrderBookDelta::new(price_int, size_delta, Side::Sell));
+    }
+
+    /// Apply deltas to an order book.
+    pub fn apply_to(&self, book: &mut OrderBook) {
+        for delta in &self.deltas {
+            let price = delta.price();
+            let size = delta.size_delta.abs();
+            if delta.side == Side::Buy {
+                if delta.size_delta > 0.0 {
+                    *book.bids.entry(delta.price_int).or_insert(0.0) += size;
+                    *book.bid_queue_depths.entry(delta.price_int).or_insert(0) += 1;
+                } else {
+                    book.remove_size(price, size, 1);
+                }
+            } else {
+                if delta.size_delta > 0.0 {
+                    *book.asks.entry(delta.price_int).or_insert(0.0) += size;
+                    *book.ask_queue_depths.entry(delta.price_int).or_insert(0) += 1;
+                } else {
+                    book.remove_size(price, size, 2);
+                }
+            }
+        }
     }
 }
 
@@ -750,5 +862,96 @@ mod tests {
         // Ask at 101 should have size 5 - 3 = 2
         let ask_size = book.asks.get(&(101_000_000_000_i64));
         assert_eq!(ask_size, Some(&2.0));
+    }
+
+    #[test]
+    fn test_walk_book_queue_depth() {
+        let mut book = OrderBook::new();
+        book.add_limit_order(100.0, 5.0, 1);
+        book.add_limit_order(100.0, 5.0, 1);
+        book.add_limit_order(101.0, 3.0, 2);
+
+        let fills = book.walk_book(10.0, Side::Buy);
+        assert!(!fills.is_empty());
+        for fill in &fills {
+            assert!(fill.queue_depth >= 1, "queue_depth should be >= 1");
+        }
+    }
+
+    #[test]
+    fn test_validate_price_increment() {
+        let tick = 0.01;
+        assert!(OrderBook::validate_price_increment(100.00, tick, 0.0));
+        assert!(OrderBook::validate_price_increment(100.01, tick, 0.0));
+        assert!(!OrderBook::validate_price_increment(100.005, tick, 0.0));
+        assert!(!OrderBook::validate_price_increment(99.99, tick, 100.0));
+    }
+
+    #[test]
+    fn test_order_book_deltas_apply() {
+        let mut book = OrderBook::new();
+        book.add_limit_order(100.0, 5.0, 1);
+
+        let mut deltas = OrderBookDeltas::new(1000);
+        deltas.add_bid(100_000_000_000, 2.0);
+        deltas.apply_to(&mut book);
+
+        assert_eq!(book.bids.get(&(100_000_000_000_i64)), Some(&7.0));
+    }
+
+    #[test]
+    fn test_order_book_delta_remove() {
+        let mut book = OrderBook::new();
+        book.add_limit_order(100.0, 5.0, 1);
+
+        let mut deltas = OrderBookDeltas::new(1000);
+        deltas.deltas.push(OrderBookDelta::new(100_000_000_000, -2.0, Side::Buy));
+        deltas.apply_to(&mut book);
+
+        assert_eq!(book.bids.get(&(100_000_000_000_i64)), Some(&3.0));
+    }
+}
+
+// ─── Phase 2.8: Add submit_market to OrderEmulator ───────────────────────────────────────
+// This method was identified as missing during the Phase 3.2 StrategyCtx implementation review.
+// OrderEmulator had process_market_order but no simple submit_market entry point.
+
+impl OrderEmulator {
+    /// Submit a market order for immediate fill simulation.
+    /// Returns an order ID (0 if size is 0).
+    ///
+    /// Unlike limit orders which queue and wait for price crossing,
+    /// market orders are filled immediately at current market price
+    /// with VPIN-based slippage applied.
+    pub fn submit_market(
+        &mut self,
+        size: f64,
+        side: Side,
+        timestamp_ns: u64,
+    ) -> OrderId {
+        if size <= 0.0 {
+            return 0;
+        }
+
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        // Market orders don't queue — they fill immediately.
+        // Record as a fill event with queue_position=0 (no queue delay).
+        // The actual fill price and slippage are computed via process_market_order
+        // when the engine calls it with the current order book state.
+        let qo = QueuedOrder {
+            order_id,
+            side,
+            price: 0.0, // Market order has no limit price
+            price_int: 0,
+            size,
+            remaining_size: size,
+            submitted_ns: timestamp_ns,
+            queue_position: 0, // Immediate fill, no queue position
+        };
+
+        self.pending.push(qo);
+        order_id
     }
 }

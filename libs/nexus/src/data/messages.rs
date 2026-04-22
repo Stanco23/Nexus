@@ -2,21 +2,9 @@
 //!
 //! These messages flow through the MessageBus to DataEngine.
 
+pub use crate::buffer::BarType;
 use crate::instrument::InstrumentId;
 use crate::messages::{StrategyId, TraderId};
-
-/// Bar type identifier — describes how a bar was aggregated.
-///
-/// Format: `{instrument_id}-{period}-{aggregation}`
-/// Example: `BTCUSDT.BINANCE-1m-BETWEEN`
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BarType(pub String);
-
-impl BarType {
-    pub fn new(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
 
 /// Subscribe to trade ticks for an instrument.
 #[derive(Debug, Clone)]

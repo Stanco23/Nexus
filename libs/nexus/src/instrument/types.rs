@@ -56,6 +56,13 @@ pub struct Instrument {
     pub maker_fee: f64,
     pub taker_fee: f64,
     pub kind: InstrumentKind,
+    /// Timestamp of the last update event (nanoseconds).
+    pub ts_event: u64,
+    /// Timestamp of initialization (nanoseconds).
+    pub ts_init: u64,
+    /// Name of the tick scheme for this instrument (e.g., "BINANCE.DEFAULT").
+    /// When set, price increments use the scheme's tiered lookup.
+    pub scheme_name: Option<String>,
 }
 
 impl Instrument {
@@ -66,6 +73,8 @@ impl Instrument {
         asset_class: AssetClass,
         quote_currency: &str,
         kind: InstrumentKind,
+        ts_event: u64,
+        ts_init: u64,
     ) -> Self {
         let raw = format!("{}.{}", symbol.to_uppercase(), venue.to_uppercase());
         let id = fnv1a_hash(raw.as_bytes());
@@ -95,6 +104,9 @@ impl Instrument {
             maker_fee: 0.0,
             taker_fee: 0.0,
             kind,
+            ts_event,
+            ts_init,
+            scheme_name: None,
         }
     }
 
@@ -116,6 +128,50 @@ impl Instrument {
     /// Get the minimum size increment as floating point.
     pub fn size_increment_f64(&self) -> f64 {
         self.size_increment as f64 / 10f64.powi(self.size_precision as i32)
+    }
+
+    /// Calculate the notional value (quantity * price).
+    pub fn notional_value(&self, quantity: f64, price: f64) -> f64 {
+        quantity * price
+    }
+
+    /// Calculate base quantity from notional value and price.
+    pub fn calculate_base_quantity(&self, notional: f64, price: f64) -> f64 {
+        if price == 0.0 {
+            return 0.0;
+        }
+        notional / price
+    }
+
+    /// Get the settlement/quote currency.
+    pub fn get_settlement_currency(&self) -> &str {
+        &self.quote_currency
+    }
+
+    /// Get the next bid price using the instrument's price increment.
+    pub fn next_bid_price(&self, reference_price: f64, n: i32) -> f64 {
+        let tick = self.price_increment_f64();
+        if tick == 0.0 {
+            return reference_price;
+        }
+        let ticks = (reference_price / tick).round() as i64 - n as i64;
+        ticks as f64 * tick
+    }
+
+    /// Get the next ask price using the instrument's price increment.
+    pub fn next_ask_price(&self, reference_price: f64, n: i32) -> f64 {
+        let tick = self.price_increment_f64();
+        if tick == 0.0 {
+            return reference_price;
+        }
+        let ticks = (reference_price / tick).round() as i64 + n as i64;
+        ticks as f64 * tick
+    }
+
+    /// Get the tick scheme for this instrument, if registered.
+    pub fn get_tick_scheme(&self) -> Option<&'static dyn crate::instrument::TickScheme> {
+        self.scheme_name.as_deref()?;
+        crate::instrument::tick_scheme::registry::get_scheme(self.scheme_name.as_deref()?)
     }
 }
 
@@ -236,6 +292,10 @@ pub struct OptionDetails {
     pub activation_ns: u64,
     pub expiration_ns: u64,
     pub settlement_type: SettlementType,
+    /// The currency of the underlying asset.
+    pub underlying_currency: String,
+    /// The currency in which the option is quoted/traded.
+    pub option_currency: String,
 }
 
 impl Default for OptionDetails {
@@ -250,6 +310,8 @@ impl Default for OptionDetails {
             activation_ns: 0,
             expiration_ns: 0,
             settlement_type: SettlementType::CASH,
+            underlying_currency: String::new(),
+            option_currency: String::new(),
         }
     }
 }
@@ -343,8 +405,18 @@ impl InstrumentBuilder {
             }
         };
         Self {
-            inner: Instrument::new(symbol, venue, class, asset_class, quote_currency, kind),
+            inner: Instrument::new(symbol, venue, class, asset_class, quote_currency, kind, 0, 0),
         }
+    }
+
+    pub fn ts_event(mut self, ts: u64) -> Self {
+        self.inner.ts_event = ts;
+        self
+    }
+
+    pub fn ts_init(mut self, ts: u64) -> Self {
+        self.inner.ts_init = ts;
+        self
     }
 
     pub fn price_precision(mut self, p: u8) -> Self {
@@ -421,6 +493,11 @@ impl InstrumentBuilder {
 
     pub fn kind(mut self, k: InstrumentKind) -> Self {
         self.inner.kind = k;
+        self
+    }
+
+    pub fn scheme(mut self, name: &str) -> Self {
+        self.inner.scheme_name = Some(name.to_string());
         self
     }
 
@@ -504,5 +581,23 @@ mod tests {
         assert_ne!(h1, h2);
         // But stable across calls
         assert_eq!(h1, fnv1a_hash(b"BTCUSDT.BINANCE"));
+    }
+
+    #[test]
+    fn test_instrument_with_tick_scheme() {
+        use crate::instrument::tick_scheme::registry::get_scheme;
+        let instr = InstrumentBuilder::new(
+            "BTCUSDT",
+            "BINANCE",
+            InstrumentClass::SPOT,
+            AssetClass::CRYPTOCURRENCY,
+            "USDT",
+        )
+        .scheme("BINANCE.DEFAULT")
+        .build();
+        assert_eq!(instr.scheme_name, Some("BINANCE.DEFAULT".to_string()));
+        let scheme = instr.get_tick_scheme();
+        assert!(scheme.is_some());
+        assert_eq!(scheme.unwrap().price_increment(), 0.01);
     }
 }

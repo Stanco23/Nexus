@@ -24,7 +24,9 @@ pub mod mc_wf;
 pub mod optim;
 pub mod paper;
 pub mod portfolio;
+pub mod signals;
 pub mod slippage;
+pub mod strategy_ctx;
 pub mod sweep;
 
 pub use database::{Database, DatabaseError, SqliteDatabase, MemoryDatabase};

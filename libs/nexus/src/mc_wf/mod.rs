@@ -23,6 +23,9 @@ use std::collections::HashMap;
 pub struct MonteCarloConfig {
     pub num_iterations: usize,
     pub shuffle_trades: bool,
+    /// External seed for reproducible Monte Carlo runs. If None, uses a
+    /// default seed (42). Set to a specific value for deterministic results.
+    pub seed: Option<u64>,
 }
 
 impl Default for MonteCarloConfig {
@@ -30,6 +33,7 @@ impl Default for MonteCarloConfig {
         Self {
             num_iterations: 1000,
             shuffle_trades: true,
+            seed: Some(42),
         }
     }
 }
@@ -74,17 +78,24 @@ impl MonteCarloRunner {
         let mut all_max_drawdowns = Vec::with_capacity(self.config.num_iterations);
         let mut all_pnls = Vec::with_capacity(self.config.num_iterations);
 
-        let results: Vec<(f64, f64, f64, f64)> = (0..self.config.num_iterations)
-            .par_bridge()
-            .map(|_i| {
-                let shuffled_trades = if self.config.shuffle_trades {
-                    Self::shuffle_trades(trades)
-                } else {
-                    trades.to_vec()
-                };
-                Self::compute_equity_curve_stats(&shuffled_trades, initial_equity)
-            })
-            .collect();
+        let seed = self.config.seed.unwrap_or(42);
+
+        let results: Vec<(f64, f64, f64, f64)> = if self.config.shuffle_trades {
+            // Sequential for reproducibility — parallel iteration order is non-deterministic
+            (0..self.config.num_iterations)
+                .map(|i| {
+                    let shuffled_trades =
+                        Self::shuffle_trades_with_seed(trades, seed.wrapping_add(i as u64));
+                    Self::compute_equity_curve_stats(&shuffled_trades, initial_equity)
+                })
+                .collect()
+        } else {
+            // Parallel only when not shuffling (all iterations are identical)
+            (0..self.config.num_iterations)
+                .par_bridge()
+                .map(|_i| Self::compute_equity_curve_stats(trades, initial_equity))
+                .collect()
+        };
 
         for (sharpe, sortino, max_dd, pnl) in results {
             all_sharpes.push(sharpe);
@@ -111,17 +122,7 @@ impl MonteCarloRunner {
         }
     }
 
-    fn shuffle_trades(trades: &[Trade]) -> Vec<Trade> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        std::time::Instant::now()
-            .elapsed()
-            .as_nanos()
-            .hash(&mut hasher);
-        let seed = hasher.finish();
-
+    fn shuffle_trades_with_seed(trades: &[Trade], seed: u64) -> Vec<Trade> {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut shuffled = trades.to_vec();
         shuffled.shuffle(&mut rng);
@@ -495,6 +496,7 @@ impl WalkForwardRunner {
             if pnl != 0.0 && position != 0.0 {
                 trades.push(Trade {
                     timestamp_ns: *timestamp,
+                    instrument_id: 0, // mc_wf is single-instrument analysis
                     side: if position > 0.0 {
                         crate::engine::Signal::Sell
                     } else {
@@ -542,6 +544,7 @@ mod tests {
         vec![
             Trade {
                 timestamp_ns: 1_000_000_000,
+                instrument_id: 0,
                 side: crate::engine::Signal::Buy,
                 price: 100.0,
                 size: 1.0,
@@ -552,6 +555,7 @@ mod tests {
             },
             Trade {
                 timestamp_ns: 2_000_000_000,
+                instrument_id: 0,
                 side: crate::engine::Signal::Sell,
                 price: 110.0,
                 size: 1.0,
@@ -562,6 +566,7 @@ mod tests {
             },
             Trade {
                 timestamp_ns: 3_000_000_000,
+                instrument_id: 0,
                 side: crate::engine::Signal::Buy,
                 price: 105.0,
                 size: 1.0,
@@ -572,6 +577,7 @@ mod tests {
             },
             Trade {
                 timestamp_ns: 4_000_000_000,
+                instrument_id: 0,
                 side: crate::engine::Signal::Sell,
                 price: 115.0,
                 size: 1.0,
@@ -595,6 +601,7 @@ mod tests {
         let config = MonteCarloConfig {
             num_iterations: 10,
             shuffle_trades: false,
+            seed: None,
         };
         let runner = MonteCarloRunner::new(config);
         let trades = sample_trades();
@@ -612,6 +619,7 @@ mod tests {
         let config = MonteCarloConfig {
             num_iterations: 1,
             shuffle_trades: false,
+            seed: None,
         };
         let runner = MonteCarloRunner::new(config);
         let trades = sample_trades();
@@ -620,6 +628,27 @@ mod tests {
 
         assert!(result.stats.sharpe_mean.is_finite());
         assert!(result.stats.sortino_mean.is_finite());
+    }
+
+    #[test]
+    fn test_monte_carlo_reproducible_with_same_seed() {
+        let config1 = MonteCarloConfig {
+            num_iterations: 5,
+            shuffle_trades: true,
+            seed: Some(12345),
+        };
+        let config2 = MonteCarloConfig {
+            num_iterations: 5,
+            shuffle_trades: true,
+            seed: Some(12345),
+        };
+        let trades = sample_trades();
+
+        let result1 = MonteCarloRunner::new(config1).run(&trades, 10000.0);
+        let result2 = MonteCarloRunner::new(config2).run(&trades, 10000.0);
+
+        assert_eq!(result1.all_sharpes, result2.all_sharpes);
+        assert_eq!(result1.all_pnls, result2.all_pnls);
     }
 
     #[test]

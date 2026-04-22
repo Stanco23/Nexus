@@ -103,15 +103,26 @@ pub struct Oms {
     msgbus: Arc<MessageBus>,
     position_id_gen: PositionIdGenerator,
     oms_type: OmsType,
+    /// Optional Account reference for balance updates after fills.
+    /// When Some, `apply_fill` and `apply_fill_no_publish` call
+    /// `account.update_with_order()` to keep Account in sync with fills.
+    /// None = PaperBroker path where PaperBroker manages Account directly.
+    account: Option<Arc<std::sync::Mutex<crate::engine::account::Account>>>,
 }
 
 impl Oms {
-    pub fn new(cache: Arc<Mutex<Cache>>, msgbus: Arc<MessageBus>, oms_type: OmsType) -> Self {
+    pub fn new(
+        cache: Arc<Mutex<Cache>>,
+        msgbus: Arc<MessageBus>,
+        oms_type: OmsType,
+        account: Option<Arc<std::sync::Mutex<crate::engine::account::Account>>>,
+    ) -> Self {
         Self {
             cache,
             msgbus,
             position_id_gen: PositionIdGenerator::new(),
             oms_type,
+            account,
         }
     }
 
@@ -233,6 +244,21 @@ impl Oms {
         };
 
         // Publish AFTER releasing lock (Lock-Then-Publish pattern)
+
+        // MISS-4 FIX: Keep Account in sync with fills.
+        // Calls account.update_with_order() so balance reflects cost/proceeds.
+        if let Some(ref account) = self.account {
+            account.lock().unwrap().update_with_order(
+                fill.client_order_id.to_string(),
+                filled_event_data.1.clone(), // instrument_id
+                fill.order_side,
+                fill.filled_qty,
+                fill.fill_price,
+                fill.commission,
+                fill.ts_event,
+            );
+        }
+
         if matches!(filled_event_data.0, OrderState::Filled) {
             let event = OrderFilled {
                 trader_id: fill.trader_id.clone(),
@@ -276,20 +302,38 @@ impl Oms {
 
     /// Apply fill WITHOUT publishing to MsgBus — for PaperBroker where caller already has fills.
     pub fn apply_fill_no_publish(&self, client_order_id: &ClientOrderId, fill: &OrderFilled) {
-        let mut cache = self.cache.lock().unwrap();
-        let order = match cache.oms_orders_mut().get_mut(client_order_id) {
-            Some(o) => o,
-            None => return,
-        };
+        // Extract order data first, then drop lock before calling account (avoid deadlock)
+        let (instrument_id, _strategy_id): (String, StrategyId) = {
+            let mut cache = self.cache.lock().unwrap();
+            let order = match cache.oms_orders_mut().get_mut(client_order_id) {
+                Some(o) => o,
+                None => return,
+            };
 
-        order.filled_qty += fill.filled_qty;
-        order.last_fill_price = fill.fill_price;
+            order.filled_qty += fill.filled_qty;
+            order.last_fill_price = fill.fill_price;
 
-        order.state = if order.filled_qty >= order.quantity {
-            OrderState::Filled
-        } else {
-            OrderState::PartiallyFilled
-        };
+            order.state = if order.filled_qty >= order.quantity {
+                OrderState::Filled
+            } else {
+                OrderState::PartiallyFilled
+            };
+
+            (order.instrument_id.clone(), order.strategy_id.clone())
+        }; // Lock dropped here
+
+        // MISS-4 FIX: Keep Account in sync with fills (when present).
+        if let Some(ref account) = self.account {
+            account.lock().unwrap().update_with_order(
+                client_order_id.to_string(),
+                instrument_id,
+                fill.order_side,
+                fill.filled_qty,
+                fill.fill_price,
+                fill.commission,
+                fill.ts_event,
+            );
+        }
     }
 
     /// Cancel an order. Transitions to Cancelled.
@@ -519,7 +563,7 @@ mod tests {
     fn make_test_oms() -> (Oms, Arc<Mutex<Cache>>, Arc<MessageBus>) {
         let cache = Arc::new(Mutex::new(Cache::new(1000, 1000)));
         let msgbus = Arc::new(MessageBus::new());
-        let oms = Oms::new(cache.clone(), msgbus.clone(), OmsType::Hedge);
+        let oms = Oms::new(cache.clone(), msgbus.clone(), OmsType::Hedge, None);
         (oms, cache, msgbus)
     }
 

@@ -105,7 +105,7 @@ impl RiskEngine {
     }
 
     /// Called after each fill to evaluate equity and trigger state transitions.
-    pub fn on_trade(&mut self, equity: f64) {
+    pub fn on_trade(&mut self, _instrument_id: u32, equity: f64) {
         // Update peak equity
         if equity > self.peak_equity {
             self.peak_equity = equity;
@@ -380,7 +380,7 @@ mod tests {
         let mut risk = RiskEngine::new(config, 10_000.0);
         assert_eq!(risk.trading_state(), TradingState::Active);
         // Drop equity to 8900 (11% drawdown) → transition to ReduceOnly
-        risk.on_trade(8_900.0);
+        risk.on_trade(0, 8_900.0);
         assert_eq!(risk.trading_state(), TradingState::ReduceOnly);
     }
 
@@ -391,11 +391,11 @@ mod tests {
             .with_daily_loss_limit_pct(0.05); // 5%
         let mut risk = RiskEngine::new(config, 10_000.0);
         // Trigger ReduceOnly first
-        risk.on_trade(9_400.0); // 6% drawdown
+        risk.on_trade(0, 9_400.0); // 6% drawdown
         assert_eq!(risk.trading_state(), TradingState::ReduceOnly);
         // Record daily loss exceeding limit
         risk.record_loss(600.0); // 6% of 10k
-        risk.on_trade(9_400.0); // trigger transition check
+        risk.on_trade(0, 9_400.0); // trigger transition check
         assert_eq!(risk.trading_state(), TradingState::Halted);
     }
 
@@ -405,9 +405,9 @@ mod tests {
             .with_max_drawdown_pct(0.05)
             .with_daily_loss_limit_pct(0.05);
         let mut risk = RiskEngine::new(config, 10_000.0);
-        risk.on_trade(9_000.0); // 10% drawdown → ReduceOnly
+        risk.on_trade(0, 9_000.0); // 10% drawdown → ReduceOnly
         risk.record_loss(600.0); // 6% daily loss
-        risk.on_trade(9_000.0); // → Halted
+        risk.on_trade(0, 9_000.0); // → Halted
 
         // All new orders rejected
         let result = risk.check_order(1.0, 100.0, 0.0, 9_000.0, 0.0);
@@ -420,9 +420,9 @@ mod tests {
             .with_max_drawdown_pct(0.05)
             .with_daily_loss_limit_pct(0.05);
         let mut risk = RiskEngine::new(config, 10_000.0);
-        risk.on_trade(9_000.0);
+        risk.on_trade(0, 9_000.0);
         risk.record_loss(600.0);
-        risk.on_trade(9_000.0); // Halted
+        risk.on_trade(0, 9_000.0); // Halted
         assert_eq!(risk.trading_state(), TradingState::Halted);
 
         // Manual reset

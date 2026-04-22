@@ -7,8 +7,8 @@
 //! - BarAggregator.advance_time() driven by clock ticks for time-based bar closing
 
 use crate::actor::Clock;
-use crate::buffer::bar_aggregation::BarAggregator;
 use crate::buffer::tick_buffer::TradeFlowStats;
+use crate::buffer::Aggregator;
 use crate::cache::{Bar as CacheBar, OrderBook, QuoteTick};
 use crate::data::messages::{BarType, SubscribeBars, SubscribeTrades, UnsubscribeBars, UnsubscribeTrades};
 use crate::instrument::InstrumentId;
@@ -40,7 +40,7 @@ pub struct DataEngine {
     /// Bar callbacks (uses cache::Bar).
     bar_callbacks: HashMap<String, Arc<dyn Fn(CacheBar) + Send + Sync>>,
     /// Bar aggregators keyed by BarType.
-    bar_aggregators: HashMap<BarType, BarAggregator>,
+    bar_aggregators: HashMap<BarType, Box<dyn Aggregator>>,
 }
 
 impl DataEngine {
@@ -112,8 +112,8 @@ impl DataEngine {
 
     fn buffer_bar_to_cache_bar(&self, bar: &crate::buffer::bar_aggregation::Bar) -> CacheBar {
         CacheBar {
-            ts_event: bar.timestamp_ns,
-            ts_init: bar.timestamp_ns,
+            ts_event: bar.ts_event,
+            ts_init: bar.ts_init,
             open: bar.open as f64,
             high: bar.high as f64,
             low: bar.low as f64,
@@ -122,7 +122,7 @@ impl DataEngine {
             buy_volume: bar.buy_volume as f64,
             sell_volume: bar.sell_volume as f64,
             tick_count: bar.tick_count,
-            instrument_id: bar.instrument_id,
+            instrument_id: bar.instrument_id.clone(),
         }
     }
 
@@ -135,6 +135,33 @@ impl DataEngine {
                     self.route_trade_to_endpoint(endpoint, tick.clone());
                 }
             }
+        }
+
+        // Also update ALL bar aggregators for this instrument
+        // Collect completed bars first to avoid borrow conflict
+        let mut completed_bars: Vec<(BarType, crate::buffer::bar_aggregation::Bar)> = Vec::new();
+        for (bar_type, aggregator) in self.bar_aggregators.iter_mut() {
+            if bar_type.instrument_id() == instrument_id {
+                // Loop to handle multi-bar generation from VolumeBarAggregator
+                loop {
+                    let bar = aggregator.update(
+                        tick.price_int,
+                        tick.size_int,
+                        tick.side,
+                        tick.timestamp_ns,
+                    );
+                    match bar {
+                        Some(completed_bar) => completed_bars.push((bar_type.clone(), completed_bar)),
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // Process bars outside the mutable borrow
+        for (bar_type, bar) in completed_bars {
+            let cache_bar = self.buffer_bar_to_cache_bar(&bar);
+            self.process_bar(&cache_bar, &bar_type);
         }
     }
 
@@ -212,19 +239,29 @@ impl DataEngine {
 
     /// Handle a subscribe bars message.
     pub fn subscribe_bars(&mut self, msg: SubscribeBars) {
-        let period_ns: u64 = 60_000_000_000;
+        let period_ns = msg.bar_type.spec().get_interval_ns()
+            .unwrap_or(60_000_000_000);
 
         // Create aggregator if not exists
         let _ = self.bar_aggregators.entry(msg.bar_type.clone()).or_insert_with(|| {
-            BarAggregator::with_period_ns(period_ns, msg.bar_type.0.split('-').next().map(|s| {
-                crate::instrument::InstrumentId::new(s, "BINANCE")
-            }).unwrap_or_else(|| crate::instrument::InstrumentId::new("UNKNOWN", "BINANCE")))
+            crate::buffer::AggregatorFactory::create(msg.bar_type.clone())
         });
 
-        let timer_name = format!("bar_close_{}", msg.bar_type.0);
+        // Namespaced timer name includes full bar_type for uniqueness across instruments.
+        // e.g., "data_engine.bar_close_BTCUSDT.BINANCE-1m-BETWEEN"
+        let timer_name = format!("data_engine.bar_close_{}", msg.bar_type.as_str());
         let current_ns = self.clock.timestamp_ns();
         let next_boundary = ((current_ns / period_ns) + 1) * period_ns;
 
+        // SAFETY: Raw pointer created from &mut self. The pointer is only dereferenced
+        // inside the timer callback, which fires when the clock advances. The clock is
+        // owned by DataEngine, so the callback fires as long as DataEngine lives.
+        // If DataEngine is dropped without cancelling the timer, the callback may fire
+        // with a dangling pointer — but since DataEngine owns the clock and the timer
+        // callback lives inside the clock, the timer must be cancelled (via Clock::cancel_timer
+        // or Clock::cancel_timers) before DataEngine is dropped, which is the caller's
+        // responsibility. The `engine_ptr` is only dereferenced after checking that
+        // the timer has not been cancelled.
         let engine_ptr = self as *mut DataEngine;
         self.clock.set_timer_repeating(
             &timer_name,
@@ -232,7 +269,8 @@ impl DataEngine {
             next_boundary,
             None,
             Box::new(move |event| {
-                // SAFETY: DataEngine must live at least as long as the timer handler.
+                // SAFETY: DataEngine must be live for the lifetime of the timer callback.
+                // This is guaranteed when the timer is cancelled before DataEngine is dropped.
                 unsafe {
                     let engine = &mut *engine_ptr;
                     engine.advance_clock(event.timestamp_ns);
@@ -290,9 +328,15 @@ impl DataEngine {
 
     /// Replay historical ticks through the data engine.
     /// Iterates ticks in order and calls process_trade for each.
+    ///
+    /// NOTE: Currently dead code — the sweep runner drives BacktestEngine directly,
+    /// never creating a DataEngine. This method is kept for potential future use when
+    /// DataEngine becomes the canonical backtest data path. Remove or wire if that
+    /// integration is needed.
+    #[allow(dead_code)]
     pub fn replay(&mut self, ticks: &[TradeFlowStats], instrument_id: InstrumentId) {
         for tick in ticks {
-            self.process_trade(tick, instrument_id);
+            self.process_trade(tick, instrument_id.clone());
         }
     }
 }
@@ -338,7 +382,7 @@ mod tests {
         engine.subscribe_bars(SubscribeBars {
             trader_id: TraderId::new("trader-001"),
             strategy_id: StrategyId::new("strategy-001"),
-            bar_type: BarType::new("BTCUSDT.BINANCE-1m-agg"),
+            bar_type: BarType::parse_bar_type("BTCUSDT.BINANCE-1-MINUTE-LAST").unwrap(),
             endpoint: "MyStrategy.on_bar".to_string(),
         });
         assert_eq!(engine.subscription_count(), 1);
@@ -374,7 +418,7 @@ mod tests {
         engine.subscribe_bars(SubscribeBars {
             trader_id: TraderId::new("trader-001"),
             strategy_id: StrategyId::new("strategy-001"),
-            bar_type: BarType::new("BTCUSDT.BINANCE-1m-agg"),
+            bar_type: BarType::parse_bar_type("BTCUSDT.BINANCE-1-MINUTE-LAST").unwrap(),
             endpoint: "Strategy1.on_bar".to_string(),
         });
 

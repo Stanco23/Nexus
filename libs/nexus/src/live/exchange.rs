@@ -374,6 +374,100 @@ pub trait ExchangeWs: Send + Sync {
 }
 
 // =============================================================================
+// Market Data Adapter Trait (public market data streams)
+// =============================================================================
+
+/// Normalized trade tick from any exchange.
+#[derive(Debug, Clone)]
+pub struct NormalizedTrade {
+    /// FNV-1a hash of the exchange symbol.
+    pub instrument_id: u32,
+    /// Raw exchange symbol (e.g., "BTCUSDT", "BTC-USDT").
+    pub symbol: String,
+    /// Trade timestamp in nanoseconds.
+    pub timestamp_ns: u64,
+    pub price: f64,
+    pub size: f64,
+    /// 0 = buy (aggressor is buy), 1 = sell (aggressor is sell).
+    pub side: u8,
+    pub trade_id: u64,
+}
+
+/// Order book delta update.
+#[derive(Debug, Clone)]
+pub struct OrderBookDelta {
+    pub instrument_id: u32,
+    pub symbol: String,
+    pub timestamp_ns: u64,
+    pub bids: Vec<(f64, f64)>,  // (price, size)
+    pub asks: Vec<(f64, f64)>,
+}
+
+/// Kline/candlestick update.
+#[derive(Debug, Clone)]
+pub struct KlineUpdate {
+    pub instrument_id: u32,
+    pub symbol: String,
+    pub timestamp_ns: u64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
+/// Ticker / book ticker update.
+#[derive(Debug, Clone)]
+pub struct TickerUpdate {
+    pub instrument_id: u32,
+    pub symbol: String,
+    pub timestamp_ns: u64,
+    pub bid_price: f64,
+    pub ask_price: f64,
+    pub bid_size: f64,
+    pub ask_size: f64,
+}
+
+/// Normalized market data message from any exchange.
+#[derive(Debug, Clone)]
+pub enum MarketDataMessage {
+    Trade(NormalizedTrade),
+    Depth(OrderBookDelta),
+    Kline(KlineUpdate),
+    Ticker(TickerUpdate),
+    Unknown(String),
+}
+
+/// Trait for exchange market data WebSocket adapters (public trade/quote/orderbook streams).
+///
+/// Implementations: BinanceMarketDataAdapter, BybitMarketDataAdapter, OkxMarketDataAdapter
+///
+/// Distinct from `ExchangeWs` which handles authenticated user data streams.
+#[async_trait]
+pub trait MarketDataAdapter: Send + Sync {
+    /// Connect to the exchange WebSocket endpoint.
+    async fn connect(&mut self) -> Result<(), WsError>;
+
+    /// Gracefully close the WebSocket connection.
+    async fn close(&mut self) -> Result<(), WsError>;
+
+    /// Receive the next normalized market data message.
+    async fn recv(&mut self) -> Result<MarketDataMessage, WsError>;
+
+    /// Subscribe to trade stream for a given symbol.
+    async fn subscribe_trades(&mut self, symbol: &str) -> Result<(), WsError>;
+
+    /// Unsubscribe from trade stream for a given symbol.
+    async fn unsubscribe_trades(&mut self, symbol: &str) -> Result<(), WsError>;
+
+    /// Reconnect after a connection drop, re-subscribing to all active streams.
+    async fn reconnect(&mut self) -> Result<(), WsError>;
+
+    /// Whether the adapter is currently connected.
+    fn is_connected(&self) -> bool;
+}
+
+// =============================================================================
 // Exchange Type Enum (for runtime selection)
 // =============================================================================
 

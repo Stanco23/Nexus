@@ -39,6 +39,21 @@ pub struct PaperBroker {
     paper_trades: Vec<PaperTrade>,
     taker_fee: f64,
     maker_fee: f64,
+    /// Maps OrderEmulator order_id → pending order metadata for limit fills.
+    /// This allows on_trade (which receives fills by emulator order_id) to look up
+    /// the real client_order_id, position_id, and instrument_id.
+    pending_limit_orders: std::collections::HashMap<u64, PendingPaperOrder>,
+}
+
+/// Minimal order metadata needed to resolve fills back to their source order.
+#[derive(Clone)]
+struct PendingPaperOrder {
+    client_order_id: ClientOrderId,
+    position_id: PositionId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    #[allow(dead_code)]
+    strategy_id: StrategyId,
 }
 
 impl PaperBroker {
@@ -52,7 +67,7 @@ impl PaperBroker {
         msgbus: Arc<MessageBus>,
         oms_type: OmsType,
     ) -> Self {
-        let oms = Oms::new(cache.clone(), msgbus, oms_type);
+        let oms = Oms::new(cache.clone(), msgbus, oms_type, None);
         Self {
             emulator: OrderEmulator::new_with_config(slippage_config),
             order_book: OrderBook::default(),
@@ -62,6 +77,7 @@ impl PaperBroker {
             paper_trades: Vec::new(),
             taker_fee,
             maker_fee,
+            pending_limit_orders: std::collections::HashMap::new(),
         }
     }
 
@@ -92,7 +108,7 @@ impl PaperBroker {
         // Parse from string or create a placeholder (0 id, which is "UNKNOWN")
         let instrument_id_str = &submit.instrument_id;
         let instrument_id = InstrumentId::parse(instrument_id_str)
-            .unwrap_or(InstrumentId { id: 0 });
+            .unwrap_or_else(|_| InstrumentId::new("UNKNOWN", "PAPER"));
 
         // Extract venue from instrument_id string (format "SYMBOL.VENUE")
         let venue_str = instrument_id_str
@@ -103,7 +119,7 @@ impl PaperBroker {
         let strategy_id = submit.strategy_id.clone();
 
         // Submit via OMS — generates position_id and publishes OrderSubmitted
-        let position_id = self.oms.submit_order(&submit, strategy_id);
+        let position_id = self.oms.submit_order(&submit, strategy_id.clone());
 
         match submit.order_type {
             crate::messages::OrderType::Market => {
@@ -118,14 +134,15 @@ impl PaperBroker {
                     ts,
                     self.taker_fee,
                 );
-                fills
+                let instrument_id_cloned = instrument_id.clone();
+                    fills
                     .into_iter()
                     .map(|e| {
                         let filled = self.record_fill(
                             e,
                             client_order_id.clone(),
                             position_id.clone(),
-                            instrument_id,
+                            instrument_id_cloned.clone(),
                             submit.order_side,
                             false,
                             venue_str.to_string(),
@@ -141,37 +158,47 @@ impl PaperBroker {
                     Some(s) => s,
                     None => return vec![],
                 };
-                let _order_id = self.emulator.submit_limit(
+                // MISS-3 FIX: Store order_id → metadata mapping so on_trade can resolve fills
+                let order_id = self.emulator.submit_limit(
                     submit.price.unwrap_or(0.0),
                     submit.quantity,
                     book_side,
                     ts,
                 );
+                self.pending_limit_orders.insert(order_id, PendingPaperOrder {
+                    client_order_id: client_order_id.clone(),
+                    position_id: position_id.clone(),
+                    instrument_id,
+                    order_side: submit.order_side,
+                    strategy_id: strategy_id.clone(),
+                });
 
                 // Check immediate fill (limit price may already be crossed)
-                self.emulator
-                    .process_fills(
-                        self.order_book.last_price,
-                        self.order_book.vpin,
-                        ts,
-                        self.maker_fee,
-                    )
-                    .into_iter()
-                    .map(|e| {
+                let fills = self.emulator.process_fills(
+                    self.order_book.last_price,
+                    self.order_book.vpin,
+                    ts,
+                    self.maker_fee,
+                );
+                let mut results = Vec::new();
+                for fill in fills {
+                    // MISS-3 FIX: Look up real IDs from pending_limit_orders
+                    if let Some(pending) = self.pending_limit_orders.remove(&fill.order_id) {
                         let filled = self.record_fill(
-                            e,
-                            client_order_id.clone(),
-                            position_id.clone(),
-                            instrument_id,
-                            submit.order_side,
+                            fill,
+                            pending.client_order_id.clone(),
+                            pending.position_id,
+                            pending.instrument_id,
+                            pending.order_side,
                             true,
                             venue_str.to_string(),
                         );
                         // Update OMS state without publishing
-                        self.oms.apply_fill_no_publish(&client_order_id, &filled);
-                        filled
-                    })
-                    .collect()
+                        self.oms.apply_fill_no_publish(&pending.client_order_id, &filled);
+                        results.push(filled);
+                    }
+                }
+                results
             }
             _ => vec![],
         }
@@ -180,6 +207,14 @@ impl PaperBroker {
     /// Cancel a pending limit order.
     /// Returns true if the order was found and removed.
     pub fn cancel_order(&mut self, cancel: CancelOrder) -> bool {
+        // Also remove from pending_limit_orders so cancelled orders don't still get filled
+        // We need to find the order_id by client_order_id — iterate to find match
+        let order_id_to_remove = self.pending_limit_orders.iter()
+            .find(|(_, pending)| pending.client_order_id == cancel.client_order_id)
+            .map(|(id, _)| *id);
+        if let Some(order_id) = order_id_to_remove {
+            self.pending_limit_orders.remove(&order_id);
+        }
         self.oms.cancel(&cancel.client_order_id)
     }
 
@@ -197,15 +232,21 @@ impl PaperBroker {
         );
 
         for fill in fills {
-            let _ = self.record_fill(
-                fill,
-                ClientOrderId::new("LIMIT-FILL"),
-                PositionId::new("LIMIT-FILL"),
-                InstrumentId::new("LIMIT-FILL", "PAPER"),
-                OrderSide::Buy,
-                true,
-                "PAPER".to_string(),
-            );
+            // MISS-3 FIX: Look up real IDs from pending_limit_orders mapping
+            if let Some(pending) = self.pending_limit_orders.remove(&fill.order_id) {
+                let coid = pending.client_order_id.clone();
+                let filled = self.record_fill(
+                    fill,
+                    coid.clone(),
+                    pending.position_id,
+                    pending.instrument_id,
+                    pending.order_side,
+                    true,
+                    "PAPER".to_string(),
+                );
+                // Update OMS state
+                self.oms.apply_fill_no_publish(&coid, &filled);
+            }
         }
     }
 
@@ -224,7 +265,7 @@ impl PaperBroker {
         self.paper_trades.push(PaperTrade {
             timestamp_ns: fill.timestamp_ns,
             client_order_id: client_order_id.clone(),
-            instrument_id,
+            instrument_id: instrument_id.clone(),
             venue: venue.clone(),
             side: Self::to_messages_side(fill.side),
             fill_price: fill.fill_price,

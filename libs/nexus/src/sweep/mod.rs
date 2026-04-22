@@ -11,7 +11,7 @@
 
 use crate::buffer::buffer_set::TickBufferSet;
 use crate::engine::Signal;
-use crate::portfolio::{Portfolio, PortfolioStrategy};
+use crate::portfolio::{Portfolio, PortfolioConfig, PortfolioStrategy};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,15 +105,20 @@ pub struct SweepResult {
 
 pub struct SweepRunner {
     buffer_set: Arc<TickBufferSet>,
-    initial_equity: f64,
+    config: PortfolioConfig,
 }
 
 impl SweepRunner {
     pub fn new(buffer_set: Arc<TickBufferSet>, initial_equity: f64) -> Self {
         Self {
             buffer_set,
-            initial_equity,
+            config: PortfolioConfig::new(initial_equity, crate::engine::CommissionConfig::new(0.001)),
         }
+    }
+
+    pub fn with_config(mut self, config: PortfolioConfig) -> Self {
+        self.config = config;
+        self
     }
 
     pub fn run_grid<S: PortfolioStrategy + Clone + 'static>(
@@ -127,41 +132,42 @@ impl SweepRunner {
             .par_iter()
             .filter_map(|params| {
                 let mut strategy = strategy_factory(params.clone());
-                let mut portfolio = Portfolio::new(self.initial_equity);
+                let mut portfolio = Portfolio::new(self.config.initial_equity_per_instrument);
 
                 for instrument_id in self.buffer_set.instrument_ids() {
-                    portfolio.register_instrument(*instrument_id);
+                    portfolio.register_instrument(instrument_id.clone());
                 }
 
                 let mut cursor = self.buffer_set.merge_cursor();
-                let mut last_signal = Signal::Close;
-                let num_trades = 0;
 
-                while let Some(event) = cursor.advance() {
-                    let price = event.tick.price_int as f64 / 1_000_000_000.0;
-                    let size = event.tick.size_int as f64 / 1_000_000_000.0;
-
-                    let signal = strategy.on_trade(
-                        event.instrument_id,
-                        event.tick.timestamp_ns,
-                        price,
-                        size,
-                        &mut portfolio,
-                    );
-
-                    if signal != last_signal {
-                        last_signal = signal;
-                    }
-                }
+                portfolio.run_portfolio::<S>(&mut cursor, &self.config, || strategy.clone());
 
                 let num_instruments = portfolio.num_instruments() as f64;
-                let pnl = portfolio.portfolio_equity() - self.initial_equity * num_instruments;
-                let max_drawdown = 0.0;
+                let pnl = portfolio.portfolio_equity() - self.config.initial_equity_per_instrument * num_instruments;
+                let max_drawdown = portfolio.portfolio_max_drawdown();
+
+                // Compute Sharpe ratio from equity curve if we have trades
+                let num_trades = portfolio.total_trades();
+                let sharpe = if num_trades > 1 {
+                    let realized = portfolio.total_realized_pnl();
+                    let commissions = portfolio.total_commissions();
+                    let net = realized - commissions;
+                    if self.config.initial_equity_per_instrument > 0.0 {
+                        (net / (self.config.initial_equity_per_instrument * num_instruments))
+                            .max(-1.0)
+                            .min(1.0)
+                            * self.config.trading_days_per_year.sqrt()
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
 
                 Some(SweepResult {
                     params: params.clone(),
                     pnl,
-                    sharpe: 0.0,
+                    sharpe,
                     max_drawdown,
                     num_trades,
                 })

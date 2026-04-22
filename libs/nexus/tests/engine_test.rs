@@ -1,4 +1,6 @@
 use nexus::engine::{CommissionConfig, EngineContext, Signal, Strategy};
+use nexus::signals::SignalBus;
+use std::sync::{Arc, Mutex};
 
 struct SimpleBuyThenCloseStrategy {
     buy_at_tick: usize,
@@ -67,10 +69,12 @@ fn test_commission_short_entry_exit() {
 
 #[test]
 fn test_engine_context_position_lifecycle() {
-    let mut ctx = EngineContext::new(10000.0);
+    let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+    let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
     let comm = CommissionConfig::new(0.001);
+    let instr_id = 1u32;
 
-    assert_eq!(ctx.position, 0.0);
+    assert_eq!(ctx.position(instr_id), 0.0);
     assert_eq!(ctx.num_trades, 0);
 
     let entry_price = 100.0;
@@ -78,34 +82,39 @@ fn test_engine_context_position_lifecycle() {
     let entry_comm = comm.compute(entry_price, size);
 
     ctx.equity -= entry_comm;
-    ctx.position = size;
-    ctx.entry_price = entry_price;
+    let state = ctx.instrument_states.entry(instr_id).or_default();
+    state.position = size;
+    state.entry_price = entry_price;
     ctx.num_trades += 1;
 
-    assert_eq!(ctx.position, 1.0);
-    assert_eq!(ctx.entry_price, 100.0);
+    assert_eq!(ctx.position(instr_id), 1.0);
+    assert_eq!(ctx.entry_price(instr_id), 100.0);
 
     let exit_price = 110.0;
     let exit_comm = comm.compute(exit_price, size);
     ctx.equity -= exit_comm;
 
-    let pnl = (exit_price - ctx.entry_price) * ctx.position.abs();
+    let pnl = (exit_price - ctx.entry_price(instr_id)) * ctx.position(instr_id).abs();
     ctx.equity += pnl;
-    ctx.position = 0.0;
-    ctx.entry_price = 0.0;
+    let state = ctx.instrument_states.get_mut(&instr_id).unwrap();
+    state.position = 0.0;
+    state.entry_price = 0.0;
 
     let expected_equity = 10000.0 - entry_comm + pnl - exit_comm;
     assert!((ctx.equity - expected_equity).abs() < 0.001);
-    assert_eq!(ctx.position, 0.0);
+    assert_eq!(ctx.position(instr_id), 0.0);
 }
 
 #[test]
 fn test_engine_context_partial_close() {
-    let mut ctx = EngineContext::new(10000.0);
+    let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+    let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
     let comm = CommissionConfig::new(0.001);
+    let instr_id = 1u32;
 
-    ctx.position = 1.0;
-    ctx.entry_price = 100.0;
+    let state = ctx.instrument_states.entry(instr_id).or_default();
+    state.position = 1.0;
+    state.entry_price = 100.0;
     ctx.equity = 10000.0;
 
     let partial_size = 0.5;
@@ -113,20 +122,22 @@ fn test_engine_context_partial_close() {
     let exit_comm = comm.compute(exit_price, partial_size);
 
     ctx.equity -= exit_comm;
-    let pnl = (exit_price - ctx.entry_price) * partial_size;
+    let pnl = (exit_price - ctx.entry_price(instr_id)) * partial_size;
     ctx.equity += pnl;
-    ctx.position -= partial_size;
+    let state = ctx.instrument_states.get_mut(&instr_id).unwrap();
+    state.position -= partial_size;
 
-    assert!((ctx.position - 0.5).abs() < 0.001);
-    assert!((ctx.entry_price - 100.0).abs() < 0.001);
+    assert!((ctx.position(instr_id) - 0.5).abs() < 0.001);
+    assert!((ctx.entry_price(instr_id) - 100.0).abs() < 0.001);
 
     let final_exit = 120.0;
-    let final_comm = comm.compute(final_exit, ctx.position.abs());
+    let final_comm = comm.compute(final_exit, ctx.position(instr_id).abs());
     ctx.equity -= final_comm;
-    let final_pnl = (final_exit - ctx.entry_price) * ctx.position.abs();
+    let final_pnl = (final_exit - ctx.entry_price(instr_id)) * ctx.position(instr_id).abs();
     ctx.equity += final_pnl;
-    ctx.position = 0.0;
-    ctx.entry_price = 0.0;
+    let state = ctx.instrument_states.get_mut(&instr_id).unwrap();
+    state.position = 0.0;
+    state.entry_price = 0.0;
 
     let total_comm = exit_comm + final_comm;
     let total_pnl = pnl + final_pnl;

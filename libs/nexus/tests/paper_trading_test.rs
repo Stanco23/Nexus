@@ -296,7 +296,7 @@ fn test_data_engine_process_trade() {
     engine.subscribe_trades(nexus::data::messages::SubscribeTrades {
         trader_id: TraderId::new("TRADER-001"),
         strategy_id: StrategyId::new("STRAT-001"),
-        instrument_id: btc,
+        instrument_id: btc.clone(),
         endpoint: "PaperBroker.on_trade".to_string(),
     });
 

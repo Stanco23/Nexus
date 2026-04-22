@@ -155,7 +155,7 @@ fn test_tick_buffer_from_ring_buffer() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, inst_id).unwrap();
+    let rb = RingBuffer::open(path, inst_id.clone()).unwrap();
     assert_eq!(rb.num_ticks(), 100);
 
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();

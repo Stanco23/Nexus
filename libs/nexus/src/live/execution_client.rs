@@ -1,7 +1,7 @@
 //! ExecutionClient — wires BinanceHttpAdapter + BinanceWsAdapter + Cache + MsgBus.
 //!
 //! Implements the Actor trait. Publishes order events to MsgBus and updates Cache.
-//! Uses Cache as the sole authoritative state store (NO shadow Account).
+//! Wires RiskEngine and Account for live trading safety and balance tracking.
 //!
 //! Nautilus source: `execution/engine.pyx`
 
@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use crate::actor::MessageBus;
 use crate::cache::Cache;
 use crate::data::DataEngine;
-use crate::engine::account::AccountId;
+use crate::engine::account::{Account, AccountId};
 use crate::engine::oms::{Oms, OmsOrder};
-use crate::instrument::Venue;
-use crate::live::exchange::{Exchange, ExchangeError, ExchangeWs, WsMessage as ExchangeWsMessage};
+use crate::instrument::{Venue, fnv1a_hash};
+use crate::live::exchange::{Exchange, ExchangeError, ExchangeWs, MarketDataAdapter, WsMessage as ExchangeWsMessage};
 use crate::actor::Actor;
 use crate::messages::{
     CancelOrder, ClientOrderId, ModifyOrder, OrderCancelled, OrderFilled,
@@ -46,6 +46,8 @@ pub struct ExecutionClient {
     /// Account ID for this client.
     #[allow(dead_code)]
     account_id: AccountId,
+    /// Account for balance and equity tracking (wired in Phase 5.6).
+    account: Arc<Mutex<Account>>,
     /// Data engine for routing quote and orderbook data (wired in Phase 5.5).
     #[allow(dead_code)]
     data_engine: Arc<Mutex<DataEngine>>,
@@ -57,6 +59,16 @@ pub struct ExecutionClient {
     /// Maps client_order_id -> ModifyOrder. Only applied to OMS after exchange
     /// sends ExecutionReport with REPLACED status.
     pending_modifications: HashMap<ClientOrderId, ModifyOrder>,
+    /// Pending order submissions — maps client_order_id to the uuid of the submit request.
+    /// Used for audit trail / correlation when execution reports arrive.
+    pending_submissions: HashMap<ClientOrderId, uuid::Uuid>,
+    /// Channel for routing WS messages back to the main task context for processing.
+    /// This allows handle_ws_message to be called (which dispatches to on_* handlers)
+    /// from the correct async context rather than the spawned WS loop.
+    ws_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ExchangeWsMessage>>>>,
+    /// Optional market data adapter for routing trade/quote/orderbook data to DataEngine.
+    /// Set via `set_market_data_adapter()` before calling `connect()`.
+    market_data_adapter: Option<Arc<Mutex<Box<dyn MarketDataAdapter>>>>
 }
 
 impl ExecutionClient {
@@ -76,6 +88,7 @@ impl ExecutionClient {
         ws: Arc<Mutex<Box<dyn ExchangeWs>>>,
         trader_id: TraderId,
         account_id: AccountId,
+        account: Arc<Mutex<Account>>,
         cache: Arc<Mutex<Cache>>,
         oms: Oms,
         data_engine: Arc<Mutex<DataEngine>>,
@@ -102,22 +115,85 @@ impl ExecutionClient {
             cache,
             oms,
             account_id,
+            account,
             data_engine,
             risk_engine,
             msgbus: Arc::clone(&msgbus),
             pending_modifications: HashMap::new(),
+            pending_submissions: HashMap::new(),
+            ws_tx: Arc::new(Mutex::new(None)),
+            market_data_adapter: None,
         }
+    }
+
+    /// Set the market data adapter for routing trade/quote/orderbook data to DataEngine.
+    /// Must be called before `connect()`.
+    pub fn set_market_data_adapter(
+        &mut self,
+        adapter: Arc<Mutex<Box<dyn MarketDataAdapter>>>,
+    ) {
+        self.market_data_adapter = Some(adapter);
     }
 
     /// Connect to the WebSocket and start the receive loop.
     /// Must be called before placing orders.
     pub async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.ws.lock().unwrap().connect().await?;
+
+        // Create a channel so the spawned WS recv loop can feed messages to
+        // handle_ws_message running in the main task context (where &mut self is available).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ExchangeWsMessage>(200);
+        // Store a clone in ws_tx so disconnect() can drop it to signal shutdown
+        *self.ws_tx.lock().unwrap() = Some(tx.clone());
+
+        // Spawn WS receive loop — this task ONLY receives from the websocket and
+        // feeds messages into the channel. It does NOT process them.
+        let ws = Arc::clone(&self.ws);
+        let name = self.component.name.to_string();
+        tokio::task::spawn_local(async move {
+            let log_prefix = format!("[{}] WS Recv", name);
+            // tx was moved here as `mut tx` in the outer scope
+            loop {
+                let msg_result = {
+                    let mut ws_guard = ws.lock().unwrap();
+                    ws_guard.recv().await
+                };
+
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("{} error: {}, reconnecting...", log_prefix, e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        break;
+                    }
+                };
+
+                // MISS-5 FIX: send to channel instead of msgbus.send directly.
+                // This allows handle_ws_message to be called in the main task context
+                // where we have &mut self access.
+                if tx.send(msg).await.is_err() {
+                    // Receiver (main task) dropped — client disconnected
+                    break;
+                }
+            }
+            eprintln!("{} exited", log_prefix);
+        });
+
+        // MISS-5 FIX: Process loop running in main task context.
+        // This calls handle_ws_message (which invokes on_* handlers and updates
+        // Cache/Account/RiskEngine) for every WS message received.
+        let msgbus = Arc::clone(&self.msgbus);
+        while let Some(msg) = rx.recv().await {
+            self.handle_ws_message(msg, &msgbus);
+        }
+
         Ok(())
     }
 
     /// Disconnect and stop the WebSocket receive loop.
     pub async fn disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Drop the tx to signal the recv loop to exit
+        *self.ws_tx.lock().unwrap() = None;
         self.ws.lock().unwrap().close().await?;
         Ok(())
     }
@@ -179,6 +255,10 @@ impl ExecutionClient {
         // Submit to OMS (generates PositionId, persists to cache, publishes OrderSubmitted)
         let position_id = self.oms.submit_order(&submit, strategy_id);
 
+        // Store uuid for correlation when execution report arrives
+        let uuid = submit.uuid;
+        self.pending_submissions.insert(submit.client_order_id.clone(), uuid);
+
         // Place the order via HTTP
         let venue_order_id = self.http.place_order(&submit).await?;
 
@@ -210,11 +290,59 @@ impl ExecutionClient {
             ExchangeWsMessage::OkxExec(report) => {
                 self.handle_execution_report_from_okx(report);
             }
-            ExchangeWsMessage::BinanceBalance(_) | ExchangeWsMessage::BybitBalance(_) | ExchangeWsMessage::OkxBalance(_) => {
-                // Balance updates handled separately
+            ExchangeWsMessage::BinanceBalance(bal) => {
+                // MISS-2 FIX: Apply exchange-reported balance update to Account.
+                // This keeps Account balance in sync with exchange-reported balances.
+                use crate::engine::account::Currency;
+                if let Ok(total) = bal.balance.parse::<f64>() {
+                    self.account.lock().unwrap().apply_balance_update(
+                        Currency::new(&bal.asset),
+                        total,
+                        0.0, // BinanceBalanceUpdate doesn't report locked separately
+                    );
+                }
             }
-            ExchangeWsMessage::BinanceAccount(_) | ExchangeWsMessage::BybitAccount(_) | ExchangeWsMessage::OkxAccount(_) => {
-                // Account updates handled separately
+            ExchangeWsMessage::BybitBalance(bal) => {
+                // BybitBalanceUpdate has only `balance` field (no free/locked split)
+                use crate::engine::account::Currency;
+                if let Ok(total) = bal.balance.parse::<f64>() {
+                    self.account.lock().unwrap().apply_balance_update(
+                        Currency::new(&bal.asset),
+                        total,
+                        0.0,
+                    );
+                }
+            }
+            ExchangeWsMessage::OkxBalance(bal) => {
+                // OkxBalanceUpdate has only `balance` field (no free/locked split)
+                use crate::engine::account::Currency;
+                if let Ok(total) = bal.balance.parse::<f64>() {
+                    self.account.lock().unwrap().apply_balance_update(
+                        Currency::new(&bal.asset),
+                        total,
+                        0.0,
+                    );
+                }
+            }
+            ExchangeWsMessage::BinanceAccount(acc) => {
+                // MISS-2 FIX: Apply Binance account update (per-currency free/locked balances).
+                use crate::engine::account::Currency;
+                for bal in &acc.balances {
+                    if let (Ok(free), Ok(locked)) = (
+                        bal.free.parse::<f64>(),
+                        bal.locked.parse::<f64>(),
+                    ) {
+                        self.account.lock().unwrap().apply_balance_update(
+                            Currency::new(&bal.asset),
+                            free + locked,
+                            locked,
+                        );
+                    }
+                }
+            }
+            // BybitAccount and OkxAccount: available when their adapters are fully wired
+            ExchangeWsMessage::BybitAccount(_) | ExchangeWsMessage::OkxAccount(_) => {
+                // Account updates handled separately — TODO: wire when Bybit/OKX adapters complete
             }
             ExchangeWsMessage::BinanceListStatus(status) => {
                 self.handle_list_status_from_binance(status);
@@ -257,10 +385,39 @@ impl ExecutionClient {
                 // Fill event — build OrderFilled and apply to OMS
                 let fill = self.build_order_filled(&report);
                 self.oms.apply_fill(&client_order_id, &fill);
+
+                // D.13 FIX: Remove from pending submissions on fill (no correlation needed after fill)
+                self.pending_submissions.remove(&client_order_id);
+
+                // MISS-1 FIX: Update RiskEngine with new equity after fill.
+                // This drives the TradingState state machine (Active → ReduceOnly → Halted).
+                // Without this call, drawdown circuit breaker and daily loss limit are non-functional.
+                let equity = {
+                    let cache = self.cache.lock().unwrap();
+                    cache.get_equity_for_venue(&Venue::new("BINANCE"))
+                };
+                let instrument_id_str = fill.instrument_id.to_string();
+                let instrument_id = fnv1a_hash(instrument_id_str.as_bytes());
+                self.risk_engine.lock().unwrap().on_trade(instrument_id, equity);
+
+                // MISS-2 FIX: Update Account balance after fill.
+                // Account tracks balance, margin, commissions, and realized PnL.
+                // Without this call, Account is inert and balance never reflects fills.
+                self.account.lock().unwrap().update_with_order(
+                    fill.client_order_id.to_string(),
+                    fill.instrument_id.clone(),
+                    fill.order_side,
+                    fill.filled_qty,
+                    fill.fill_price,
+                    fill.commission,
+                    fill.ts_event,
+                );
             }
             "CANCELED" | "EXPIRED" => {
                 // Order cancelled — notify OMS
                 self.oms.cancel(&client_order_id);
+                // D.13 FIX: Remove from pending submissions on cancel/expire
+                self.pending_submissions.remove(&client_order_id);
             }
             "REJECTED" => {
                 // Remove from pending modifications if present (no OMS update needed)
@@ -269,6 +426,8 @@ impl ExecutionClient {
                     let reason = report.reject_reason.clone();
                     self.oms.apply_rejection(&client_order_id, &reason);
                 }
+                // D.13 FIX: Remove from pending submissions on rejection
+                self.pending_submissions.remove(&client_order_id);
             }
             _ => {}
         }
@@ -339,6 +498,7 @@ impl ExecutionClient {
             match group_status {
                 "CANCELLED" => {
                     self.oms.cancel(&coid);
+                    self.pending_submissions.remove(&coid);
                 }
                 "EXECUTED" => {
                     // Individual ExecutionReport messages already handled fills
@@ -358,6 +518,7 @@ impl ExecutionClient {
             match group_status {
                 "CANCELLED" => {
                     self.oms.cancel(&coid);
+                    self.pending_submissions.remove(&coid);
                 }
                 "EXECUTED" => {
                     // Individual ExecutionReport messages already handled fills
@@ -368,10 +529,22 @@ impl ExecutionClient {
     }
 
     /// Route market data messages to DataEngine (wired in Phase 5.5).
-    /// Currently a no-op stub; market data WebSocket arrives via a separate
-    /// BinanceMarketDataAdapter connection, not this user-data-stream WS.
+    ///
+    /// Market data (quotes, orderbook) arrives via a **separate**
+    /// `BinanceMarketDataAdapter` WebSocket connection (e.g., `!miniTicker` /
+    /// `<symbol>@depth` streams), NOT the user-data-stream WS that
+    /// `ExecutionClient` connects to for fills and balances.
+    ///
+    /// When `BinanceMarketDataAdapter` is implemented, it will hold an
+    /// `Arc<Mutex<DataEngine>>` and call `data_engine.process_quote()` /
+    /// `data_engine.process_orderbook()` directly — NOT through this hook.
+    ///
+    /// This stub exists because `ExecutionClient` is the natural place to
+    /// document the data flow; the actual wiring happens in the market-data
+    /// adapter, not here.
     fn maybe_route_to_data_engine(&mut self, _msg: &ExchangeWsMessage) {
-        // Phase 5.5: BinanceMarketDataAdapter will call data_engine.process_quote/process_orderbook
+        // No-op: quote/OB data arrives via BinanceMarketDataAdapter (Phase 5.5),
+        // not via the user-data-stream WS that ExecutionClient manages.
     }
 
     fn handle_execution_report_from_binance(

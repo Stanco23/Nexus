@@ -280,6 +280,7 @@ mod tests {
         let trades = vec![
             Trade {
                 timestamp_ns: 1_000_000_000,
+                instrument_id: 0,
                 side: Signal::Buy,
                 price: 100.0,
                 size: 1.0,
@@ -290,6 +291,7 @@ mod tests {
             },
             Trade {
                 timestamp_ns: 2_000_000_000,
+                instrument_id: 0,
                 side: Signal::Sell,
                 price: 110.0,
                 size: 1.0,

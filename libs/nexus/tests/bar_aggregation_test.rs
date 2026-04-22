@@ -42,7 +42,7 @@ fn test_bar_buffer_from_tick_buffer() {
     }
     writer.finalize().unwrap();
 
-    let rb = RingBuffer::open(path, inst_id).unwrap();
+    let rb = RingBuffer::open(path, inst_id.clone()).unwrap();
     let tb = TickBuffer::from_ring_buffer(&rb, 10).unwrap();
 
     // Build 1-second bars
@@ -93,12 +93,12 @@ fn test_bar_aggregation_1m_intervals() {
 
     // Verify first bar
     let first = bar_buffer.get(0).unwrap();
-    assert_eq!(first.timestamp_ns, start_ts);
+    assert_eq!(first.ts_event, start_ts);
     assert_eq!(first.open, 100000);
 
     // Verify last bar
     let last = bar_buffer.get(59).unwrap();
-    assert_eq!(last.timestamp_ns, start_ts + 59_000_000_000);
+    assert_eq!(last.ts_event, start_ts + 59_000_000_000);
     assert_eq!(last.close, 100000 + 59 * 100);
 
     clean_file(path);
@@ -217,7 +217,7 @@ fn test_bar_iteration() {
 
     // Verify bar iteration preserves order
     for (i, bar) in bars.iter().enumerate() {
-        assert_eq!(bar.timestamp_ns, start_ts + (i as u64) * 1_000_000_000);
+        assert_eq!(bar.ts_event, start_ts + (i as u64) * 1_000_000_000);
     }
 
     clean_file(path);

@@ -179,7 +179,7 @@ impl RingBuffer {
 
     /// Get the instrument ID for this buffer.
     pub fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
+        self.instrument_id.clone()
     }
 
     /// Get the file header.

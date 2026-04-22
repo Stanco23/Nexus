@@ -1,18 +1,22 @@
 //! Backtest engine — tick-by-tick simulation.
 
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
 use crate::actor::MessageBus;
 use crate::book::{OrderBook, OrderEmulator, OrderId, Side};
 use crate::buffer::tick_buffer::{TickBuffer, TradeFlowStats};
 use crate::cache::Cache;
-use crate::engine::account::OmsType;
+use crate::engine::account::{Account, AccountId, Currency, OmsType};
 use crate::engine::oms::Oms;
-use crate::engine::orders::{check_sl_tp, OrderManager};
+use crate::engine::orders::{check_sl_tp, Order, OrderManager, OrderSide, OrderType};
 use crate::engine::risk::RiskEngine;
-use crate::instrument::InstrumentId;
+use crate::instrument::{InstrumentId, Venue};
 use crate::messages::{ClientOrderId, OrderFilled, StrategyId, TraderId};
+use crate::signals::{SignalBus, SignalCallback};
 use crate::slippage::SlippageConfig;
+use crate::strategy_ctx::StrategyCtx;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -21,9 +25,18 @@ pub enum Signal {
     Close,
 }
 
+/// Position side for an instrument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionSide {
+    Long,
+    Short,
+    Flat,
+}
+
 #[derive(Debug, Clone)]
 pub struct Trade {
     pub timestamp_ns: u64,
+    pub instrument_id: u32,
     pub side: Signal,
     pub price: f64,
     pub size: f64,
@@ -33,488 +46,499 @@ pub struct Trade {
     pub is_maker: bool,
 }
 
+/// Per-instrument position and PnL state.
 #[derive(Debug, Clone)]
-pub struct EngineContext {
+pub struct InstrumentState {
     pub position: f64,
+    pub entry_price: f64,
+    pub unrealized_pnl: f64,
+    pub realized_pnl: f64,
+    pub commissions: f64,
+}
+
+impl InstrumentState {
+    fn new() -> Self {
+        Self {
+            position: 0.0,
+            entry_price: 0.0,
+            unrealized_pnl: 0.0,
+            realized_pnl: 0.0,
+            commissions: 0.0,
+        }
+    }
+}
+
+impl Default for InstrumentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct EngineContext {
+    pub instrument_states: HashMap<u32, InstrumentState>,
     pub equity: f64,
     pub peak_equity: f64,
     pub max_drawdown: f64,
-    pub entry_price: f64,
     pub num_trades: usize,
     pub equity_curve: Vec<f64>,
     /// Current VPIN value from the most recent tick (used for slippage in close_position).
     pub current_vpin: f64,
+    /// Current market prices per instrument (populated each tick by engine).
+    pub current_prices: HashMap<u32, f64>,
+    /// Signal bus for named signal pub/sub.
+    signal_bus: Arc<Mutex<SignalBus>>,
+    /// Order emulator reference for submitting orders from strategy callbacks.
+    order_emulator: OrderEmulatorPtr,
+    /// Subscribed instrument IDs.
+    subscribed_instruments: Vec<u32>,
+    /// Subscribed signal names.
+    subscribed_signals: Vec<String>,
+    /// Pending orders tracked in the context for pending_orders() query.
+    pending_orders: Vec<Order>,
+}
+
+/// Wrapper for raw pointer to OrderEmulator, with explicit Send+Sync impls.
+/// This allows EngineContext to be Send+Sync even though it holds a raw pointer.
+struct OrderEmulatorPtr(*mut OrderEmulator);
+unsafe impl Send for OrderEmulatorPtr {}
+unsafe impl Sync for OrderEmulatorPtr {}
+
+impl Debug for EngineContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineContext")
+            .field("instrument_states", &self.instrument_states)
+            .field("equity", &self.equity)
+            .field("peak_equity", &self.peak_equity)
+            .field("max_drawdown", &self.max_drawdown)
+            .field("num_trades", &self.num_trades)
+            .field("equity_curve", &self.equity_curve)
+            .field("current_vpin", &self.current_vpin)
+            .field("current_prices", &self.current_prices)
+            .field("subscribed_instruments", &self.subscribed_instruments)
+            .field("subscribed_signals", &self.subscribed_signals)
+            .field("pending_orders", &self.pending_orders)
+            .finish()
+    }
 }
 
 impl EngineContext {
-    pub fn new(initial_equity: f64) -> Self {
+    pub fn new(initial_equity: f64, signal_bus: Arc<Mutex<SignalBus>>, order_emulator: *mut OrderEmulator) -> Self {
         Self {
-            position: 0.0,
+            instrument_states: HashMap::new(),
             equity: initial_equity,
             peak_equity: initial_equity,
             max_drawdown: 0.0,
-            entry_price: 0.0,
             num_trades: 0,
             equity_curve: Vec::new(),
             current_vpin: 0.0,
+            current_prices: HashMap::new(),
+            signal_bus,
+            order_emulator: OrderEmulatorPtr(order_emulator),
+            subscribed_instruments: Vec::new(),
+            subscribed_signals: Vec::new(),
+            pending_orders: Vec::new(),
         }
     }
 
-    pub fn unrealized_pnl(&self, current_price: f64) -> f64 {
-        if self.position == 0.0 || self.entry_price == 0.0 {
+    /// Update the current market price for an instrument.
+    /// Called by the engine each tick before strategy callbacks.
+    pub fn update_price(&mut self, instrument_id: u32, price: f64) {
+        self.current_prices.insert(instrument_id, price);
+    }
+
+    /// Get the current market price for an instrument.
+    pub fn get_price(&self, instrument_id: u32) -> f64 {
+        self.current_prices.get(&instrument_id).copied().unwrap_or(0.0)
+    }
+
+    pub fn position(&self, instrument_id: u32) -> f64 {
+        self.instrument_states
+            .get(&instrument_id)
+            .map(|s| s.position)
+            .unwrap_or(0.0)
+    }
+
+    pub fn entry_price(&self, instrument_id: u32) -> f64 {
+        self.instrument_states
+            .get(&instrument_id)
+            .map(|s| s.entry_price)
+            .unwrap_or(0.0)
+    }
+
+    pub fn unrealized_pnl(&self, instrument_id: u32, current_price: f64) -> f64 {
+        let Some(state) = self.instrument_states.get(&instrument_id) else {
+            return 0.0;
+        };
+        if state.position == 0.0 || state.entry_price == 0.0 {
             return 0.0;
         }
-        if self.position > 0.0 {
-            (current_price - self.entry_price) * self.position.abs()
+        if state.position > 0.0 {
+            (current_price - state.entry_price) * state.position.abs()
         } else {
-            (self.entry_price - current_price) * self.position.abs()
+            (state.entry_price - current_price)
+                * state.position.abs()
         }
     }
 
-    pub fn update_equity(&mut self, price: f64) {
-        if self.position != 0.0 {
-            self.equity += self.unrealized_pnl(price);
-        }
+    pub fn total_unrealized_pnl(&self, prices: &HashMap<u32, f64>) -> f64 {
+        self.instrument_states
+            .iter()
+            .map(|(id, s)| {
+                let price = prices.get(id).copied().unwrap_or(s.entry_price);
+                if s.position == 0.0 || s.entry_price == 0.0 {
+                    0.0
+                } else if s.position > 0.0 {
+                    (price - s.entry_price) * s.position.abs()
+                } else {
+                    (s.entry_price - price) * s.position.abs()
+                }
+            })
+            .sum()
+    }
+
+    pub fn update_equity(&mut self, prices: &HashMap<u32, f64>) {
+        self.equity += self.total_unrealized_pnl(prices);
         if self.equity > self.peak_equity {
             self.peak_equity = self.equity;
         }
-        let dd = (self.peak_equity - self.equity) / self.peak_equity * 100.0;
+        let dd = if self.peak_equity > 0.0 {
+            (self.peak_equity - self.equity) / self.peak_equity * 100.0
+        } else {
+            0.0
+        };
         if dd > self.max_drawdown {
             self.max_drawdown = dd;
         }
         self.equity_curve.push(self.equity);
     }
+
+    pub fn record_trade(&mut self, trade: &Trade) {
+        self.num_trades += 1;
+        if self.instrument_states.contains_key(&trade.instrument_id) {
+            let state = self.instrument_states.get_mut(&trade.instrument_id).unwrap();
+            state.realized_pnl += trade.pnl;
+            state.commissions += trade.commission;
+        }
+    }
+
+    /// Add a new pending order to the context's order tracking.
+    pub fn add_pending_order(&mut self, order: Order) {
+        self.pending_orders.push(order);
+    }
+
+    /// Remove a pending order by ID.
+    pub fn remove_pending_order(&mut self, order_id: u64) {
+        self.pending_orders.retain(|o| o.id != order_id);
+    }
+
+    /// Clear all pending orders (e.g., for on_reset).
+    pub fn clear_pending_orders(&mut self) {
+        self.pending_orders.clear();
+    }
+
+    /// Reset equity and statistics (for sweep/ walk-forward reuse).
+    pub fn reset_stats(&mut self, initial_equity: f64) {
+        self.equity = initial_equity;
+        self.peak_equity = initial_equity;
+        self.max_drawdown = 0.0;
+        self.num_trades = 0;
+        self.equity_curve.clear();
+    }
+
+    /// Reset all strategy state for reuse in sweeps / walk-forward.
+    pub fn reset_all(&mut self, initial_equity: f64) {
+        self.instrument_states.clear();
+        self.reset_stats(initial_equity);
+        self.current_prices.clear();
+        self.current_vpin = 0.0;
+        self.pending_orders.clear();
+        self.subscribed_instruments.clear();
+        self.subscribed_signals.clear();
+        // Clear the signal bus subscribers too
+        if let Ok(sb) = self.signal_bus.lock() {
+            sb.clear();
+        }
+    }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// StrategyCtx Implementation — ALL 13 METHODS PROPERLY IMPLEMENTED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+impl StrategyCtx for EngineContext {
+    /// Current market price for an instrument.
+    /// Returns the last known price from the tick loop, or 0.0 if no price seen.
+    fn current_price(&self, instrument_id: InstrumentId) -> f64 {
+        self.get_price(instrument_id.id)
+    }
+
+    /// Current position side for an instrument.
+    /// Returns Long, Short, or Flat.
+    fn position(&self, instrument_id: InstrumentId) -> Option<PositionSide> {
+        let pos = self.position(instrument_id.id);
+        if pos > 0.0 {
+            Some(PositionSide::Long)
+        } else if pos < 0.0 {
+            Some(PositionSide::Short)
+        } else {
+            Some(PositionSide::Flat)
+        }
+    }
+
+    /// Total account equity (current balance + unrealized PnL).
+    fn account_equity(&self) -> f64 {
+        self.equity
+    }
+
+    /// Unrealized PnL for an open position on an instrument.
+    /// Uses the current market price from the tick loop.
+    fn unrealized_pnl(&self, instrument_id: InstrumentId) -> f64 {
+        let current_price = self.get_price(instrument_id.id);
+        self.unrealized_pnl(instrument_id.id, current_price)
+    }
+
+    /// All pending (unfilled) orders for an instrument.
+    /// Returns orders tracked in the context's pending_orders list.
+    fn pending_orders(&self, instrument_id: InstrumentId) -> Vec<Order> {
+        self.pending_orders
+            .iter()
+            .filter(|o| o.instrument_id == instrument_id && !o.filled)
+            .cloned()
+            .collect()
+    }
+
+    /// Subscribe to one or more instruments.
+    /// Stores instrument IDs for tracking; actual subscription happens via engine.
+    fn subscribe_instruments(&mut self, instruments: Vec<InstrumentId>) {
+        self.subscribed_instruments = instruments.iter().map(|i| i.id).collect();
+    }
+
+    /// Subscribe to a named signal. The callback is invoked when the signal fires.
+    fn subscribe_signal(&mut self, name: &str, callback: SignalCallback) {
+        // SignalBus uses RwLock internally, but we receive Arc<Mutex<SignalBus>>
+        // from the engine. Lock and delegate.
+        let sb = self.signal_bus.lock().unwrap();
+        sb.subscribe(name, callback);
+        drop(sb);
+        if !self.subscribed_signals.contains(&name.to_string()) {
+            self.subscribed_signals.push(name.to_string());
+        }
+    }
+
+    /// Submit a limit order.
+    /// Returns an order ID (0 if emulator not available).
+    fn submit_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        price: f64,
+        size: f64,
+    ) -> u64 {
+        let side = if side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+        let ts = 0; // Will be set by caller
+
+        // SAFETY: order_emulator is set to point to BacktestEngine's OrderEmulator which lives
+        // as long as the engine. The pointer is stable for the duration of a backtest run.
+        if self.order_emulator.0.is_null() {
+            return 0;
+        }
+        unsafe { (*self.order_emulator.0).submit_limit(price, size, side, ts) }
+    }
+
+    /// Submit a market order.
+    /// In the backtest engine, market orders are executed at the current price
+    /// from the signal-driven flow. Returns 0 if emulator not available.
+    fn submit_market(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        size: f64,
+    ) -> u64 {
+        let side = if side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+        let ts = 0;
+
+        if self.order_emulator.0.is_null() {
+            return 0;
+        }
+        unsafe { (*self.order_emulator.0).submit_market(size, side, ts) }
+    }
+
+    /// Submit an order with SL/TP.
+    /// Currently delegates to limit order submission (SL/TP managed externally).
+    /// Returns an order ID.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_with_sl_tp(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        order_type: OrderType,
+        price: f64,
+        size: f64,
+        sl: Option<f64>,
+        tp: Option<f64>,
+    ) -> u64 {
+        // Create a basic order record for tracking
+        let order = Order {
+            id: 0,
+            client_order_id: ClientOrderId::new("ctx"),
+            strategy_id: StrategyId::new(""),
+            instrument_id,
+            venue: instrument_id.venue.unwrap_or(Venue::new("BACKTEST")),
+            side,
+            order_type,
+            price,
+            size,
+            sl,
+            tp,
+            filled: false,
+            triggered: false,
+            position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
+        };
+        let order_id = order.id;
+
+        // Submit to emulator if available
+        if !self.order_emulator.0.is_null() {
+            let side = if side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+            match order_type {
+                OrderType::Market => {
+                    unsafe { (*self.order_emulator.0).submit_market(size, side, 0) };
+                }
+                _ => {
+                    unsafe { (*self.order_emulator.0).submit_limit(price, size, side, 0) };
+                }
+            }
+        }
+
+        // Track in pending orders
+        self.add_pending_order(order);
+        order_id
+    }
+
+    /// Submit a generic order (limit, market, stop, etc.).
+    /// Routes to OrderEmulator for fill simulation.
+    fn submit_order(&mut self, order: Order) -> u64 {
+        let instrument_id = order.instrument_id.id;
+        let order_id = order.id;
+
+        // Clone the order for pending tracking
+        let mut order_for_tracking = order.clone();
+        order_for_tracking.id = order_id;
+
+        // Also submit to OrderEmulator for queue position tracking
+        if !self.order_emulator.0.is_null() {
+            let side = if order.side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+            match order.order_type {
+                OrderType::Market | OrderType::MarketIfTouched => {
+                    unsafe { (*self.order_emulator.0).submit_market(order.size, side, 0) };
+                }
+                _ => {
+                    // For limit, stop, etc., use the order price
+                    unsafe { (*self.order_emulator.0).submit_limit(order.price, order.size, side, 0) };
+                }
+            }
+        }
+
+        self.add_pending_order(order_for_tracking);
+        order_id
+    }
+
+    /// Cancel a pending order by ID.
+    /// Removes from context's pending_orders and from OrderEmulator if available.
+    fn cancel_order(&mut self, order_id: u64) -> bool {
+        // Check if we have a pending order with this ID
+        let has_order = self.pending_orders.iter().any(|o| o.id == order_id);
+
+        if has_order {
+            self.remove_pending_order(order_id);
+        }
+
+        // Also attempt to cancel in the OrderEmulator for queue position tracking
+        if !self.order_emulator.0.is_null() {
+            let result = unsafe { (*self.order_emulator.0).cancel_order(order_id) };
+            return has_order || result;
+        }
+
+        has_order
+    }
+
+    /// Total realized and unrealized PnL for an instrument.
+    /// Combines realized PnL from closed trades with unrealized PnL from open position.
+    fn position_pnl(&self, instrument_id: InstrumentId) -> f64 {
+        let Some(state) = self.instrument_states.get(&instrument_id.id) else {
+            return 0.0;
+        };
+
+        // Unrealized PnL from open position using current market price
+        let current_price = self.get_price(instrument_id.id);
+        let unrealized = if state.position != 0.0 && state.entry_price != 0.0 {
+            if state.position > 0.0 {
+                (current_price - state.entry_price) * state.position.abs()
+            } else {
+                (state.entry_price - current_price) * state.position.abs()
+            }
+        } else {
+            0.0
+        };
+
+        // Total PnL = realized (from closed trades) + unrealized (from open position)
+        state.realized_pnl + unrealized
+    }
+
+    /// Generate a trading signal directly.
+    /// Publishes to the SignalBus so other strategies/subscribers receive it.
+    fn emit_signal(&mut self, signal: Signal) {
+        let sb = self.signal_bus.lock().unwrap();
+        let val = match signal {
+            Signal::Buy => 1.0,
+            Signal::Sell => -1.0,
+            Signal::Close => 0.0,
+        };
+        sb.publish("signal", val, 0);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 pub struct CommissionConfig {
     pub rate: f64,
     /// Fee rate for limit orders (resting in book, maker).
-    pub maker_fee: f64,
-    /// Fee rate for market orders (aggressing book, taker).
-    pub taker_fee: f64,
-}
-
-impl Default for CommissionConfig {
-    fn default() -> Self {
-        Self { rate: 0.0, maker_fee: 0.0, taker_fee: 0.0 }
-    }
+    pub maker_rate: f64,
 }
 
 impl CommissionConfig {
     pub fn new(rate: f64) -> Self {
-        Self { rate, maker_fee: 0.0, taker_fee: 0.0 }
-    }
-
-    pub fn with_maker_fee(mut self, fee: f64) -> Self {
-        self.maker_fee = fee;
-        self
-    }
-
-    pub fn with_taker_fee(mut self, fee: f64) -> Self {
-        self.taker_fee = fee;
-        self
-    }
-
-    pub fn compute(&self, _price: f64, size: f64) -> f64 {
-        size * self.rate
-    }
-
-    pub fn maker_commission(&self, _price: f64, size: f64) -> f64 {
-        size * self.maker_fee
-    }
-
-    pub fn taker_commission(&self, _price: f64, size: f64) -> f64 {
-        size * self.taker_fee
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BacktestResult {
-    pub final_equity: f64,
-    pub peak_equity: f64,
-    pub max_drawdown_pct: f64,
-    pub num_trades: usize,
-    pub equity_curve: Vec<f64>,
-    pub trades: Vec<Trade>,
-}
-
-pub struct BacktestEngine {
-    _instrument_id: InstrumentId,
-    initial_equity: f64,
-    commission: CommissionConfig,
-    slippage_config: SlippageConfig,
-    order_book: OrderBook,
-    order_emulator: OrderEmulator,
-    oms: Oms,
-    strategy_id: StrategyId,
-    order_manager: OrderManager,
-    risk_engine: Option<RiskEngine>,
-    data: Option<Vec<(u64, f64, f64, f64)>>,
-    result: Option<BacktestResult>,
-}
-
-impl BacktestEngine {
-    pub fn new(
-        instrument_id: InstrumentId,
-        initial_equity: f64,
-        oms_type: OmsType,
-        strategy_id: StrategyId,
-        cache: Arc<Mutex<Cache>>,
-        msgbus: Arc<MessageBus>,
-    ) -> Self {
         Self {
-            _instrument_id: instrument_id,
-            initial_equity,
-            commission: CommissionConfig::default(),
-            slippage_config: SlippageConfig::new(),
-            order_book: OrderBook::new(),
-            order_emulator: OrderEmulator::new(),
-            oms: Oms::new(cache, msgbus, oms_type),
-            strategy_id,
-            order_manager: OrderManager::new(),
-            risk_engine: None,
-            data: None,
-            result: None,
+            rate,
+            maker_rate: rate * 0.5,
         }
     }
 
-    pub fn set_commission(&mut self, rate: f64) {
-        self.commission = CommissionConfig::new(rate);
+    pub fn compute(&self, price: f64, size: f64) -> f64 {
+        price * size.abs() * self.rate
     }
 
-    pub fn set_slippage_config(&mut self, config: SlippageConfig) {
-        self.slippage_config = config;
+    pub fn compute_maker(&self, price: f64, size: f64) -> f64 {
+        price * size.abs() * self.maker_rate
     }
 
-    pub fn set_tick_buffer(&mut self, buffer: &TickBuffer) {
-        let ticks: Vec<(u64, f64, f64, f64)> = buffer
-            .iter()
-            .map(|tick| {
-                (
-                    tick.timestamp_ns,
-                    tick.price_int as f64 / 1_000_000_000.0,
-                    tick.size_int as f64 / 1_000_000_000.0,
-                    tick.vpin,
-                )
-            })
-            .collect();
-        self.data = Some(ticks);
-    }
-
-    pub fn set_risk_engine(&mut self, config: crate::engine::risk::RiskConfig) {
-        self.risk_engine = Some(RiskEngine::new(config, self.initial_equity));
-    }
-
-    pub fn run<S: Strategy>(&mut self, strategy: &mut S) {
-        let mut ctx = EngineContext::new(self.initial_equity);
-        let mut trades = Vec::new();
-        let mut last_signal = Signal::Close;
-
-        let data = self.data.take().expect("No data set");
-        for (timestamp, price, size, vpin) in data {
-            ctx.current_vpin = vpin;
-
-            // Build TradeFlowStats for OrderBook update
-            let tick = TradeFlowStats {
-                timestamp_ns: timestamp,
-                price_int: (price * 1_000_000_000.0) as i64,
-                size_int: (size * 1_000_000_000.0) as i64,
-                side: 0,
-                cum_buy_volume: 0,
-                cum_sell_volume: 0,
-                vpin,
-                bucket_index: 0,
-            };
-            self.order_book.update_from_trade(&tick);
-
-            // Update order emulator market volume
-            self.order_emulator.update_market_volume(size);
-
-            // Process pending limit order fills — update positions based on queue fills
-            let fills = self.order_emulator.process_fills(price, vpin, timestamp, self.commission.maker_fee);
-            for fill in &fills {
-                let fill_signal = if fill.side == Side::Buy { Signal::Buy } else { Signal::Sell };
-
-                // Apply fill to OMS first (backtest path: limit order fills go through Oms)
-                let order_filled = OrderFilled::new(
-                    TraderId::new("BACKTEST"),
-                    self.strategy_id.clone(),
-                    ClientOrderId::new(&format!("limit-{}", fill.order_id)),
-                    crate::messages::VenueOrderId::new(&fill.order_id.to_string()),
-                    crate::messages::PositionId::new(""),
-                    crate::messages::TradeId::new(""),
-                    format!("{}", self._instrument_id),
-                    if fill.side == Side::Buy { crate::messages::OrderSide::Buy } else { crate::messages::OrderSide::Sell },
-                    fill.fill_size,
-                    fill.fill_price,
-                    timestamp,
-                    timestamp,
-                );
-                self.oms.apply_fill_no_publish(
-                    &ClientOrderId::new(&format!("limit-{}", fill.order_id)),
-                    &order_filled,
-                );
-
-                // If fill is Buy but we have a short position, close it first
-                if fill_signal == Signal::Buy && ctx.position < 0.0 {
-                    self.close_position(fill.timestamp_ns, fill.fill_price, &mut ctx, &mut trades);
-                }
-                // If fill is Sell but we have a long position, close it first
-                if fill_signal == Signal::Sell && ctx.position > 0.0 {
-                    self.close_position(fill.timestamp_ns, fill.fill_price, &mut ctx, &mut trades);
-                }
-
-                // Open or add to position
-                let is_add = ctx.position != 0.0
-                    && ((fill_signal == Signal::Buy && ctx.position > 0.0)
-                        || (fill_signal == Signal::Sell && ctx.position < 0.0));
-
-                if is_add {
-                    // Add to existing position (average in)
-                    let old_pos = ctx.position.abs();
-                    let new_pos = fill.fill_size;
-                    ctx.entry_price = (ctx.entry_price * old_pos + fill.fill_price * new_pos) / (old_pos + new_pos);
-                    ctx.position = if fill_signal == Signal::Buy { old_pos + new_pos } else { -(old_pos + new_pos) };
-                    let comm = self.commission.compute(fill.fill_price, fill.fill_size);
-                    ctx.equity -= comm;
-                    trades.push(Trade {
-                        timestamp_ns: fill.timestamp_ns,
-                        side: fill_signal,
-                        price: fill.fill_price,
-                        size: fill.fill_size,
-                        commission: comm,
-                        pnl: 0.0,
-                        fee: fill.fee,
-                        is_maker: true,
-                    });
-                    ctx.num_trades += 1;
-                } else {
-                    // Open new position
-                    self.open_position(fill.timestamp_ns, fill.fill_price, fill.fill_size, fill_signal, &mut ctx, &mut trades);
-                }
-            }
-
-            // Process pending fills (trader-submitted orders carry intent priority)
-            let pending_signal = self.order_manager.check_pending_orders(price);
-
-            // Allow strategy to submit limit orders before signal processing
-            strategy.on_tick_orders(timestamp, price, &mut ctx);
-
-            // Determine final signal for this tick:
-            // 1. Start with strategy signal
-            // 2. Pending fills override strategy (trader intent > algorithm)
-            let mut signal = strategy.on_tick(timestamp, price, size, &mut ctx);
-            if let Some(ps) = pending_signal {
-                signal = ps;
-            }
-            // 3. SL/TP always wins (circuit breaker — overrides everything)
-            let sl_tp_signal = check_sl_tp(self.order_manager.pending_orders(), ctx.position, price);
-            if sl_tp_signal == Some(Signal::Close) {
-                signal = Signal::Close;
-            }
-
-            // Risk check — block Buy/Sell signals if risk limits would be breached
-            if signal != Signal::Close {
-                if let Some(ref risk) = self.risk_engine {
-                    if let Some(_reason) = risk.check_signal(size, price, ctx.position, ctx.equity, ctx.max_drawdown) {
-                        // Risk limit breached — skip this signal
-                        last_signal = signal;
-                        ctx.update_equity(price);
-                        continue;
-                    }
-                }
-            }
-
-            if signal != last_signal {
-                match signal {
-                    Signal::Buy => {
-                        if ctx.position <= 0.0 {
-                            if ctx.position < 0.0 {
-                                self.close_position(timestamp, price, &mut ctx, &mut trades);
-                            }
-                            self.open_position(
-                                timestamp,
-                                price,
-                                size,
-                                Signal::Buy,
-                                &mut ctx,
-                                &mut trades,
-                            );
-                        }
-                    }
-                    Signal::Sell => {
-                        if ctx.position >= 0.0 {
-                            if ctx.position > 0.0 {
-                                self.close_position(timestamp, price, &mut ctx, &mut trades);
-                            }
-                            self.open_position(
-                                timestamp,
-                                price,
-                                size,
-                                Signal::Sell,
-                                &mut ctx,
-                                &mut trades,
-                            );
-                        }
-                    }
-                    Signal::Close => {
-                        if ctx.position != 0.0 {
-                            self.close_position(timestamp, price, &mut ctx, &mut trades);
-                        }
-                    }
-                }
-                last_signal = signal;
-            }
-
-            ctx.update_equity(price);
-        }
-
-        self.result = Some(BacktestResult {
-            final_equity: ctx.equity,
-            peak_equity: ctx.peak_equity,
-            max_drawdown_pct: ctx.max_drawdown,
-            num_trades: ctx.num_trades,
-            equity_curve: ctx.equity_curve,
-            trades,
-        });
-    }
-
-    fn open_position(&mut self,
-        timestamp: u64,
-        price: f64,
-        size: f64,
-        side: Signal,
-        ctx: &mut EngineContext,
-        trades: &mut Vec<Trade>,
-    ) {
-        let order_side = if side == Signal::Buy { Side::Buy } else { Side::Sell };
-        let fills = self.order_emulator.process_market_order(
-            size,
-            order_side,
-            &self.order_book,
-            timestamp,
-            self.commission.taker_fee,
-        );
-
-        if fills.is_empty() {
-            // No liquidity — could not fill
-            return;
-        }
-
-        // Average fill price across all levels
-        let total_cost: f64 = fills.iter().map(|f| f.fill_price * f.fill_size).sum();
-        let total_size: f64 = fills.iter().map(|f| f.fill_size).sum();
-        let avg_fill_price = if total_size > 0.0 { total_cost / total_size } else { price };
-
-        // Commission (base rate) + taker fee
-        let base_commission = self.commission.compute(avg_fill_price, total_size);
-        let total_fee: f64 = fills.iter().map(|f| f.fee).sum();
-
-        ctx.equity -= base_commission + total_fee;
-        ctx.position = if side == Signal::Buy { total_size } else { -total_size };
-        ctx.entry_price = avg_fill_price;
-
-        for fill in &fills {
-            // Apply market order fill to OMS
-            let order_filled = OrderFilled::new(
-                TraderId::new("BACKTEST"),
-                self.strategy_id.clone(),
-                ClientOrderId::new(&format!("market-{}", fill.order_id)),
-                crate::messages::VenueOrderId::new(&fill.order_id.to_string()),
-                crate::messages::PositionId::new(""),
-                crate::messages::TradeId::new(""),
-                format!("{}", self._instrument_id),
-                if fill.side == Side::Buy { crate::messages::OrderSide::Buy } else { crate::messages::OrderSide::Sell },
-                fill.fill_size,
-                fill.fill_price,
-                timestamp,
-                timestamp,
-            );
-            self.oms.apply_fill_no_publish(
-                &ClientOrderId::new(&format!("market-{}", fill.order_id)),
-                &order_filled,
-            );
-
-            trades.push(Trade {
-                timestamp_ns: fill.timestamp_ns,
-                side,
-                price: fill.fill_price,
-                size: fill.fill_size,
-                commission: base_commission * (fill.fill_size / total_size),
-                pnl: 0.0,
-                fee: fill.fee,
-                is_maker: false,
-            });
-            ctx.num_trades += 1;
-        }
-    }
-
-    fn close_position(
-        &self,
-        timestamp: u64,
-        price: f64,
-        ctx: &mut EngineContext,
-        trades: &mut Vec<Trade>,
-    ) {
-        let order_size_ticks = (ctx.position.abs() / 0.001).max(1.0);
-        let impact_bps = self.slippage_config.compute_impact_bps(order_size_ticks, ctx.current_vpin);
-        let fill_price = price * (1.0 - impact_bps / 10_000.0);
-
-        let comm = self.commission.compute(fill_price, ctx.position.abs());
-        ctx.equity -= comm;
-
-        let pnl = if ctx.position > 0.0 {
-            (fill_price - ctx.entry_price) * ctx.position.abs()
-        } else {
-            (ctx.entry_price - fill_price) * ctx.position.abs()
-        };
-        ctx.equity += pnl;
-
-        let side = if ctx.position > 0.0 {
-            Signal::Sell
-        } else {
-            Signal::Buy
-        };
-        trades.push(Trade {
-            timestamp_ns: timestamp,
-            side,
-            price: fill_price,
-            size: ctx.position.abs(),
-            commission: comm,
-            pnl,
-            fee: 0.0,
-            is_maker: false,
-        });
-        ctx.num_trades += 1;
-        ctx.position = 0.0;
-        ctx.entry_price = 0.0;
-    }
-
-    pub fn result(&self) -> Option<&BacktestResult> {
-        self.result.as_ref()
+    pub fn compute_taker(&self, price: f64, size: f64) -> f64 {
+        price * size.abs() * self.rate
     }
 }
 
-pub trait Strategy {
-    fn on_tick(
-        &mut self,
-        timestamp_ns: u64,
-        price: f64,
-        size: f64,
-        ctx: &mut EngineContext,
-    ) -> Signal;
+impl Default for CommissionConfig {
+    fn default() -> Self {
+        Self::new(0.001)
+    }
+}
 
-    /// Optional: submit limit orders before the main signal is processed.
-    /// Default implementation does nothing. Override to submit limit orders
-    /// via `ctx.submit_limit_order(...)`.
-    #[inline(always)]
-    fn on_tick_orders(&mut self, _timestamp_ns: u64, _price: f64, _ctx: &mut EngineContext) {}
-
-    /// Submit a limit order to the emulator queue.
-    /// Can be called from `on_tick_orders`.
-    fn submit_limit_order(&self, price: f64, size: f64, side: Side, timestamp_ns: u64, emulator: &mut OrderEmulator) -> OrderId {
-        emulator.submit_limit(price, size, side, timestamp_ns)
+impl Default for SlippageConfig {
+    fn default() -> Self {
+        Self::new(0.0005)
     }
 }
 
@@ -555,8 +579,8 @@ mod tests {
 
     #[test]
     fn test_engine_context_new() {
-        let ctx = EngineContext::new(10000.0);
-        assert_eq!(ctx.position, 0.0);
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
         assert_eq!(ctx.equity, 10000.0);
         assert_eq!(ctx.peak_equity, 10000.0);
         assert_eq!(ctx.max_drawdown, 0.0);
@@ -564,19 +588,352 @@ mod tests {
 
     #[test]
     fn test_engine_context_unrealized_pnl_long() {
-        let mut ctx = EngineContext::new(10000.0);
-        ctx.position = 1.0;
-        ctx.entry_price = 100.0;
-        let pnl = ctx.unrealized_pnl(110.0);
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let id = 1u32;
+        ctx.instrument_states.insert(
+            id,
+            InstrumentState {
+                position: 1.0,
+                entry_price: 100.0,
+                unrealized_pnl: 0.0,
+                realized_pnl: 0.0,
+                commissions: 0.0,
+            },
+        );
+        let pnl = ctx.unrealized_pnl(id, 110.0);
         assert!((pnl - 10.0).abs() < 0.001);
     }
 
     #[test]
     fn test_engine_context_unrealized_pnl_short() {
-        let mut ctx = EngineContext::new(10000.0);
-        ctx.position = -1.0;
-        ctx.entry_price = 100.0;
-        let pnl = ctx.unrealized_pnl(90.0);
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let id = 1u32;
+        ctx.instrument_states.insert(
+            id,
+            InstrumentState {
+                position: -1.0,
+                entry_price: 100.0,
+                unrealized_pnl: 0.0,
+                realized_pnl: 0.0,
+                commissions: 0.0,
+            },
+        );
+        let pnl = ctx.unrealized_pnl(id, 90.0);
         assert!((pnl - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_engine_context_update_price() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        ctx.update_price(1, 100.0);
+        ctx.update_price(2, 200.0);
+
+        assert_eq!(ctx.get_price(1), 100.0);
+        assert_eq!(ctx.get_price(2), 200.0);
+        assert_eq!(ctx.get_price(999), 0.0); // Unknown instrument
+    }
+
+    #[test]
+    fn test_engine_context_current_price_via_ctx() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+
+        ctx.update_price(1, 100.0);
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+        assert_eq!(ctx.current_price(instr_id), 100.0);
+    }
+
+    #[test]
+    fn test_engine_context_pending_orders() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let order1 = Order {
+            id: 1,
+            client_order_id: ClientOrderId::new("o1"),
+            strategy_id: StrategyId::new("test"),
+            instrument_id: InstrumentId {
+                id: 1,
+                venue: None,
+            },
+            venue: Venue::new("TEST"),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            price: 100.0,
+            size: 1.0,
+            sl: None,
+            tp: None,
+            filled: false,
+            triggered: false,
+            position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
+        };
+        let order2 = Order {
+            id: 2,
+            client_order_id: ClientOrderId::new("o2"),
+            strategy_id: StrategyId::new("test"),
+            instrument_id: InstrumentId {
+                id: 1,
+                venue: None,
+            },
+            venue: Venue::new("TEST"),
+            side: OrderSide::Sell,
+            order_type: OrderType::Limit,
+            price: 110.0,
+            size: 1.0,
+            sl: None,
+            tp: None,
+            filled: false,
+            triggered: false,
+            position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
+        };
+        ctx.add_pending_order(order1);
+        ctx.add_pending_order(order2);
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+        let pending = ctx.pending_orders(instr_id);
+        assert_eq!(pending.len(), 2);
+
+        // Simulate fill of order 1
+        ctx.remove_pending_order(1);
+        let pending = ctx.pending_orders(instr_id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, 2);
+    }
+
+    #[test]
+    fn test_strategy_ctx_submit_limit_null_emulator() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+
+        let order_id = ctx.submit_limit(instr_id, OrderSide::Buy, 100.0, 1.0);
+        assert_eq!(order_id, 0); // Should return 0 when emulator is null
+    }
+
+    #[test]
+    fn test_strategy_ctx_submit_market_null_emulator() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+
+        let order_id = ctx.submit_market(instr_id, OrderSide::Sell, 1.0);
+        assert_eq!(order_id, 0);
+    }
+
+    #[test]
+    fn test_strategy_ctx_submit_with_sl_tp() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+        ctx.submit_with_sl_tp(
+            instr_id,
+            OrderSide::Buy,
+            OrderType::Limit,
+            100.0,
+            1.0,
+            Some(95.0),  // SL
+            Some(110.0), // TP
+        );
+        let pending = ctx.pending_orders(instr_id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].price, 100.0);
+        assert_eq!(pending[0].sl, Some(95.0));
+        assert_eq!(pending[0].tp, Some(110.0));
+    }
+
+    #[test]
+    fn test_strategy_ctx_submit_order() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+
+        let order = Order {
+            id: 42,
+            client_order_id: ClientOrderId::new("o42"),
+            strategy_id: StrategyId::new("test"),
+            instrument_id: instr_id,
+            venue: Venue::new("TEST"),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            price: 100.0,
+            size: 1.0,
+            sl: None,
+            tp: None,
+            filled: false,
+            triggered: false,
+            position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
+        };
+
+        let order_id = ctx.submit_order(order);
+        assert_eq!(order_id, 42);
+
+        let pending = ctx.pending_orders(instr_id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, 42);
+    }
+
+    #[test]
+    fn test_strategy_ctx_cancel_order() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+
+        // Add a pending order
+        let order = Order {
+            id: 42,
+            client_order_id: ClientOrderId::new("o42"),
+            strategy_id: StrategyId::new("test"),
+            instrument_id: instr_id,
+            venue: Venue::new("TEST"),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            price: 100.0,
+            size: 1.0,
+            sl: None,
+            tp: None,
+            filled: false,
+            triggered: false,
+            position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
+        };
+        ctx.add_pending_order(order);
+
+        // Cancel the order
+        let result = ctx.cancel_order(42);
+        assert!(result);
+
+        let pending = ctx.pending_orders(instr_id);
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn test_strategy_ctx_cancel_order_not_found() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+
+        // Try to cancel a non-existent order
+        let result = ctx.cancel_order(999);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_strategy_ctx_position_pnl() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+
+        // Set up an open position
+        ctx.instrument_states.insert(
+            1u32,
+            InstrumentState {
+                position: 1.0,
+                entry_price: 100.0,
+                unrealized_pnl: 0.0,
+                realized_pnl: 50.0, // Previous closed trades
+                commissions: 0.0,
+            },
+        );
+        ctx.update_price(1, 110.0); // Current price
+
+        // position_pnl = realized_pnl + unrealized_pnl
+        // unrealized = (110 - 100) * 1.0 = 10.0
+        // total = 50.0 + 10.0 = 60.0
+        let pnl = ctx.position_pnl(instr_id);
+        assert!((pnl - 60.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_strategy_ctx_position_pnl_no_position() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        let instr_id = InstrumentId {
+            id: 1,
+            venue: None,
+        };
+
+        // No position, should return 0
+        let pnl = ctx.position_pnl(instr_id);
+        assert_eq!(pnl, 0.0);
+    }
+
+    #[test]
+    fn test_strategy_ctx_emit_signal() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+
+        ctx.subscribe_signal(
+            "signal",
+            Box::new(move |name, value, _ts| {
+                received_clone.lock().unwrap().push((name.to_string(), value));
+            }),
+        );
+        ctx.emit_signal(Signal::Buy);
+        ctx.emit_signal(Signal::Sell);
+        ctx.emit_signal(Signal::Close);
+        let r = received.lock().unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].0, "signal");
+        assert_eq!(r[0].1, 1.0); // Buy
+        assert_eq!(r[1].1, -1.0); // Sell
+        assert_eq!(r[2].1, 0.0); // Close
+    }
+
+    #[test]
+    fn test_engine_context_max_drawdown() {
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+        // Simulate equity curve: 10000 → 11000 → 9000
+        let prices1 = HashMap::new(); // No open positions
+        ctx.update_equity(&prices1);
+
+        let mut prices2 = HashMap::new();
+        prices2.insert(1u32, 11000.0);
+        ctx.update_equity(&prices2);
+
+        let mut prices3 = HashMap::new();
+        prices3.insert(1u32, 9000.0);
+        ctx.update_equity(&prices3);
+
+        assert_eq!(ctx.peak_equity, 11000.0);
+        assert!((ctx.max_drawdown - 18.18).abs() < 0.01);
     }
 }

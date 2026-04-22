@@ -5,6 +5,16 @@
 //! The combination of symbol and venue uniquely identifies an instrument.
 //! FNV-1a hash of the raw string is used as the instrument_id u32.
 
+/// Compute FNV-1a hash of a byte string (32-bit).
+pub fn fnv1a_hash(data: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in data {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -58,7 +68,7 @@ pub struct Symbol {
 impl Symbol {
     pub fn new(code: &str) -> Self {
         Self {
-            code: code.to_string(),
+            code: code.to_uppercase(),
         }
     }
 }
@@ -85,17 +95,26 @@ impl FromStr for Symbol {
 ///
 /// The instrument_id is a 32-bit FNV-1a hash of the normalized string
 /// representation (symbol in uppercase, venue in uppercase, joined by '.').
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+/// Symbol and venue strings are stored for display (as_str) and synthetic detection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InstrumentId {
     pub id: u32, // FNV-1a hash of "SYMBOL.VENUE"
+    pub symbol: Symbol,
+    pub venue: Venue,
 }
 
 impl InstrumentId {
     /// Create from symbol and venue.
     pub fn new(symbol: &str, venue: &str) -> Self {
-        let raw = format!("{}.{}", symbol.to_uppercase(), venue.to_uppercase());
+        let symbol_upper = Symbol::new(symbol);
+        let venue_upper = Venue::new(venue);
+        let raw = format!("{}.{}", symbol_upper.code, venue_upper.code);
+        let id = fnv1a_hash(raw.as_bytes());
+        reverse_lookup::register(id, raw);
         Self {
-            id: fnv1a_hash(raw.as_bytes()),
+            id,
+            symbol: symbol_upper,
+            venue: venue_upper,
         }
     }
 
@@ -114,17 +133,20 @@ impl InstrumentId {
         Ok(Self::new(parts[0], parts[1]))
     }
 
-    /// Get the raw string representation.
+    /// Get the "SYMBOL.VENUE" string representation.
     pub fn as_str(&self) -> String {
-        // We can't reconstruct the original string from the hash alone.
-        // For display purposes, use a placeholder when we don't have the mapping.
-        format!("INSTR{:08X}", self.id)
+        format!("{}.{}", self.symbol.code, self.venue.code)
     }
 
     /// Check if this is a synthetic instrument (venue = SYNTH).
     pub fn is_synthetic(&self) -> bool {
-        // Can't determine from hash alone; this requires lookup
-        false
+        self.venue.is_synthetic()
+    }
+
+    /// Reverse lookup — get the canonical "SYMBOL.VENUE" string from a hash.
+    /// Returns None if the hash hasn't been registered.
+    pub fn from_hash(hash: u32) -> Option<String> {
+        reverse_lookup::get(hash)
     }
 }
 
@@ -161,14 +183,26 @@ impl fmt::Display for IdError {
 
 impl std::error::Error for IdError {}
 
-/// Compute FNV-1a hash of a byte string (32-bit).
-pub fn fnv1a_hash(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c9dc5;
-    for byte in data {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(0x01000193);
+/// Thread-safe reverse-lookup map for instrument ID hashes.
+pub mod reverse_lookup {
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    static LOOKUP: Lazy<RwLock<HashMap<u32, String>>> =
+        Lazy::new(|| RwLock::new(HashMap::new()));
+
+    /// Register an instrument string for reverse lookup.
+    pub fn register(hash: u32, repr: String) {
+        let mut guard = LOOKUP.write().unwrap();
+        guard.insert(hash, repr);
     }
-    hash
+
+    /// Look up the canonical string from a hash. Returns None if not found.
+    pub fn get(hash: u32) -> Option<String> {
+        let guard = LOOKUP.read().unwrap();
+        guard.get(&hash).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +246,16 @@ mod tests {
     fn test_symbol_display() {
         let s = Symbol::new("BTCUSDT");
         assert_eq!(format!("{}", s), "BTCUSDT");
+    }
+
+    #[test]
+    fn test_from_hash_reverse_lookup() {
+        let id = InstrumentId::new("BTCUSDT", "BINANCE");
+        let repr = InstrumentId::from_hash(id.id);
+        assert!(repr.is_some());
+        assert_eq!(repr.unwrap(), "BTCUSDT.BINANCE");
+
+        // Unknown hash returns None
+        assert!(InstrumentId::from_hash(0xDEADBEEF).is_none());
     }
 }
