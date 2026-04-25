@@ -1,6 +1,6 @@
-<div align="center">
-
-![Nexus Trading Engine](logo.svg)
+<p align="center">
+  <img src="logo.svg" alt="Nexus Trading Engine" width="500"/>
+</p>
 
 # Nexus
 
@@ -8,11 +8,9 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg?style=flat-square)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![GitHub Repo](https://img.shields.io/badge/GitHub-Stanco23/Nexus-green.svg?style=flat-square)](https://github.com/Stanco23/Nexus)
+[![GitHub Repo](https://img.shields.io/badge/GitHub-Stanco23%2FNexus-green.svg?style=flat-square)](https://github.com/Stanco23/Nexus)
 
 *A matching engine built from scratch. Not a wrapper. Not a port. A ground-up implementation in Rust.*
-
-</div>
 
 ---
 
@@ -39,30 +37,32 @@ Built for traders and developers who want **control over the full stack**, not a
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Trader / Strategy                     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                    REST API · WebSocket
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│                    Execution Client                          │
-│         (OKX · Binance · Bybit adapters)                   │
-└─────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-      ┌───────────┐   ┌───────────┐   ┌───────────┐
-      │ Matching  │   │    Risk   │   │  Position │
-      │  Engine   │   │  Engine   │   │  Manager  │
-      └───────────┘   └───────────┘   └───────────┘
-                              │
-                     ┌────────┴────────┐
-                     ▼                 ▼
-             ┌─────────────┐   ┌─────────────┐
-             │  Order Book │   │  Market     │
-             │  (live L2)  │   │  Data Feed  │
-             └─────────────┘   └─────────────┘
+                    +------------------------+
+                    |   Trader / Strategy    |
+                    +------------------------+
+                              |
+                    REST API / WebSocket
+                              |
+                    +------------------------+
+                    |    Execution Client     |
+                    |  (OKX / Binance / Bybit)
+                    +------------------------+
+                              |
+              +---------------+---------------+
+              |               |               |
+              v               v               v
+        +-----------+   +-----------+   +-----------+
+        | Matching  |   |   Risk    |   | Position  |
+        |  Engine   |   |  Engine   |   |  Manager  |
+        +-----------+   +-----------+   +-----------+
+                              |
+                      +-------+-------+
+                      |               |
+                      v               v
+              +-------------+   +-------------+
+              | Order Book  |   | Market Data |
+              |  (live L2) |   |    Feed     |
+              +-------------+   +-------------+
 ```
 
 **Key design decisions:**
@@ -79,7 +79,7 @@ Built for traders and developers who want **control over the full stack**, not a
 The matching engine is designed for sub-millisecond order processing.
 
 ```
-Orders processed: ~100,000/sec (benchmark, single thread)
+Orders processed:  ~100,000/sec (benchmark, single thread)
 Average fill latency: < 1ms (in-process, no network)
 Memory per order book level: ~64 bytes
 ```
@@ -132,19 +132,19 @@ export OKX_PASSPHRASE="your-passphrase"
 
 ```
 Nexus/
-├── libs/
-│   └── nexus/
-│       └── src/
-│           ├── book.rs          # Order book + matching logic
-│           ├── engine/          # Core, risk, margin, sizing, OMS
-│           ├── data/            # DataEngine + subscription routing
-│           ├── live/            # Exchange adapters (OKX, Binance, Bybit)
-│           ├── buffer/          # Ring buffer, tick buffer, aggregators
-│           ├── sweep/           # Parameter sweep framework
-│           └── trader.rs        # Top-level trader orchestrator
-├── apps/
-│   └── cli/                     # CLI entry point
-└── logo.svg                      # Nexus logo
++-- libs/
+|   +-- nexus/
+|       +-- src/
+|           +-- book.rs          # Order book + matching logic
+|           +-- engine/          # Core, risk, margin, sizing, OMS
+|           +-- data/             # DataEngine + subscription routing
+|           +-- live/            # Exchange adapters (OKX, Binance, Bybit)
+|           +-- buffer/           # Ring buffer, tick buffer, aggregators
+|           +-- sweep/           # Parameter sweep framework
+|           +-- trader.rs        # Top-level trader orchestrator
++-- apps/
+|   +-- cli/                     # CLI entry point
++-- logo.svg                     # Nexus logo
 ```
 
 ---
