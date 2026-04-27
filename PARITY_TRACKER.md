@@ -47,10 +47,10 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 | 2.8 | OrderEmulator | ✅ | submit_market() added; wiring still needed |
 
 **Tasks:**
-- [ ] Wire OrderEmulator into `Portfolio::run_portfolio()` loop (Phase 2.8)
-- [ ] Implement full TrailingStop logic (Phase 2.3) — no immediate trigger, actual trailing
-- [ ] Monte Carlo regime engine (Phase 2.7)
-- [ ] Walk-forward analysis framework (Phase 2.7)
+- [x] ~~Wire OrderEmulator into `Portfolio::run_portfolio()` loop~~ — DONE (commit `8dd3b00`)
+- [x] ~~Implement full TrailingStop logic~~ — DONE: check_trailing_stop_trigger + update_trailing_trigger_price wired in check_pending_orders_with_market (orders.rs:410)
+- [x] ~~Monte Carlo regime engine~~ — DONE: MonteCarloRunner in mc_wf/mod.rs
+- [x] ~~Walk-forward analysis framework~~ — DONE: WalkForwardRunner in mc_wf/mod.rs
 
 ---
 
@@ -67,8 +67,8 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 | 3.7 | Live Strategy (Actor-Based) | ❌ | Not started |
 
 **Tasks:**
-- [ ] Wire SignalBus into `Portfolio::run_portfolio()` tick loop (Phase 3.6)
-- [ ] Implement Live Strategy trait (Phase 3.7)
+- [x] ~~Wire SignalBus into `Portfolio::run_portfolio()` tick loop~~ — signal_bus.publish() called in portfolio.rs:638
+- [ ] Implement Live Strategy trait (Phase 3.7) — blocked on Phase 5.7 add_strategy()
 
 ---
 
@@ -76,18 +76,13 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 
 | Sub-phase | Description | Status | Gap |
 |-----------|-------------|--------|-----|
-| 4.1 | Order Types | 🟡 | Missing: Iceberg, TWAP, VWAP, MarketToLimit, LimitIfTouched |
-| 4.2 | Order Matching | 🟡 | No price-time priority, no LiquiditySide enum |
+| 4.1 | Order Types | ✅ | All order types implemented including TrailingStopMarket/Limit, MarketToLimit, LimitIfTouched, MarketIfTouched, PostOnly, ReduceOnly |
+| 4.2 | Order Matching | ✅ | MatchingCore (FIFO) + OrderEmulator; LiquiditySide enum exists |
 | 4.3 | Position Sizing | ✅ | None |
 | 4.4 | Risk Controls | ✅ | None |
 | 4.5 | VPIN Calibration | ✅ | None |
 | 4.6 | Margin System | ✅ | None |
 | 4.7 | Account Model | 🟡 | Multi-venue, multi-currency incomplete |
-| 4.8 | Execution Reports | 🟡 | Missing AccountId, TradeId, VenueOrderId, LiquiditySide in FillReport |
-
----
-
-## PHASE 5 — Live Trading Architecture 🟡 22%
 
 | Sub-phase | Description | Status | Gap |
 |-----------|-------------|--------|-----|
@@ -99,13 +94,13 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 | 5.0f | TraderId on Component | ✅ | None |
 | 5.0g | Account + OMS | 🟡 | Multi-venue routing incomplete |
 | 5.0h | Component Event Handlers | 🟡 | ~12 implemented, ~38 missing |
-| 5.1 | Paper Trading | 🔴 | No SimulatedExchange trait |
-| 5.2 | Live Execution | 🟡 | No tick size validation, ExecutionEngine routing map missing |
-| 5.3 | OMS Reconciliation | 🟡 | Exchange confirm not wired for modify |
-| 5.4 | Multi-Exchange | 🟡 | No ExchangeRouter, Bybit/OKX hardcoded "0" on executed_qty |
-| 5.5 | Data Engine | 🔴 | BinanceMarketDataAdapter NOT wired to DataEngine (G1 open) |
-| 5.6 | Risk Engine (Live) | 🟡 | RiskEngine not registered as MsgBus component |
-| 5.7 | Trader Node | 🔴 | **No Trader struct exists at all** |
+| 5.1 | Paper Trading | ✅ | SimulatedExchange trait exists |
+| 5.2 | Live Execution | 🟡 | ExecutionClient has tick size validation; routing map present |
+| 5.3 | OMS Reconciliation | ✅ | Exchange confirm wired for modify + submit |
+| 5.4 | Multi-Exchange | ✅ | ExchangeRouter + Coinbase HMAC |
+| 5.5 | Data Engine | 🟡 | DataEngine shared via Arc<Mutex>; BinanceMarketDataAdapter exists but NOT registered to Trader |
+| 5.6 | Risk Engine (Live) | ✅ | RiskEngine registered on MsgBus (risk.rs:168-169) + on_trade wired |
+| 5.7 | Trader Node | 🟡 | TradingNode + run_blocking + health heartbeat done; add_strategy + adapter wiring remaining |
 
 ---
 
@@ -194,23 +189,34 @@ Need to:
 | StrategyCtx.position_pnl | ✅ Implemented | Combines realized + unrealized |
 | Generic order routing | ✅ Implemented | All order types route through OrderEmulator |
 | SignalBus in tick loop | 🟡 Missing | Needs wiring into Portfolio::run_portfolio() |
-| OrderEmulator wired | 🟡 Missing | Currently using manual SL/TP in check_sl_tp() |
-| PortfolioStrategy → Strategy trait | 🟡 Different | Nexus uses `on_trade(portfolio)` not `on_trade(ctx)` |
+---
+
+## Verified Gaps (2026-04-27 Review)
+
+### Critical — Systematic Fix Queue
+| Gap | File | Description |
+|-----|------|-------------|
+| **H2** | trader.rs | BinanceMarketDataAdapter NOT registered to Trader (orphan impl) |
+| **H4** | actor.rs | `on_order_book_deltas`, `on_order_book_depth`, `on_order_modified` missing in Actor trait |
+| **M2** | engine/risk.rs | No submit/modify throttlers in RiskEngine |
+| **M4** | live/bybit_http_adapter.rs, live/okx_http_adapter.rs | Bybit/OKX don't use rate_limiter from HttpAdapter base |
+| **M16** | buffer/bar_aggregation.rs | Renko/ValueImbalance/ValueRuns fall back to TimeBarAggregator instead of real impl |
+
+### Stale — Already Resolved
+| Gap | Was | Actual |
+|-----|-----|--------|
+| H3 RiskEngine MsgBus | OPEN | ✅ Registered (risk.rs:168) |
+| H6 ExchangeRouter | OPEN | ✅ Full impl (exchange_router.rs) |
+| H11 TrailingStop | OPEN | ✅ Wired (orders.rs:410) |
+| M1 Order rejections | OPEN | ✅ oms.record_rejection() + MsgBus (5.6) |
+| M8 FillReport fields | OPEN | ✅ All fields present (reports.rs:93) |
+| H1 quote/OB routing | OPEN | ✅ DataEngine routing correct; H2 is root cause |
 
 ---
 
 ## Testing Status
 
 **Unit Tests (libs/nexus/src/engine/core.rs):** 19 passing
-- CommissionConfig tests: 3
-- EngineContext basic: 3
-- Unrealized PnL: 2
-- Price tracking: 2
-- Pending orders: 2
-- StrategyCtx methods: 7
-
-**Integration Tests Needed:**
-- End-to-end backtest with signal strategy
-- Order submission → fill → position update cycle
-- SignalBus signal propagation
-- OrderEmulator fill processing
+**Risk Engine tests:** 21 passing
+**OMS tests:** 11 passing
+**Data Engine tests:** 12 passing
