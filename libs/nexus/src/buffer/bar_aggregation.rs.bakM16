@@ -1170,6 +1170,326 @@ impl ValueRunsBarAggregator {
 }
 
 // ============================================================================
+// RenkoBarAggregator
+// ============================================================================
+
+/// Renko chart aggregator — bricks form based on price movement (brick size).
+///
+/// A new brick is formed when price moves `step` price units from the last
+/// close in the same direction. A reversal requires price to move at least
+/// `2 * step` from the last close (closing one brick then opening one in the
+/// opposite direction).
+///
+/// The bar's OHLCV is computed from the brick boundaries: the brick that
+/// closed sets the open/high/low/close, and the size contributes to volume.
+#[derive(Debug)]
+pub struct RenkoBarAggregator {
+    bar_type: BarType,
+    /// BarBuilder accumulates OHLCV from ticks within each brick.
+    builder: BarBuilder,
+    /// Brick size in price units (from bar_type.spec.step).
+    brick_size: i64,
+    /// The price level at which the current brick opened.
+    brick_open: Option<i64>,
+    /// Direction of the current brick: 1 = up (bull), -1 = down (bear), 0 = none.
+    brick_direction: i8,
+    /// Running sum of size contributions from ticks in the current brick.
+    brick_size_accum: i64,
+}
+
+impl RenkoBarAggregator {
+    /// Create a new Renko aggregator. `bar_type.spec.step` is the brick size.
+    pub fn new(bar_type: BarType) -> Self {
+        let brick_size = bar_type.spec.step as i64;
+        let instrument_id = bar_type.instrument_id();
+        Self {
+            bar_type,
+            builder: BarBuilder::new(instrument_id),
+            brick_size,
+            brick_open: None,
+            brick_direction: 0,
+            brick_size_accum: 0,
+        }
+    }
+
+    /// Update with a trade tick. Returns a bar if a brick closes.
+    pub fn update(&mut self, price: i64, size: i64, _side: u8, timestamp_ns: u64) -> Option<Bar> {
+        self.builder.update(price, size, timestamp_ns);
+
+        let brick_open = match self.brick_open {
+            Some(b) => b,
+            None => {
+                // First tick — initialize the brick but don't close yet
+                self.brick_open = Some(price);
+                self.brick_direction = 0;
+                return None;
+            }
+        };
+
+        let price_delta = price - brick_open;
+
+        // No movement yet — just update brick tracking
+        if price_delta == 0 {
+            return None;
+        }
+
+        // Check if price moved enough to form a brick (or reverse)
+        let abs_delta = price_delta.abs();
+
+        if abs_delta < self.brick_size {
+            // Not enough movement to close a brick — update tracking only
+            // (price may have moved within the current brick range)
+            return None;
+        }
+
+        // Price moved at least one brick — determine if it's a continuation or reversal
+        let direction = if price_delta > 0 { 1 } else { -1 };
+
+        // Check for brick close conditions:
+        // 1. Same direction: abs_delta >= brick_size (price extended in same direction)
+        // 2. Reversal: abs_delta >= 2 * brick_size (closed current + opened opposite)
+        let is_reversal = direction != self.brick_direction && self.brick_direction != 0;
+
+        if !is_reversal && abs_delta < self.brick_size {
+            return None;
+        }
+
+        // Build the closed bar from the current brick
+        let bar = self.builder.build_now();
+
+        // Reset brick tracking for the next brick
+        if is_reversal && abs_delta >= 2 * self.brick_size {
+            // Reversal: the excess movement past the first brick_size opens the new brick
+            // new_brick_open = brick_open + direction * self.brick_size
+            // new_price = brick_open + direction * (abs_delta - self.brick_size)
+            // But simpler: just set brick_open to the price at the reversal level
+            let reversal_level = brick_open + direction * self.brick_size;
+            self.brick_open = Some(reversal_level);
+            self.brick_direction = direction;
+            self.brick_size_accum = size.abs();
+        } else if abs_delta >= self.brick_size {
+            // Continuation or exact brick movement
+            let multiples = abs_delta / self.brick_size;
+            let remainder = abs_delta % self.brick_size;
+            // After closing `multiples` bricks, open a new brick at the remainder level
+            let new_open = brick_open + direction * (abs_delta - remainder);
+            self.brick_open = Some(new_open);
+            self.brick_direction = direction;
+            self.brick_size_accum = remainder;
+        }
+
+        Some(bar)
+    }
+
+    pub fn advance_time(&mut self, _timestamp_ns: u64) -> Option<Bar> {
+        None
+    }
+
+    pub fn flush(&mut self) -> Option<Bar> {
+        if self.builder.count > 0 {
+            Some(self.builder.build_now())
+        } else {
+            None
+        }
+    }
+
+    pub fn bar_type(&self) -> &BarType {
+        &self.bar_type
+    }
+}
+
+// ============================================================================
+// ValueImbalanceBarAggregator
+// ============================================================================
+
+/// Aggregator that closes bars based on notional value imbalance.
+/// Tracks the cumulative buy notional minus sell notional and closes
+/// when the absolute imbalance exceeds the `step` threshold (in price * size units).
+#[derive(Debug)]
+pub struct ValueImbalanceBarAggregator {
+    bar_type: BarType,
+    builder: BarBuilder,
+    /// Threshold for imbalance (in notional units = price * size).
+    step: i64,
+    /// Accumulated buy notional (price * size for buy ticks).
+    buy_value: i64,
+    /// Accumulated sell notional (price * size for sell ticks).
+    sell_value: i64,
+}
+
+impl ValueImbalanceBarAggregator {
+    /// Create a new ValueImbalance aggregator. `bar_type.spec.step` is the imbalance threshold.
+    pub fn new(bar_type: BarType) -> Self {
+        let step = bar_type.spec.step as i64;
+        let instrument_id = bar_type.instrument_id();
+        Self {
+            bar_type,
+            builder: BarBuilder::new(instrument_id),
+            step,
+            buy_value: 0,
+            sell_value: 0,
+        }
+    }
+
+    /// Update with a trade tick. Returns a bar if imbalance threshold is crossed.
+    pub fn update(&mut self, price: i64, size: i64, side: u8, timestamp_ns: u64) -> Option<Bar> {
+        self.builder.update(price, size, timestamp_ns);
+
+        // Notional value of this tick
+        let value = (price.abs() / 1_000_000_000) * size.abs(); // Convert from nanounits
+        // Actually, price and size are in nanounits already from the data engine
+        // price * size would overflow, so use i128 arithmetic
+        let value_i128 = (price as i128).abs() * (size as i128);
+
+        if side == 0 {
+            self.buy_value += value_i128;
+        } else if side == 1 {
+            self.sell_value += value_i128;
+        }
+        // side >= 2: unknown — don't contribute to imbalance
+
+        let imbalance = (self.buy_value - self.sell_value).abs();
+        if imbalance >= self.step as i128 {
+            let bar = self.builder.build_now();
+            self.buy_value = 0;
+            self.sell_value = 0;
+            return Some(bar);
+        }
+        None
+    }
+
+    pub fn advance_time(&mut self, _timestamp_ns: u64) -> Option<Bar> {
+        None
+    }
+
+    pub fn flush(&mut self) -> Option<Bar> {
+        if self.builder.count > 0 {
+            Some(self.builder.build_now())
+        } else {
+            None
+        }
+    }
+
+    pub fn bar_type(&self) -> &BarType {
+        &self.bar_type
+    }
+}
+
+// ============================================================================
+// AggregatorFactory
+// ============================================================================
+
+/// Factory for creating boxed aggregators for the DataEngine live path.
+pub struct AggregatorFactory;
+
+impl AggregatorFactory {
+    /// Create a boxed aggregator for the DataEngine live path.
+    pub fn create(bar_type: BarType) -> Box<dyn Aggregator> {
+        match bar_type.spec.aggregation {
+            BarAggregation::Millisecond | BarAggregation::Second
+            | BarAggregation::Minute | BarAggregation::Hour
+            | BarAggregation::Day | BarAggregation::Week
+            | BarAggregation::Month | BarAggregation::Year => {
+                let period_ns = bar_type.spec.get_interval_ns().unwrap_or(60_000_000_000);
+                Box::new(TimeBarAggregator::with_period_ns(period_ns, bar_type.instrument_id()))
+            }
+            BarAggregation::Tick => Box::new(TickBarAggregator::new(bar_type)),
+            BarAggregation::Volume => Box::new(VolumeBarAggregator::new(bar_type)),
+            BarAggregation::Value => Box::new(ValueBarAggregator::new(bar_type)),
+            BarAggregation::TickImbalance => Box::new(TickImbalanceBarAggregator::new(bar_type)),
+            BarAggregation::TickRuns => Box::new(TickRunsBarAggregator::new(bar_type)),
+            BarAggregation::VolumeImbalance => Box::new(VolumeImbalanceBarAggregator::new(bar_type)),
+            BarAggregation::ValueImbalance => Box::new(ValueImbalanceBarAggregator::new(bar_type)),
+            BarAggregation::ValueRuns => Box::new(ValueRunsBarAggregator::new(bar_type)),
+            BarAggregation::Renko => Box::new(RenkoBarAggregator::new(bar_type)),
+            _ => {
+                // Default fallback
+                Box::new(TimeBarAggregator::new(BarPeriod::OneMinute, bar_type.instrument_id()))
+            }
+        }
+    }
+}
+
+// ============================================================================
+// build_bars_with_type
+// ============================================================================
+
+/// Build bars from a TickBuffer using a BarType (general path, stack-based dispatch).
+/// For time-based: uses TimeBarAggregator.
+/// For threshold-based: uses the appropriate aggregator.
+pub fn build_bars_with_type(tick_buffer: &TickBuffer, bar_type: &BarType) -> Vec<Bar> {
+#[derive(Debug)]
+pub struct ValueRunsBarAggregator {
+    bar_type: BarType,
+    builder: BarBuilder,
+    step: u64,
+    current_run_side: Option<u8>,
+    run_value: i128,
+}
+
+impl ValueRunsBarAggregator {
+    pub fn new(bar_type: BarType) -> Self {
+        let step = bar_type.spec.step as u64;
+        let instrument_id = bar_type.instrument_id();
+        Self {
+            bar_type,
+            builder: BarBuilder::new(instrument_id),
+            step,
+            current_run_side: None,
+            run_value: 0,
+        }
+    }
+
+    pub fn update(&mut self, price: i64, size: i64, side: u8, timestamp_ns: u64) -> Option<Bar> {
+        self.builder.update(price, size, timestamp_ns);
+
+        if side >= 2 {
+            // Unknown/mixed side — don't count toward runs
+            return None;
+        }
+
+        let value = (price as i128) * (size as i128);
+
+        if let Some(current) = self.current_run_side {
+            if current == side {
+                self.run_value += value;
+            } else {
+                // Side changed — reset run
+                self.current_run_side = Some(side);
+                self.run_value = value;
+            }
+        } else {
+            self.current_run_side = Some(side);
+            self.run_value = value;
+        }
+
+        if self.run_value >= self.step as i128 {
+            let bar = self.builder.build_now();
+            self.current_run_side = None;
+            self.run_value = 0;
+            return Some(bar);
+        }
+        None
+    }
+
+    pub fn advance_time(&mut self, _timestamp_ns: u64) -> Option<Bar> {
+        None
+    }
+
+    pub fn flush(&mut self) -> Option<Bar> {
+        if self.builder.count > 0 {
+            Some(self.builder.build_now())
+        } else {
+            None
+        }
+    }
+
+    pub fn bar_type(&self) -> &BarType {
+        &self.bar_type
+    }
+}
+
+// ============================================================================
 // Aggregator Trait
 // ============================================================================
 
@@ -1324,255 +1644,11 @@ impl Aggregator for ValueRunsBarAggregator {
         self.bar_type()
     }
 }
-// ============================================================================
-// RenkoBarAggregator
-// ============================================================================
-
-/// Renko chart aggregator — bricks form based on price movement (brick size).
-///
-/// A new brick is formed when price moves `step` price units from the last
-/// close in the same direction. A reversal requires price to move at least
-/// `2 * step` from the last close (closing one brick then opening one in the
-/// opposite direction).
-///
-/// The bar's OHLCV is computed from the brick boundaries: the brick that
-/// closed sets the open/high/low/close, and the size contributes to volume.
-#[derive(Debug)]
-pub struct RenkoBarAggregator {
-    bar_type: BarType,
-    /// BarBuilder accumulates OHLCV from ticks within each brick.
-    builder: BarBuilder,
-    /// Brick size in price units (from bar_type.spec.step).
-    brick_size: i64,
-    /// The price level at which the current brick opened.
-    brick_open: Option<i64>,
-    /// Direction of the current brick: 1 = up (bull), -1 = down (bear), 0 = none.
-    brick_direction: i64,
-    /// Running sum of size contributions from ticks in the current brick.
-    brick_size_accum: i64,
-}
-
-impl RenkoBarAggregator {
-    /// Create a new Renko aggregator. `bar_type.spec.step` is the brick size.
-    pub fn new(bar_type: BarType) -> Self {
-        let brick_size = bar_type.spec.step as i64;
-        let instrument_id = bar_type.instrument_id();
-        Self {
-            bar_type,
-            builder: BarBuilder::new(instrument_id),
-            brick_size,
-            brick_open: None,
-            brick_direction: 0,
-            brick_size_accum: 0,
-        }
-    }
-
-    /// Update with a trade tick. Returns a bar if a brick closes.
-    pub fn update(&mut self, price: i64, size: i64, _side: u8, timestamp_ns: u64) -> Option<Bar> {
-        self.builder.update(price, size, timestamp_ns);
-
-        let brick_open = match self.brick_open {
-            Some(b) => b,
-            None => {
-                // First tick — initialize the brick but don't close yet
-                self.brick_open = Some(price);
-                self.brick_direction = 0;
-                return None;
-            }
-        };
-
-        let price_delta = price - brick_open;
-        if price_delta == 0 {
-            return None;
-        }
-
-        let direction = if price_delta > 0 { 1 } else { -1 };
-        let is_reversal = direction != self.brick_direction && self.brick_direction != 0;
-        let abs_delta = price_delta.abs();
-
-        if !is_reversal && abs_delta < self.brick_size {
-            return None;
-        }
-
-        let bar = self.builder.build_now();
-
-        if is_reversal && abs_delta >= 2 * self.brick_size {
-            let reversal_level = brick_open + direction * self.brick_size;
-            self.brick_open = Some(reversal_level);
-            self.brick_direction = direction;
-            self.brick_size_accum = size.abs();
-        } else if abs_delta >= self.brick_size {
-            let multiples = abs_delta / self.brick_size;
-            let remainder = abs_delta % self.brick_size;
-            let new_open = brick_open + direction * (abs_delta - remainder);
-            self.brick_open = Some(new_open);
-            self.brick_direction = direction;
-            self.brick_size_accum = remainder;
-            let _ = multiples; // used for brick counting logic
-        }
-
-        Some(bar)
-    }
-
-    pub fn advance_time(&mut self, _timestamp_ns: u64) -> Option<Bar> {
-        None
-    }
-
-    pub fn flush(&mut self) -> Option<Bar> {
-        if self.builder.count > 0 {
-            Some(self.builder.build_now())
-        } else {
-            None
-        }
-    }
-
-    pub fn bar_type(&self) -> &BarType {
-        &self.bar_type
-    }
-}
-
-impl Aggregator for RenkoBarAggregator {
-    fn update(&mut self, price: i64, size: i64, side: u8, timestamp_ns: u64) -> Option<Bar> {
-        self.update(price, size, side, timestamp_ns)
-    }
-
-    fn advance_time(&mut self, timestamp_ns: u64) -> Option<Bar> {
-        self.advance_time(timestamp_ns)
-    }
-
-    fn flush(&mut self) -> Option<Bar> {
-        self.flush()
-    }
-
-    fn bar_type(&self) -> &BarType {
-        self.bar_type()
-    }
-}
-
-// ============================================================================
-// ValueImbalanceBarAggregator
-// ============================================================================
-
-/// Aggregator that closes bars based on notional value imbalance.
-/// Tracks the cumulative buy notional minus sell notional and closes
-/// when the absolute imbalance exceeds the `step` threshold (in price * size units).
-#[derive(Debug)]
-pub struct ValueImbalanceBarAggregator {
-    bar_type: BarType,
-    builder: BarBuilder,
-    /// Threshold for imbalance (in notional units = price * size).
-    step: i64,
-    /// Accumulated buy notional (price * size for buy ticks).
-    buy_value: i128,
-    /// Accumulated sell notional (price * size for sell ticks).
-    sell_value: i128,
-}
-
-impl ValueImbalanceBarAggregator {
-    /// Create a new ValueImbalance aggregator. `bar_type.spec.step` is the imbalance threshold.
-    pub fn new(bar_type: BarType) -> Self {
-        let step = bar_type.spec.step as i64;
-        let instrument_id = bar_type.instrument_id();
-        Self {
-            bar_type,
-            builder: BarBuilder::new(instrument_id),
-            step,
-            buy_value: 0,
-            sell_value: 0,
-        }
-    }
-
-    /// Update with a trade tick. Returns a bar if imbalance threshold is crossed.
-    pub fn update(&mut self, price: i64, size: i64, side: u8, timestamp_ns: u64) -> Option<Bar> {
-        self.builder.update(price, size, timestamp_ns);
-
-        let value_i128 = (price as i128).abs() * (size as i128);
-
-        if side == 0 {
-            self.buy_value += value_i128;
-        } else if side == 1 {
-            self.sell_value += value_i128;
-        }
-
-        let imbalance = (self.buy_value - self.sell_value).abs();
-        if imbalance >= self.step as i128 {
-            let bar = self.builder.build_now();
-            self.buy_value = 0;
-            self.sell_value = 0;
-            return Some(bar);
-        }
-        None
-    }
-
-    pub fn advance_time(&mut self, _timestamp_ns: u64) -> Option<Bar> {
-        None
-    }
-
-    pub fn flush(&mut self) -> Option<Bar> {
-        if self.builder.count > 0 {
-            Some(self.builder.build_now())
-        } else {
-            None
-        }
-    }
-
-    pub fn bar_type(&self) -> &BarType {
-        &self.bar_type
-    }
-}
-
-impl Aggregator for ValueImbalanceBarAggregator {
-    fn update(&mut self, price: i64, size: i64, side: u8, timestamp_ns: u64) -> Option<Bar> {
-        self.update(price, size, side, timestamp_ns)
-    }
-
-    fn advance_time(&mut self, timestamp_ns: u64) -> Option<Bar> {
-        self.advance_time(timestamp_ns)
-    }
-
-    fn flush(&mut self) -> Option<Bar> {
-        self.flush()
-    }
-
-    fn bar_type(&self) -> &BarType {
-        self.bar_type()
-    }
-}
 
 // ============================================================================
 // AggregatorFactory
 // ============================================================================
-
-/// Factory for creating boxed aggregators for the DataEngine live path.
-pub struct AggregatorFactory;
-
-impl AggregatorFactory {
-    /// Create a boxed aggregator for the DataEngine live path.
-    pub fn create(bar_type: BarType) -> Box<dyn Aggregator> {
-        match bar_type.spec.aggregation {
-            BarAggregation::Millisecond | BarAggregation::Second
-            | BarAggregation::Minute | BarAggregation::Hour
-            | BarAggregation::Day | BarAggregation::Week
-            | BarAggregation::Month | BarAggregation::Year => {
-                let period_ns = bar_type.spec.get_interval_ns().unwrap_or(60_000_000_000);
-                Box::new(TimeBarAggregator::with_period_ns(period_ns, bar_type.instrument_id()))
-            }
-            BarAggregation::Tick => Box::new(TickBarAggregator::new(bar_type)),
-            BarAggregation::Volume => Box::new(VolumeBarAggregator::new(bar_type)),
-            BarAggregation::Value => Box::new(ValueBarAggregator::new(bar_type)),
-            BarAggregation::TickImbalance => Box::new(TickImbalanceBarAggregator::new(bar_type)),
-            BarAggregation::TickRuns => Box::new(TickRunsBarAggregator::new(bar_type)),
-            BarAggregation::VolumeImbalance => Box::new(VolumeImbalanceBarAggregator::new(bar_type)),
-            BarAggregation::ValueImbalance => Box::new(ValueImbalanceBarAggregator::new(bar_type)),
-            BarAggregation::ValueRuns => Box::new(ValueRunsBarAggregator::new(bar_type)),
-            BarAggregation::Renko => Box::new(RenkoBarAggregator::new(bar_type)),
-            _ => {
-                // Default fallback
-                Box::new(TimeBarAggregator::new(BarPeriod::OneMinute, bar_type.instrument_id()))
-            }
-        }
-    }
-}
+// (AggregatorFactory already defined above with full implementations)
 
 // ============================================================================
 // build_bars_with_type
@@ -1669,45 +1745,6 @@ pub fn build_bars_with_type(tick_buffer: &TickBuffer, bar_type: &BarType) -> Vec
             }
             BarAggregation::VolumeImbalance => {
                 let mut agg = VolumeImbalanceBarAggregator::new(bar_type.clone());
-                let mut bars = Vec::new();
-                for tick in tick_buffer.iter() {
-                    if let Some(bar) = agg.update(tick.price_int, tick.size_int, tick.side, tick.timestamp_ns) {
-                        bars.push(bar);
-                    }
-                }
-                if let Some(bar) = agg.flush() {
-                    bars.push(bar);
-                }
-                bars
-            }
-            BarAggregation::ValueImbalance => {
-                let mut agg = ValueImbalanceBarAggregator::new(bar_type.clone());
-                let mut bars = Vec::new();
-                for tick in tick_buffer.iter() {
-                    if let Some(bar) = agg.update(tick.price_int, tick.size_int, tick.side, tick.timestamp_ns) {
-                        bars.push(bar);
-                    }
-                }
-                if let Some(bar) = agg.flush() {
-                    bars.push(bar);
-                }
-                bars
-            }
-            BarAggregation::ValueRuns => {
-                let mut agg = ValueRunsBarAggregator::new(bar_type.clone());
-                let mut bars = Vec::new();
-                for tick in tick_buffer.iter() {
-                    if let Some(bar) = agg.update(tick.price_int, tick.size_int, tick.side, tick.timestamp_ns) {
-                        bars.push(bar);
-                    }
-                }
-                if let Some(bar) = agg.flush() {
-                    bars.push(bar);
-                }
-                bars
-            }
-            BarAggregation::Renko => {
-                let mut agg = RenkoBarAggregator::new(bar_type.clone());
                 let mut bars = Vec::new();
                 for tick in tick_buffer.iter() {
                     if let Some(bar) = agg.update(tick.price_int, tick.size_int, tick.side, tick.timestamp_ns) {

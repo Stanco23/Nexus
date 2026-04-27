@@ -33,15 +33,16 @@
 //!
 //! Nautilus Source: `common/actor.pyx`, `common/component.pyx`, `common/messages.pyx`
 
+use crate::book::OrderBookDeltas;
 use crate::cache::{Bar, OrderBook, QuoteTick, TradeTick};
 use crate::instrument::Instrument;
 #[allow(unused_imports)]
 use crate::messages::{
     AccountState, ClientOrderId, FundingRateUpdate, IndexPriceUpdate, InstrumentClose,
     InstrumentStatus, MarkPriceUpdate, OrderAccepted, OrderCancelled, OrderFilled,
-    OrderPartiallyFilled, OrderRejected, PositionChanged, PositionClosed, PositionOpened,
-    PositionId, SignalData, OrderSide, OrderSubmitted, StrategyId, TradeId, TraderId,
-    VenueOrderId,
+    OrderPartiallyFilled, OrderModified, OrderRejected, PositionChanged, PositionClosed,
+    PositionOpened, PositionId, SignalData, OrderSide, OrderSubmitted, StrategyId, TradeId,
+    TraderId, VenueOrderId,
 };
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
@@ -1148,6 +1149,9 @@ pub trait Actor: Send + Sync {
     /// Called when a full order book snapshot is received.
     fn on_order_book(&mut self, _book: &OrderBook) {}
 
+    /// Called when a batch of order book deltas is received (incremental update).
+    fn on_order_book_deltas(&mut self, _deltas: &OrderBookDeltas) {}
+
     /// Called when an instrument definition is received.
     fn on_instrument(&mut self, _instrument: &Instrument) {}
 
@@ -1200,6 +1204,9 @@ pub trait Actor: Send + Sync {
 
     /// Called when an order is rejected by the venue.
     fn on_order_rejected(&mut self, _event: &OrderRejected) {}
+
+    /// Called when an order is modified (price or quantity changed by the venue).
+    fn on_order_modified(&mut self, _event: &OrderModified) {}
 
     /// Called when a position is opened.
     fn on_position_opened(&mut self, _event: &PositionOpened) {}

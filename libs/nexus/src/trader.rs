@@ -30,6 +30,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use serde::{Deserialize, Serialize};
+use tokio;
 
 use crate::actor::{Actor, Clock, MessageBus, SystemClock};
 use crate::cache::Cache;
@@ -40,6 +41,7 @@ use crate::engine::oms::Oms;
 use crate::engine::orders::Order;
 use crate::engine::risk::{RiskConfig, RiskEngine};
 use crate::instrument::Venue;
+use crate::live::MarketDataAdapter;
 use crate::messages::{OrderFilled, SubmitOrder, TraderId};
 use crate::paper::PaperExecution;
 
@@ -811,11 +813,17 @@ impl Default for NodeConfig {
 /// TradingNode wraps a Trader with production concerns:
 /// - SIGTERM graceful shutdown (via sigwait in a dedicated thread)
 /// - Health heartbeat writes to the database
+/// - Market data adapter management (Binance, Bybit, OKX)
 ///
 /// The recommended way to run a live trading node.
 pub struct TradingNode {
     trader: Arc<std::sync::Mutex<Trader>>,
     config: NodeConfig,
+    /// Market data adapters (WebSocket). Each adapter's receive loop is
+    /// driven by the tokio runtime started in `run_blocking()`.
+    /// Wrapped in Arc<Mutex<..>> so the async adapter tasks can be moved
+    /// into the tokio runtime without cloning the Box<dyn Trait>.
+    market_adapters: Arc<std::sync::Mutex<Vec<Box<dyn MarketDataAdapter>>>>,
 }
 
 
@@ -825,7 +833,16 @@ impl TradingNode {
         Self {
             trader: Arc::new(std::sync::Mutex::new(trader)),
             config,
+            market_adapters: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Register a market data adapter (Binance, Bybit, OKX, etc.).
+    ///
+    /// The adapter's WebSocket receive loop is driven by the tokio runtime
+    /// started in `run_blocking()`. This must be called BEFORE `run_blocking()`.
+    pub fn add_market_adapter(&mut self, adapter: Box<dyn MarketDataAdapter>) {
+        self.market_adapters.lock().unwrap().push(adapter);
     }
 
     /// Start the node: spawns background threads for SIGTERM and health,
@@ -836,10 +853,26 @@ impl TradingNode {
     ///
     /// Health: pure std thread, locks Trader only for the brief duration of
     /// `clock().timestamp_ns()` + `database.save_heartbeat()`.
+    ///
+    /// Startup sequence:
+    /// 1. Build a single-threaded tokio runtime on the current thread
+    /// 2. Enter the runtime and call `trader.start()` — this fires up all
+    ///    Actor WS loops (ExecutionClient spawn_local) and connects adapters
+    /// 3. Park the async executor in `block_on()` — the runtime's worker
+    ///    thread drives all spawned tasks (market data receive loops)
+    /// 4. On SIGTERM: `trader.stop()` fires via oneshot signal,
+    ///    `block_on()` returns, runtime is dropped (clean shutdown)
     pub fn run_blocking(&self) {
         let trader = Arc::clone(&self.trader);
         let health_secs = self.config.health_interval_secs;
         let signal_on = self.config.signal_handling;
+        // Extract adapters from the Arc<Mutex<..>> — drain the vec so each
+        // adapter is owned by exactly one tokio task (no use-after-move).
+        let adapters: Vec<Box<dyn MarketDataAdapter>> =
+            std::mem::take(&mut *self.market_adapters.lock().unwrap());
+
+        // Shutdown signal: SIGTERM handler sends, block_on receives, unblocks
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // SIGTERM via sigwait — pure std, no tokio, no raw C signal handler.
         if signal_on {
@@ -869,6 +902,8 @@ impl TradingNode {
                 }
 
                 eprintln!("[TradingNode] SIGTERM received, shutting down");
+                // Signal the block_on to exit and stop the trader
+                let _ = shutdown_tx.send(());
                 t_sig.lock().unwrap().stop();
             });
         }
@@ -891,9 +926,45 @@ impl TradingNode {
             });
         }
 
-        // Park main thread forever — background threads do all work
-        loop {
-            std::thread::park();
-        }
+        // Build and run the tokio runtime for all async market adapter loops.
+        // Single-threaded: supports spawn_local from ExecutionClient::on_start().
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime build should not fail");
+
+        // Enter the runtime so we can spawn + call trader.start() from this thread
+        runtime.block_on(async {
+            // Start all actors (ExecutionClient, etc.) — this calls connect().await
+            // which spawn_local's the WS receive loops onto THIS runtime thread.
+            trader.lock().unwrap().start().expect("trader already started");
+
+            // Start all market data adapters — each connect().await spawns the
+            // WebSocket receive loop as a background tokio task.
+            for mut adapter in adapters {
+                tokio::spawn(async move {
+                    if let Err(e) = adapter.connect().await {
+                        eprintln!("[TradingNode] market adapter connect error: {}", e);
+                    }
+                    // receive_loop runs indefinitely inside connect(), reconnecting on drop
+                });
+            }
+
+            // Park the async executor forever — exit when SIGTERM fires
+            tokio::select! {
+                _ = tokio::task::yield_now() => {
+                    // yield_to! macro loops forever on this branch
+                    loop {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    eprintln!("[TradingNode] shutdown signal received");
+                }
+            }
+        });
+
+        // Runtime shutdown: all adapter tasks are dropped, connections closed
+        eprintln!("[TradingNode] runtime exited");
     }
 }
