@@ -237,6 +237,8 @@ impl BybitHttpAdapter {
             price: String,
             #[serde(rename = "qty")]
             qty: String,
+            #[serde(rename = "cumExecQty")]
+            cum_exec_qty: String,
             #[serde(rename = "side")]
             side: String,
             #[serde(rename = "orderType")]
@@ -260,7 +262,7 @@ impl BybitHttpAdapter {
                 symbol: o.symbol,
                 price: o.price,
                 orig_qty: o.qty,
-                executed_qty: "0".to_string(),
+                executed_qty: o.cum_exec_qty.clone(),
                 status: o.order_status,
                 order_type: o.order_type,
                 side: o.side,

@@ -16,6 +16,8 @@ pub mod okx_ws_adapter;
 pub mod okx_market_adapter;
 pub mod binance_market_adapter;
 pub mod matching_core;
+pub mod exchange_router;
+pub mod coinbase_http_adapter;
 
 pub use exchange::{
     AccountInfoResponse, AssetBalance, BinanceExecutionReport, BybitExecutionReport,
