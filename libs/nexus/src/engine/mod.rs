@@ -4,6 +4,7 @@
 
 pub mod core;
 pub mod account;
+pub mod exec_algorithm;
 pub mod margin;
 pub mod oms;
 pub mod orders;

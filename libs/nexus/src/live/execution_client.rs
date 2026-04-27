@@ -835,6 +835,7 @@ impl ExecutionClient {
             time_in_force: None,
             expire_time_ns: None,
             last_venue_order_id: None,
+            parent_client_order_id: None,
         }
     }
 
@@ -941,6 +942,7 @@ impl ExecutionClient {
             time_in_force: None,
             expire_time_ns: None,
             last_venue_order_id: None,
+            parent_client_order_id: None,
         }
     }
 }

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::actor::MessageBus;
 use crate::cache::Cache;
 use crate::engine::account::{OmsType, PositionIdGenerator};
+use crate::engine::exec_algorithm::ParentOrder;
 use crate::messages::{
     ClientOrderId, OrderCancelled, OrderFilled,
     OrderPartiallyFilled, OrderRejected, OrderSide, OrderSubmitted, OrderType,
@@ -52,6 +53,9 @@ pub struct OmsOrder {
     pub time_in_force: Option<TimeInForce>,
     pub expire_time_ns: Option<u64>,
     pub last_venue_order_id: Option<VenueOrderId>,
+    /// For child orders of a split algorithm (ICEBERG/TWAP/VWAP),
+    /// this is the client_order_id of the parent order.
+    pub parent_client_order_id: Option<ClientOrderId>,
 }
 
 impl OmsOrder {
@@ -87,6 +91,7 @@ impl OmsOrder {
             time_in_force: None,
             expire_time_ns: None,
             last_venue_order_id: None,
+            parent_client_order_id: None,
         }
     }
 }
@@ -108,6 +113,16 @@ pub struct Oms {
     /// `account.update_with_order()` to keep Account in sync with fills.
     /// None = PaperBroker path where PaperBroker manages Account directly.
     account: Option<Arc<std::sync::Mutex<crate::engine::account::Account>>>,
+    /// Active parent orders for split-order algorithms (ICEBERG/TWAP/VWAP).
+    /// Keyed by parent client_order_id.
+    /// Uses Arc<Mutex<...>> for interior mutability so apply_fill (which takes &self)
+    /// can update parent state when a child fill arrives.
+    parent_orders: Arc<std::sync::Mutex<std::collections::HashMap<ClientOrderId, ParentOrder>>>,
+    /// Optional callback to submit a child order to the exchange.
+    /// This is called when a split-order type (ICEBERG/TWAP/VWAP) is submitted
+    /// (to send the first child) and when a child fill arrives (to send the next child).
+    /// In backtest/paper mode this is None — child order submission is handled externally.
+    submit_child: Option<Arc<Mutex<Option<Box<dyn FnMut(SubmitOrder) + Send>>>>>,
 }
 
 impl Oms {
@@ -116,6 +131,7 @@ impl Oms {
         msgbus: Arc<MessageBus>,
         oms_type: OmsType,
         account: Option<Arc<std::sync::Mutex<crate::engine::account::Account>>>,
+        submit_child: Option<Arc<Mutex<Option<Box<dyn FnMut(SubmitOrder) + Send>>>>>,
     ) -> Self {
         Self {
             cache,
@@ -123,12 +139,17 @@ impl Oms {
             position_id_gen: PositionIdGenerator::new(),
             oms_type,
             account,
+            parent_orders: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            submit_child,
         }
     }
 
     /// Generate position_id using PositionIdGenerator, insert into cache as Pending,
     /// publish OrderSubmitted to MsgBus.
     /// Returns PositionId (ClientOrderId comes from SubmitOrder argument).
+    ///
+    /// For split-order types (ICEBERG/TWAP/VWAP), this creates a `ParentOrder` in
+    /// `self.parent_orders` and generates + submits the first child via `submit_child`.
     pub fn submit_order(&mut self, submit: &SubmitOrder, strategy_id: StrategyId) -> PositionId {
         // Extract instrument_id from the submit's instrument_id string
         // Format may be "BTCUSDT.BINANCE" or just the raw string
@@ -156,6 +177,88 @@ impl Oms {
             self.oms_type,
         );
 
+        // Check if this is a split-order type (ICEBERG/TWAP/VWAP)
+        let is_split_order = matches!(
+            submit.order_type,
+            OrderType::Iceberg | OrderType::Twap | OrderType::Vwap
+        );
+
+        if is_split_order {
+            // --- Split-order path: create parent, generate first child ---
+
+            // Create the parent ParentOrder
+            let parent_client_order_id = submit.client_order_id.clone();
+            let parent = match submit.order_type {
+                OrderType::Iceberg => ParentOrder::new_iceberg(
+                    parent_client_order_id.clone(),
+                    submit.quantity,
+                    instrument_id_str.clone(),
+                    submit.order_side,
+                    submit.price,
+                    strategy_id.clone(),
+                    submit.trader_id.clone(),
+                    10.0,  // display_qty: 10 units per child slice
+                    0.0,   // min_qty: no minimum
+                    0,     // max_orders: unlimited
+                ),
+                OrderType::Twap => ParentOrder::new_twap(
+                    parent_client_order_id.clone(),
+                    submit.quantity,
+                    instrument_id_str.clone(),
+                    submit.order_side,
+                    submit.price,
+                    strategy_id.clone(),
+                    submit.trader_id.clone(),
+                    3600,  // duration_secs: 1 hour
+                    8,     // num_slices: 8
+                    false, // randomize
+                ),
+                OrderType::Vwap => ParentOrder::new_vwap(
+                    parent_client_order_id.clone(),
+                    submit.quantity,
+                    instrument_id_str.clone(),
+                    submit.order_side,
+                    submit.price,
+                    strategy_id.clone(),
+                    submit.trader_id.clone(),
+                    0.10,  // participation_rate: 10%
+                    false, // randomize_size
+                ),
+                _ => unreachable!(),
+            };
+
+            // Set timestamp for child order creation
+            let mut parent = parent;
+            parent.set_ts_init(submit.ts_init);
+
+            // Store parent in parent_orders map (Arc<Mutex<...>>)
+            {
+                let mut parent_map = self.parent_orders.lock().unwrap();
+                parent_map.insert(parent_client_order_id.clone(), parent);
+            }
+
+            // Generate the first child SubmitOrder
+            let child_client_order_id = ClientOrderId::new(&format!("{}-CHILD-001", parent_client_order_id));
+
+            // Use can_generate_child to check (it checks remaining vs display), then generate
+            let child_order_opt = {
+                let parent_map = self.parent_orders.lock().unwrap();
+                let parent_ref = parent_map.get(&parent_client_order_id).unwrap();
+                parent_ref.generate_child(child_client_order_id.clone())
+            };
+
+            if let Some(child_submit) = child_order_opt {
+                // Submit the first child via the callback
+                self.submit_child(&child_submit);
+            }
+
+            // Return the position_id for the parent
+            // Note: parent is NOT stored in cache (it has no exchange representation)
+            // Children are tracked in cache as they are filled
+            return position_id;
+        }
+
+        // --- Regular order path ---
         let oms_order = OmsOrder::new(
             submit.client_order_id.clone(),
             position_id.clone(),
@@ -190,6 +293,21 @@ impl Oms {
         position_id
     }
 
+    /// Internal helper: submit a child order via the `submit_child` callback.
+    /// Uses interior mutability so it can be called even when `self` is borrowed.
+    /// Does nothing if `submit_child` is None (backtest/paper mode).
+    fn submit_child(&self, child: &SubmitOrder) {
+        if let Some(ref submit_child_arc) = self.submit_child {
+            if let Ok(mut submit_child_opt) = submit_child_arc.lock() {
+                if let Some(ref mut submit_fn) = *submit_child_opt {
+                    submit_fn(child.clone());
+                }
+            }
+        }
+        // In backtest/paper mode (submit_child is None), the caller handles
+        // child order submission externally.
+    }
+
     /// Called when exchange sends NEW event via WebSocket.
     /// Transitions Pending -> Accepted, records venue_order_id, updates secondary index.
     pub fn apply_accepted(&self, client_order_id: &ClientOrderId, venue_order_id: VenueOrderId) {
@@ -204,8 +322,20 @@ impl Oms {
 
     /// Apply a fill (partial or full). Updates cache, publishes OrderFilled/OrderPartiallyFilled.
     /// Follows Lock-Then-Publish: extracts data, drops lock, then publishes.
+    ///
+    /// For child orders of a split algorithm (ICEBERG/TWAP/VWAP), also updates
+    /// the parent `ParentOrder` and submits the next child if needed.
     pub fn apply_fill(&self, client_order_id: &ClientOrderId, fill: &OrderFilled) {
-        let filled_event_data: (OrderState, String, StrategyId, VenueOrderId, PositionId, f64, f64) = {
+        let filled_event_data: (
+            OrderState,
+            String,
+            StrategyId,
+            VenueOrderId,
+            PositionId,
+            f64,
+            f64,
+            Option<ClientOrderId>,
+        ) = {
             let mut cache = self.cache.lock().unwrap();
             let order = match cache.oms_get_mut(client_order_id) {
                 Some(o) => o,
@@ -239,8 +369,18 @@ impl Oms {
             let venue_order_id = order.venue_order_id.clone().unwrap_or_else(|| VenueOrderId::new(""));
             let remaining_qty = order.quantity - order.filled_qty;
             let position_id = order.position_id.clone();
+            let parent_client_order_id = order.parent_client_order_id.clone();
 
-            (new_state, instrument_id, strategy_id, venue_order_id, position_id, last_fill_price, remaining_qty)
+            (
+                new_state,
+                instrument_id,
+                strategy_id,
+                venue_order_id,
+                position_id,
+                last_fill_price,
+                remaining_qty,
+                parent_client_order_id,
+            )
         };
 
         // Publish AFTER releasing lock (Lock-Then-Publish pattern)
@@ -297,6 +437,68 @@ impl Oms {
                 ts_init: fill.ts_init,
             };
             self.msgbus.publish("order.partially_filled", &event);
+        }
+
+        // Phase 2: Handle child fill for split-order algorithms
+        // Done AFTER releasing cache lock to avoid deadlock.
+        if let Some(parent_id) = filled_event_data.7 {
+            self.handle_child_fill(&parent_id, fill.filled_qty, fill.ts_init);
+        }
+    }
+
+    /// Handle a fill for a child order of a split algorithm.
+    ///
+    /// Updates the parent `ParentOrder.remaining_qty` and, if the parent can still
+    /// generate children, generates and submits the next child via `submit_child`.
+    ///
+    /// Called after the cache lock has been released to avoid deadlock when
+    /// `submit_child` callback re-enters the OMS.
+    fn handle_child_fill(&self, parent_id: &ClientOrderId, filled_qty: f64, ts_init: u64) {
+        // Update parent state: reduce remaining_qty, increment child_count
+        let can_continue = {
+            let mut parent_map = self.parent_orders.lock().unwrap();
+            if let Some(parent) = parent_map.get_mut(parent_id) {
+                parent.on_child_fill(filled_qty);
+                parent.can_generate_child()
+            } else {
+                false
+            }
+        };
+
+        // If parent can still generate children, generate and submit the next child
+        if can_continue {
+            let child_client_order_id = {
+                let parent_map = self.parent_orders.lock().unwrap();
+                if let Some(parent) = parent_map.get(parent_id) {
+                    let child_num = parent.child_count + 1;
+                    ClientOrderId::new(&format!("{}-CHILD-{:03}", parent.parent_client_order_id, child_num))
+                } else {
+                    return;
+                }
+            };
+
+            let child_order_opt = {
+                let parent_map = self.parent_orders.lock().unwrap();
+                parent_map.get(parent_id).and_then(|p| p.generate_child(child_client_order_id))
+            };
+
+            if let Some(child_submit) = child_order_opt {
+                self.submit_child(&child_submit);
+            }
+        }
+    }
+
+    /// Set the `submit_child` callback used to submit child orders to the exchange.
+    ///
+    /// This is called by `ExecutionClient` in live trading mode after the OMS is created
+    /// and before any split-order submissions occur.
+    pub fn set_submit_child_fn(
+        &mut self,
+        submit_fn: Box<dyn FnMut(SubmitOrder) + Send + 'static>,
+    ) {
+        if let Some(ref arc) = self.submit_child {
+            let mut opt = arc.lock().unwrap();
+            *opt = Some(submit_fn);
         }
     }
 
@@ -563,7 +765,7 @@ mod tests {
     fn make_test_oms() -> (Oms, Arc<Mutex<Cache>>, Arc<MessageBus>) {
         let cache = Arc::new(Mutex::new(Cache::new(1000, 1000)));
         let msgbus = Arc::new(MessageBus::new());
-        let oms = Oms::new(cache.clone(), msgbus.clone(), OmsType::Hedge, None);
+        let oms = Oms::new(cache.clone(), msgbus.clone(), OmsType::Hedge, None, None);
         (oms, cache, msgbus)
     }
 

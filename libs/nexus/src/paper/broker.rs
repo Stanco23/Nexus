@@ -73,7 +73,7 @@ impl PaperBroker {
         oms_type: OmsType,
     ) -> Self {
         let oms_cache = Arc::new(StdMutex::new(Cache::new(1000, 1000)));
-        let oms = Oms::new(oms_cache, msgbus.clone(), oms_type, None);
+        let oms = Oms::new(oms_cache, msgbus.clone(), oms_type, None, None);
         Self {
             emulator: Mutex::new(OrderEmulator::new_with_config(slippage_config)),
             order_book: Mutex::new(OrderBook::default()),

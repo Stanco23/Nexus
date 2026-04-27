@@ -245,6 +245,7 @@ impl Trader {
             Arc::new(msgbus.clone()),
             crate::engine::account::OmsType::Hedge,
             None,
+            None, // submit_child: set via set_submit_child_fn() in live mode
         );
 
         // Initialize database if configured
