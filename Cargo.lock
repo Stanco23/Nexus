@@ -1279,6 +1279,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "libc",
  "memmap2",
  "nalgebra",
  "once_cell",

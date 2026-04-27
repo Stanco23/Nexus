@@ -783,3 +783,117 @@ mod tests {
         assert!(residuals.is_empty());
     }
 }
+
+// =============================================================================
+// TradingNode — Phase 5.7
+// =============================================================================
+
+/// Configuration for the TradingNode runner.
+#[derive(Debug, Clone)]
+pub struct NodeConfig {
+    /// Seconds between health heartbeat writes. 0 = disabled.
+    pub health_interval_secs: u64,
+    /// Whether to handle SIGTERM for graceful shutdown.
+    pub signal_handling: bool,
+}
+
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            health_interval_secs: 30,
+            signal_handling: true,
+        }
+    }
+}
+
+
+/// TradingNode wraps a Trader with production concerns:
+/// - SIGTERM graceful shutdown (via sigwait in a dedicated thread)
+/// - Health heartbeat writes to the database
+///
+/// The recommended way to run a live trading node.
+pub struct TradingNode {
+    trader: Arc<std::sync::Mutex<Trader>>,
+    config: NodeConfig,
+}
+
+
+impl TradingNode {
+    /// Create a new TradingNode wrapping the given Trader.
+    pub fn new(trader: Trader, config: NodeConfig) -> Self {
+        Self {
+            trader: Arc::new(std::sync::Mutex::new(trader)),
+            config,
+        }
+    }
+
+    /// Start the node: spawns background threads for SIGTERM and health,
+    /// then blocks the current thread forever.
+    ///
+    /// SIGTERM: uses `pthread_sigmask` + `sigwait` via raw libc FFI in a dedicated
+    /// waiter thread. No raw signal handler needed.
+    ///
+    /// Health: pure std thread, locks Trader only for the brief duration of
+    /// `clock().timestamp_ns()` + `database.save_heartbeat()`.
+    pub fn run_blocking(&self) {
+        let trader = Arc::clone(&self.trader);
+        let health_secs = self.config.health_interval_secs;
+        let signal_on = self.config.signal_handling;
+
+        // SIGTERM via sigwait — pure std, no tokio, no raw C signal handler.
+        if signal_on {
+            let t_sig = Arc::clone(&trader);
+            std::thread::spawn(move || {
+                // Block SIGTERM in this thread, then use sigwait to receive it.
+                let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+                unsafe { libc::sigemptyset(&mut sigset) };
+                unsafe { libc::sigaddset(&mut sigset, libc::SIGTERM) };
+
+
+                // Apply signal mask: block SIGTERM so sigwait can receive it
+                let ret = unsafe {
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut())
+                };
+                if ret != 0 {
+                    eprintln!("[TradingNode] pthread_sigmask failed: {}", ret);
+                    return;
+                }
+
+                // sigwait until SIGTERM arrives
+                let mut sig: libc::c_int = 0;
+                let ret2 = unsafe { libc::sigwait(&sigset, &mut sig) };
+                if ret2 != 0 {
+                    eprintln!("[TradingNode] sigwait failed: {}", ret2);
+                    return;
+                }
+
+                eprintln!("[TradingNode] SIGTERM received, shutting down");
+                t_sig.lock().unwrap().stop();
+            });
+        }
+
+        // Health monitor — pure std thread, locks Trader briefly for heartbeat
+        if health_secs > 0 {
+            let t_hm = Arc::clone(&trader);
+            std::thread::spawn(move || {
+                let dur = std::time::Duration::from_secs(health_secs);
+                loop {
+                    std::thread::sleep(dur);
+                    let ts = t_hm.lock().unwrap().clock().timestamp_ns();
+                    let tid = t_hm.lock().unwrap().trader_id().clone();
+                    if let Some(ref db) = t_hm.lock().unwrap().database {
+                        if let Err(e) = db.save_heartbeat(&tid, ts) {
+                            eprintln!("[TradingNode] heartbeat error: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Park main thread forever — background threads do all work
+        loop {
+            std::thread::park();
+        }
+    }
+}
