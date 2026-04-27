@@ -66,6 +66,7 @@ pub struct Instrument {
 }
 
 impl Instrument {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         symbol: &str,
         venue: &str,

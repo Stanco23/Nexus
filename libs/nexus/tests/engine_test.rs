@@ -1,41 +1,6 @@
-use nexus::engine::{CommissionConfig, EngineContext, Signal, Strategy};
+use nexus::engine::{CommissionConfig, EngineContext, Signal};
 use nexus::signals::SignalBus;
 use std::sync::{Arc, Mutex};
-
-struct SimpleBuyThenCloseStrategy {
-    buy_at_tick: usize,
-    close_at_tick: usize,
-    counter: usize,
-}
-
-impl SimpleBuyThenCloseStrategy {
-    fn new(buy_at_tick: usize, close_at_tick: usize) -> Self {
-        Self {
-            buy_at_tick,
-            close_at_tick,
-            counter: 0,
-        }
-    }
-}
-
-impl Strategy for SimpleBuyThenCloseStrategy {
-    fn on_tick(
-        &mut self,
-        _timestamp_ns: u64,
-        _price: f64,
-        _size: f64,
-        _ctx: &mut EngineContext,
-    ) -> Signal {
-        self.counter += 1;
-        if self.counter == self.buy_at_tick {
-            Signal::Buy
-        } else if self.counter == self.close_at_tick {
-            Signal::Close
-        } else {
-            Signal::Close
-        }
-    }
-}
 
 #[test]
 fn test_commission_long_entry_exit() {
@@ -49,7 +14,7 @@ fn test_commission_long_entry_exit() {
     let gross_pnl = (exit - entry) * size;
     let net_pnl = gross_pnl - entry_comm - exit_comm;
 
-    assert!((net_pnl - 9.998).abs() < 0.001, "net_pnl={}", net_pnl);
+    assert!((net_pnl - 9.79).abs() < 0.001, "net_pnl={}", net_pnl);
 }
 
 #[test]
@@ -64,7 +29,9 @@ fn test_commission_short_entry_exit() {
     let gross_pnl = (entry - exit) * size;
     let net_pnl = gross_pnl - entry_comm - exit_comm;
 
-    assert!((net_pnl - 9.998).abs() < 0.001, "net_pnl={}", net_pnl);
+    // Short: gross_pnl = (entry - exit) * size = (100 - 90) * 1 = 10
+    // net_pnl = 10 - 0.1 - 0.09 = 9.81
+    assert!((net_pnl - 9.81).abs() < 0.001, "net_pnl={}", net_pnl);
 }
 
 #[test]

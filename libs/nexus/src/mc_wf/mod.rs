@@ -341,7 +341,7 @@ impl WalkForwardRunner {
         best_params: HashMap<String, f64>,
     ) -> WalkForwardResult
     where
-        S: crate::engine::Strategy + Clone,
+        S: Clone,
     {
         let num_periods = self.config.in_sample_periods + self.config.out_of_sample_periods;
         let tick_period_size = ticks.len() / num_periods.max(1);
@@ -451,7 +451,7 @@ impl WalkForwardRunner {
         ticks: &[(u64, f64, f64)],
     ) -> WindowPerformance
     where
-        S: crate::engine::Strategy + Clone,
+        S: Clone,
     {
         if ticks.is_empty() {
             return WindowPerformance {
@@ -673,17 +673,6 @@ mod tests {
             |_params: HashMap<String, f64>| {
                 #[derive(Clone)]
                 struct DummyStrategy;
-                impl crate::engine::Strategy for DummyStrategy {
-                    fn on_tick(
-                        &mut self,
-                        _timestamp_ns: u64,
-                        _price: f64,
-                        _size: f64,
-                        _ctx: &mut crate::engine::EngineContext,
-                    ) -> crate::engine::Signal {
-                        crate::engine::Signal::Close
-                    }
-                }
                 DummyStrategy
             },
             HashMap::new(),

@@ -28,6 +28,10 @@ impl TraderId {
     pub fn new(value: &str) -> Self {
         Self(value.to_string())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for TraderId {
@@ -143,6 +147,22 @@ impl Default for MessageId {
     }
 }
 
+/// A client/provider identifier (e.g. "binance spot", "bybit linear").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClientId(pub String);
+
+impl ClientId {
+    pub fn new(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Order side (buy or sell).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
@@ -161,6 +181,7 @@ pub enum OrderType {
     Twap,
     Vwap,
     TrailingStop,
+    MarketToLimit,
 }
 
 /// Time in force for a limit order.
@@ -171,11 +192,9 @@ pub enum TimeInForce {
     Ioc, // Immediate Or Cancel
     Fok, // Fill Or Kill
     Gfx, // Good For Day
+    AtTheOpen,  // Market On Open (MOO) — fill at opening price
+    AtTheClose, // Limit On Close (LOC) — fill at closing price
 }
-
-// =============================================================================
-// SECTION 2: Topic
-// =============================================================================
 
 /// A message bus topic with wildcard support.
 ///
@@ -640,6 +659,7 @@ pub struct PositionOpened {
     pub ts_event: u64,
     pub ts_init: u64,
 }
+impl Message for PositionOpened {}
 
 /// Position changed (quantity or avg price changed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,6 +674,7 @@ pub struct PositionChanged {
     pub ts_event: u64,
     pub ts_init: u64,
 }
+impl Message for PositionChanged {}
 
 /// Position closed (fully liquidated).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -668,6 +689,7 @@ pub struct PositionClosed {
     pub realized_pnl: f64,
     pub commission: f64,
 }
+impl Message for PositionClosed {}
 
 // =============================================================================
 // SECTION 5: Market Data Events

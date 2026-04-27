@@ -8,12 +8,16 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::cache::{OrderBook, QuoteTick};
+use crate::data::DataEngine;
 use crate::ingestion::adapters::binance::BinanceVenue;
+use crate::instrument::InstrumentId;
 use crate::live::exchange::{MarketDataAdapter, MarketDataMessage, NormalizedTrade, WsError};
 
 // =============================================================================
@@ -27,6 +31,7 @@ enum AdapterCommand {
     /// Unsubscribe from a trade stream.
     Unsubscribe(String),
     /// Respond to a ping from the server.
+    #[allow(dead_code)]
     Ping(u64),
     /// Close the connection and terminate the loop.
     Close,
@@ -93,7 +98,11 @@ pub struct BinanceMarketDataAdapter {
     /// Currently active subscription stream names (e.g. "btcusdt@trade").
     active_subscriptions: Vec<String>,
     /// Next message ID for SUBSCRIBE/UNSUBSCRIBE requests.
+    #[allow(dead_code)]
     msg_id: u32,
+    /// Data engine for routing quote ticks and order book updates.
+    /// US-LT-03: Wired to route parsed market data to DataEngine.
+    data_engine: Arc<Mutex<DataEngine>>,
 }
 
 impl std::fmt::Debug for BinanceMarketDataAdapter {
@@ -113,7 +122,8 @@ impl BinanceMarketDataAdapter {
     ///
     /// `symbol` — the instrument symbol in uppercase (e.g. "BTCUSDT").
     /// `venue`  — either `BinanceVenue::Spot` or `BinanceVenue::UsdtFutures`.
-    pub fn new(symbol: &str, venue: BinanceVenue) -> Self {
+    /// `data_engine` — DataEngine for routing quote ticks and order book updates (US-LT-03).
+    pub fn new(symbol: &str, venue: BinanceVenue, data_engine: Arc<Mutex<DataEngine>>) -> Self {
         let symbol_upper = symbol.to_uppercase();
         let ws_url = build_ws_url(&symbol_upper, venue);
         Self {
@@ -125,6 +135,7 @@ impl BinanceMarketDataAdapter {
             connected: false,
             active_subscriptions: Vec::new(),
             msg_id: 1,
+            data_engine,
         }
     }
 
@@ -134,9 +145,10 @@ impl BinanceMarketDataAdapter {
         let (send_tx, send_rx) = mpsc::channel::<AdapterCommand>(32);
         let (recv_tx, recv_rx) = mpsc::channel::<MarketDataMessage>(64);
         let ws_url = self.ws_url.clone();
+        let data_engine = Arc::clone(&self.data_engine);
 
         tokio::spawn(async move {
-            Self::receive_loop(ws_url, send_rx, recv_tx).await;
+            Self::receive_loop(ws_url, send_rx, recv_tx, data_engine).await;
         });
 
         self.send_tx = Some(send_tx);
@@ -150,10 +162,11 @@ impl BinanceMarketDataAdapter {
         ws_url: String,
         mut send_rx: mpsc::Receiver<AdapterCommand>,
         mut recv_tx: mpsc::Sender<MarketDataMessage>,
+        data_engine: Arc<Mutex<DataEngine>>,
     ) {
         let mut attempts: u32 = 0;
         loop {
-            match Self::ws_receive_loop(&ws_url, &mut send_rx, &mut recv_tx).await {
+            match Self::ws_receive_loop(&ws_url, &mut send_rx, &mut recv_tx, Arc::clone(&data_engine)).await {
                 Ok(()) => break,
                 Err(WsError::ConnectionClosed) => {
                     let backoff_ms = Self::compute_backoff(attempts);
@@ -171,6 +184,7 @@ impl BinanceMarketDataAdapter {
         ws_url: &str,
         send_rx: &mut mpsc::Receiver<AdapterCommand>,
         recv_tx: &mut mpsc::Sender<MarketDataMessage>,
+        data_engine: Arc<Mutex<DataEngine>>,
     ) -> Result<(), WsError> {
         let (ws_stream, _) = connect_async(ws_url)
             .await
@@ -197,6 +211,10 @@ impl BinanceMarketDataAdapter {
                                     if let Some(trade) = try_parse_trade(&text) {
                                         let _ = recv_tx.send(MarketDataMessage::Trade(trade)).await;
                                     }
+                                    // US-LT-03: Route mini ticker (quote) to DataEngine
+                                    let _ = try_parse_quote(&text, &data_engine);
+                                    // US-LT-03: Route depth update (order book) to DataEngine
+                                    let _ = try_parse_orderbook(&text, &data_engine);
                                     // Other message types → MarketDataMessage::Unknown
                                 }
                                 Message::Ping(data) => {
@@ -393,6 +411,124 @@ fn try_parse_trade(text: &str) -> Option<NormalizedTrade> {
     })
 }
 
+/// Binance 1-second mini ticker (quote tick) message.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+#[allow(non_snake_case)]
+struct BinanceMiniTickerMsg {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "E")]
+    event_time_ms: u64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "c")]
+    close_price: String,
+    #[serde(rename = "o")]
+    open_price: String,
+    #[serde(rename = "h")]
+    high_price: String,
+    #[serde(rename = "l")]
+    low_price: String,
+    #[serde(rename = "v")]
+    volume: String,
+    #[serde(rename = "q")]
+    quote_volume: String,
+}
+
+/// Try to parse a Binance mini ticker message into a `QuoteTick`.
+/// Returns `None` if parsing fails or the message is not a mini ticker event.
+fn try_parse_quote(text: &str, data_engine: &Arc<Mutex<DataEngine>>) -> Option<()> {
+    let msg: BinanceMiniTickerMsg = serde_json::from_str(text).ok()?;
+
+    if msg.event_type != "24hrMiniTicker" {
+        return None;
+    }
+
+    let bid_price: f64 = msg.close_price.parse().ok()?;
+    let ask_price: f64 = msg.open_price.parse().ok()?;
+    let ts_event = msg.event_time_ms * 1_000_000;
+    let ts_init = ts_event; // Use event time as init time
+    let instrument_id = InstrumentId::new(&msg.symbol, "BINANCE");
+
+    let quote = QuoteTick {
+        ts_event,
+        ts_init,
+        bid_price,
+        ask_price,
+        bid_size: 0.0, // Mini ticker doesn't include size
+        ask_size: 0.0,
+        instrument_id: instrument_id.clone(),
+    };
+
+    // Route to DataEngine (US-LT-03)
+    if let Ok(engine) = data_engine.lock() {
+        engine.process_quote(&quote, instrument_id);
+    }
+
+    Some(())
+}
+
+/// Binance depth update (order book) message.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+#[allow(non_snake_case)]
+struct BinanceDepthMsg {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "E")]
+    event_time_ms: u64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "U")]
+    first_update_id: u64,
+    #[serde(rename = "u")]
+    final_update_id: u64,
+    #[serde(rename = "b")]
+    bids: Vec<serde_json::Value>,
+    #[serde(rename = "a")]
+    asks: Vec<serde_json::Value>,
+}
+
+/// Try to parse a Binance depth update into an `OrderBook` and route to DataEngine.
+/// Returns `None` if parsing fails or the message is not a depth update.
+fn try_parse_orderbook(text: &str, data_engine: &Arc<Mutex<DataEngine>>) -> Option<()> {
+    let msg: BinanceDepthMsg = serde_json::from_str(text).ok()?;
+
+    if msg.event_type != "depthUpdate" {
+        return None;
+    }
+
+    let ts_event = msg.event_time_ms * 1_000_000;
+    let instrument_id = InstrumentId::new(&msg.symbol, "BINANCE");
+
+    let bids: Vec<(f64, f64)> = msg.bids.iter().filter_map(|b| {
+        let price = b[0].as_str()?.parse().ok()?;
+        let size = b[1].as_str()?.parse().ok()?;
+        Some((price, size))
+    }).collect();
+
+    let asks: Vec<(f64, f64)> = msg.asks.iter().filter_map(|a| {
+        let price = a[0].as_str()?.parse().ok()?;
+        let size = a[1].as_str()?.parse().ok()?;
+        Some((price, size))
+    }).collect();
+
+    let book = OrderBook {
+        instrument_id: instrument_id.clone(),
+        bids,
+        asks,
+        ts_event,
+    };
+
+    // Route to DataEngine (US-LT-03)
+    if let Ok(engine) = data_engine.lock() {
+        engine.process_orderbook(&book, instrument_id.clone());
+    }
+
+    Some(())
+}
+
 /// Compute FNV-1a hash of a byte string (32-bit).
 /// Used for stable instrument ID across Nexus.
 fn fnv1a_hash(data: &[u8]) -> u32 {
@@ -540,7 +676,9 @@ mod tests {
 
     #[test]
     fn test_adapter_debug_trait() {
-        let adapter = BinanceMarketDataAdapter::new("BTCUSDT", BinanceVenue::Spot);
+        let clock = Box::new(crate::actor::TestClock::new());
+        let engine = crate::data::DataEngine::new(clock);
+        let adapter = BinanceMarketDataAdapter::new("BTCUSDT", BinanceVenue::Spot, Arc::new(Mutex::new(engine)));
         let debug = format!("{:?}", adapter);
         assert!(debug.contains("BTCUSDT"));
         assert!(debug.contains("Spot"));
@@ -549,7 +687,9 @@ mod tests {
     #[test]
     fn test_subscribe_lowercases_symbol() {
         // Verify the adapter stores lowercased stream names internally
-        let adapter = BinanceMarketDataAdapter::new("BTCUSDT", BinanceVenue::Spot);
+        let clock = Box::new(crate::actor::TestClock::new());
+        let engine = crate::data::DataEngine::new(clock);
+        let adapter = BinanceMarketDataAdapter::new("BTCUSDT", BinanceVenue::Spot, Arc::new(Mutex::new(engine)));
         // Stream name should be btcusdt@trade (lowercased)
         let expected_stream = "btcusdt@trade";
         // We can't directly check active_subscriptions here since connect() isn't called,

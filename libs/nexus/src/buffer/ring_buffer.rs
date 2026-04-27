@@ -257,18 +257,10 @@ impl RingBuffer {
 
         let duration_ns = self.header.end_time_ns.saturating_sub(self.header.start_time_ns);
         let num_ticks = self.header.num_ticks.saturating_sub(1);
-        let avg_tick_ns = if num_ticks > 0 {
-            duration_ns / num_ticks
-        } else {
-            1000
-        };
+        let avg_tick_ns = duration_ns.checked_div(num_ticks).unwrap_or(1000);
 
-        let estimated_tick = if avg_tick_ns > 0 {
-            ((target_ns - self.header.start_time_ns) / avg_tick_ns)
-                .min(self.header.num_ticks.saturating_sub(1))
-        } else {
-            0
-        };
+        let estimated_tick = ((target_ns - self.header.start_time_ns) / avg_tick_ns)
+            .min(self.header.num_ticks.saturating_sub(1));
 
         // Binary search on anchor tick_index to find anchor <= estimated_tick
         let mut left = 0;
@@ -285,7 +277,7 @@ impl RingBuffer {
 
         // left is first entry where tick_index > estimated_tick
         // So left-1 is the anchor we want (at or before estimated position)
-        let mut start_slot = left.saturating_sub(1).max(0);
+        let mut start_slot = left.saturating_sub(1);
         let mut offset = self.anchor_index[start_slot].byte_offset as usize;
         let mut tick_index = self.anchor_index[start_slot].tick_index;
 

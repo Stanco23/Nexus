@@ -14,19 +14,19 @@ use crate::engine::core::{PositionSide, Signal};
 /// Strategy execution context — queryable state during backtest runs.
 pub trait StrategyCtx: Send + Sync {
     /// Current market price for an instrument.
-    fn current_price(&self, instrument_id: InstrumentId) -> f64;
+    fn current_price(&self, instrument_id: &InstrumentId) -> f64;
 
     /// Current position side for an instrument.
-    fn position(&self, instrument_id: InstrumentId) -> Option<PositionSide>;
+    fn position(&self, instrument_id: &InstrumentId) -> Option<PositionSide>;
 
     /// Total account equity.
     fn account_equity(&self) -> f64;
 
     /// Unrealized PnL for an open position on an instrument.
-    fn unrealized_pnl(&self, instrument_id: InstrumentId) -> f64;
+    fn unrealized_pnl(&self, instrument_id: &InstrumentId) -> f64;
 
     /// All pending (unfilled) orders for an instrument.
-    fn pending_orders(&self, instrument_id: InstrumentId) -> Vec<Order>;
+    fn pending_orders(&self, instrument_id: &InstrumentId) -> Vec<Order>;
 
     /// Subscribe to one or more instruments.
     fn subscribe_instruments(&mut self, instruments: Vec<InstrumentId>);
@@ -37,7 +37,7 @@ pub trait StrategyCtx: Send + Sync {
     /// Submit a limit order.
     fn submit_limit(
         &mut self,
-        instrument_id: InstrumentId,
+        instrument_id: &InstrumentId,
         side: OrderSide,
         price: f64,
         size: f64,
@@ -46,7 +46,7 @@ pub trait StrategyCtx: Send + Sync {
     /// Submit a market order.
     fn submit_market(
         &mut self,
-        instrument_id: InstrumentId,
+        instrument_id: &InstrumentId,
         side: OrderSide,
         size: f64,
     ) -> u64;
@@ -55,7 +55,7 @@ pub trait StrategyCtx: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn submit_with_sl_tp(
         &mut self,
-        instrument_id: InstrumentId,
+        instrument_id: &InstrumentId,
         side: OrderSide,
         order_type: OrderType,
         price: f64,
@@ -71,7 +71,7 @@ pub trait StrategyCtx: Send + Sync {
     fn cancel_order(&mut self, order_id: u64) -> bool;
 
     /// Total realized and unrealized PnL for an instrument.
-    fn position_pnl(&self, instrument_id: InstrumentId) -> f64;
+    fn position_pnl(&self, instrument_id: &InstrumentId) -> f64;
 
     /// Generate a trading signal directly.
     fn emit_signal(&mut self, signal: Signal);

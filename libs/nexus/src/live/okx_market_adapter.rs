@@ -16,20 +16,25 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::cache::{OrderBook, QuoteTick};
+use crate::data::DataEngine;
+use crate::instrument::instrument_id::fnv1a_hash;
+use crate::instrument::InstrumentId;
 use crate::live::exchange::{
     MarketDataAdapter, MarketDataMessage, NormalizedTrade, WsError,
 };
-use crate::instrument::instrument_id::fnv1a_hash;
 
 // ============================================================================
 // Adapter command for internal communication
 // ============================================================================
 
 /// Internal commands for the adapter background loop.
+#[allow(dead_code)]
 enum AdapterCommand {
     /// Subscribe to a trade channel.
     Subscribe { channel: String, inst_id: String },
@@ -44,6 +49,7 @@ enum AdapterCommand {
 // ============================================================================
 
 /// OKX trade message from WebSocket.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OkxTradeMsg {
     /// Always "trades" for trade messages.
@@ -52,6 +58,7 @@ struct OkxTradeMsg {
     data: Vec<OkxTradeData>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OkxArg {
     /// Channel name (e.g., "trades").
@@ -61,6 +68,7 @@ struct OkxArg {
     inst_id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OkxTradeData {
     /// Instrument ID (e.g., "BTC-USDT").
@@ -108,19 +116,24 @@ pub struct OkxMarketDataAdapter {
     connected: bool,
     /// Active subscriptions persisted across reconnects.
     active_subscriptions: Vec<(String, String)>, // (channel, inst_id)
+    /// Data engine for routing quote ticks and order book updates.
+    /// US-LT-03: Wired to route parsed market data to DataEngine.
+    data_engine: Arc<Mutex<DataEngine>>,
 }
 
 impl OkxMarketDataAdapter {
     /// Create a new adapter.
     ///
     /// `symbol` is the OKX instrument ID (e.g., "BTC-USDT").
-    pub fn new(symbol: &str) -> Self {
+    /// `data_engine` — DataEngine for routing quote ticks and order book updates (US-LT-03).
+    pub fn new(symbol: &str, data_engine: Arc<Mutex<DataEngine>>) -> Self {
         Self {
             ws_url: "wss://ws.okx.com:8443/ws/v5/public".to_string(),
             cmd_tx: None,
             recv_rx: None,
             connected: false,
             active_subscriptions: vec![("trades".to_string(), symbol.to_string())],
+            data_engine,
         }
     }
 
@@ -143,11 +156,12 @@ impl MarketDataAdapter for OkxMarketDataAdapter {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AdapterCommand>(32);
         let (recv_tx, recv_rx) = mpsc::channel::<MarketDataMessage>(64);
         let ws_url = self.ws_url.clone();
+        let data_engine = Arc::clone(&self.data_engine);
         let active_subscriptions: Vec<(String, String)> =
             std::mem::take(&mut self.active_subscriptions);
 
         tokio::spawn(async move {
-            Self::receive_loop(ws_url, cmd_rx, recv_tx, active_subscriptions).await;
+            Self::receive_loop(ws_url, cmd_rx, recv_tx, active_subscriptions, data_engine).await;
         });
 
         self.cmd_tx = Some(cmd_tx);
@@ -178,7 +192,7 @@ impl MarketDataAdapter for OkxMarketDataAdapter {
     /// Subscribe to trade stream for a given instrument ID (e.g. "BTC-USDT").
     async fn subscribe_trades(&mut self, inst_id: &str) -> Result<(), WsError> {
         let channel = "trades".to_string();
-        let inst_id_upper = inst_id.to_uppercase().replace("-USDT", "-USDT");
+        let inst_id_upper = inst_id.to_uppercase();
         if let Some(tx) = &self.cmd_tx {
             let _ = tx
                 .send(AdapterCommand::Subscribe {
@@ -193,7 +207,7 @@ impl MarketDataAdapter for OkxMarketDataAdapter {
 
     /// Unsubscribe from trade stream for a given instrument ID.
     async fn unsubscribe_trades(&mut self, inst_id: &str) -> Result<(), WsError> {
-        let inst_id_upper = inst_id.to_uppercase().replace("-USDT", "-USDT");
+        let inst_id_upper = inst_id.to_uppercase();
         if let Some(tx) = &self.cmd_tx {
             let _ = tx
                 .send(AdapterCommand::Unsubscribe {
@@ -228,9 +242,10 @@ impl OkxMarketDataAdapter {
     /// Persists active subscriptions across reconnects. Exits on `AdapterCommand::Close`.
     async fn receive_loop(
         ws_url: String,
-        mut cmd_rx: mpsc::Receiver<AdapterCommand>,
+        cmd_rx: mpsc::Receiver<AdapterCommand>,
         recv_tx: mpsc::Sender<MarketDataMessage>,
         active_subscriptions: Vec<(String, String)>,
+        data_engine: Arc<Mutex<DataEngine>>,
     ) {
         let subscriptions = std::sync::Arc::new(tokio::sync::Mutex::new(active_subscriptions));
         let mut attempts: u32 = 0;
@@ -241,7 +256,8 @@ impl OkxMarketDataAdapter {
                 break;
             }
 
-            let result = Self::ws_session(&ws_url, &subscriptions, &recv_tx).await;
+            // Clone recv_tx for each session attempt (it's cheap)
+            let result = Self::ws_session(&ws_url, &subscriptions, recv_tx.clone(), Arc::clone(&data_engine)).await;
 
             match result {
                 Ok(()) => {
@@ -270,7 +286,8 @@ impl OkxMarketDataAdapter {
     async fn ws_session(
         ws_url: &str,
         subscriptions: &std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
-        recv_tx: &mpsc::Sender<MarketDataMessage>,
+        recv_tx: mpsc::Sender<MarketDataMessage>,
+        data_engine: Arc<Mutex<DataEngine>>,
     ) -> Result<(), WsError> {
         let (ws, _) = connect_async(ws_url)
             .await
@@ -322,6 +339,8 @@ impl OkxMarketDataAdapter {
                                             return Ok(());
                                         }
                                     }
+                                    // US-LT-03: Route quote/orderbook to DataEngine
+                                    Self::route_to_data_engine(&text, &data_engine);
                                 }
                                 Message::Ping(data) => {
                                     let _ = write.send(Message::Pong(data)).await;
@@ -421,6 +440,96 @@ impl OkxMarketDataAdapter {
             trade_id: trade_id.parse::<u64>().unwrap_or(0),
         })
     }
+
+    /// Route quote and orderbook messages to DataEngine (US-LT-03).
+    fn route_to_data_engine(raw: &str, data_engine: &Arc<Mutex<DataEngine>>) {
+        let json: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let arg = match json.get("arg") {
+            Some(a) => a,
+            None => return,
+        };
+
+        let channel = match arg.get("channel").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let inst_id = match arg.get("instId").and_then(|v| v.as_str()) {
+            Some(i) => i,
+            None => return,
+        };
+
+        let data = match json.get("data").and_then(|v| v.as_array()) {
+            Some(d) => d,
+            None => return,
+        };
+
+        let ts_event = data.first()
+            .and_then(|d| d.get("ts").and_then(|v| v.as_str()))
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|t| t * 1_000_000)
+            .unwrap_or(0);
+
+        let instrument_id = InstrumentId::new(inst_id, "OKX");
+
+        if channel == "tickers" {
+            // OKX ticker data (quote-like)
+            if let Some(ticker) = data.first() {
+                let last_price = ticker.get("last").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                let bid_price = ticker.get("bid").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok()).unwrap_or(last_price * 0.9999);
+                let ask_price = ticker.get("ask").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok()).unwrap_or(last_price * 1.0001);
+
+                let quote = QuoteTick {
+                    ts_event,
+                    ts_init: ts_event,
+                    bid_price,
+                    ask_price,
+                    bid_size: 0.0,
+                    ask_size: 0.0,
+                    instrument_id: instrument_id.clone(),
+                };
+
+                if let Ok(engine) = data_engine.lock() {
+                    engine.process_quote(&quote, instrument_id.clone());
+                }
+            }
+        } else if channel == "books" {
+            // OKX order book snapshot
+            if let Some(book_data) = data.first() {
+                let bids: Vec<(f64, f64)> = book_data.get("bids").and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().filter_map(|b| {
+                            Some((b[0].as_str()?.parse().ok()?, b[1].as_str()?.parse().ok()?))
+                        }).collect()
+                    }).unwrap_or_default();
+
+                let asks: Vec<(f64, f64)> = book_data.get("asks").and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().filter_map(|a| {
+                            Some((a[0].as_str()?.parse().ok()?, a[1].as_str()?.parse().ok()?))
+                        }).collect()
+                    }).unwrap_or_default();
+
+                let book = OrderBook {
+                    instrument_id: instrument_id.clone(),
+                    bids,
+                    asks,
+                    ts_event,
+                };
+
+                if let Ok(engine) = data_engine.lock() {
+                    engine.process_orderbook(&book, instrument_id.clone());
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -509,7 +618,9 @@ mod tests {
 
     #[test]
     fn test_adapter_creation() {
-        let adapter = OkxMarketDataAdapter::new("BTC-USDT");
+        let clock = Box::new(crate::actor::TestClock::new());
+        let engine = crate::data::DataEngine::new(clock);
+        let adapter = OkxMarketDataAdapter::new("BTC-USDT", Arc::new(Mutex::new(engine)));
         assert!(!adapter.is_connected());
     }
 }

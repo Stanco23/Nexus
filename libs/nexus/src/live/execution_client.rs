@@ -137,6 +137,7 @@ impl ExecutionClient {
 
     /// Connect to the WebSocket and start the receive loop.
     /// Must be called before placing orders.
+    #[allow(clippy::await_holding_lock)]
     pub async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.ws.lock().unwrap().connect().await?;
 
@@ -155,6 +156,7 @@ impl ExecutionClient {
             // tx was moved here as `mut tx` in the outer scope
             loop {
                 let msg_result = {
+                    #[allow(clippy::await_holding_lock)]
                     let mut ws_guard = ws.lock().unwrap();
                     ws_guard.recv().await
                 };
@@ -191,6 +193,7 @@ impl ExecutionClient {
     }
 
     /// Disconnect and stop the WebSocket receive loop.
+    #[allow(clippy::await_holding_lock)]
     pub async fn disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Drop the tx to signal the recv loop to exit
         *self.ws_tx.lock().unwrap() = None;
@@ -651,6 +654,7 @@ impl ExecutionClient {
         self.handle_execution_report(exec_report);
     }
 
+    #[allow(clippy::await_holding_lock)]
     async fn reconnect_and_reconcile(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Close old WS connection
         self.ws.lock().unwrap().close().await?;
@@ -870,6 +874,10 @@ impl Actor for ExecutionClient {
         &self.component
     }
 
+    fn component_mut(&mut self) -> &mut crate::actor::Component {
+        &mut self.component
+    }
+
     fn trader_id(&self) -> &str {
         &self.trader_id.0
     }
@@ -878,6 +886,7 @@ impl Actor for ExecutionClient {
         &self.trader_id
     }
 
+    #[allow(clippy::await_holding_lock)]
     fn on_start(&mut self) {
         let ws = Arc::clone(&self.ws);
         let msgbus = Arc::clone(&self.msgbus);
@@ -890,6 +899,7 @@ impl Actor for ExecutionClient {
             loop {
                 // Acquire lock and await recv while holding it
                 let msg_result = {
+                    #[allow(clippy::await_holding_lock)]
                     let mut ws_guard = ws.lock().unwrap();
                     ws_guard.recv().await
                 };

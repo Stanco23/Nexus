@@ -5,15 +5,46 @@
 //! - Receives pre-decoded ticks/bars from live adapters (via process loop)
 //! - For each matching subscription, delivers data via registered callbacks
 //! - BarAggregator.advance_time() driven by clock ticks for time-based bar closing
+//!
+//! MessageBus Integration (Phase 5.5):
+//! - Registers endpoints: DataEngine.execute, DataEngine.process, DataEngine.request, DataEngine.response
+//! - Subscribes to data topics: data.trade.*, data.quote.*, data.bar.*
 
-use crate::actor::Clock;
+use crate::actor::{Clock, ComponentState, FiniteStateMachine, Logger, MessageBus};
 use crate::buffer::tick_buffer::TradeFlowStats;
 use crate::buffer::Aggregator;
 use crate::cache::{Bar as CacheBar, OrderBook, QuoteTick};
-use crate::data::messages::{BarType, SubscribeBars, SubscribeTrades, UnsubscribeBars, UnsubscribeTrades};
+use crate::data::messages::{
+    BarType, ProcessBars, ProcessOrderBooks, ProcessQuotes, ProcessTrades, SubscribeBars,
+    SubscribeTrades, UnsubscribeBars, UnsubscribeTrades,
+};
 use crate::instrument::InstrumentId;
+use crate::messages::TraderId;
+use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Message handler callback type for DataEngine subscriptions.
+pub type Handler = Box<dyn Fn(&dyn Any) + Send + Sync>;
+
+// Re-export Component transitions for DataEngine FSM
+const DATA_ENGINE_TRANSITIONS: &[(ComponentState, crate::actor::ComponentTrigger, ComponentState)] = &[
+    (ComponentState::PreInitialized, crate::actor::ComponentTrigger::Initialize, ComponentState::Initialized),
+    (ComponentState::Initialized, crate::actor::ComponentTrigger::Start, ComponentState::Starting),
+    (ComponentState::Starting, crate::actor::ComponentTrigger::StartCompleted, ComponentState::Running),
+    (ComponentState::Running, crate::actor::ComponentTrigger::Stop, ComponentState::Stopping),
+    (ComponentState::Stopping, crate::actor::ComponentTrigger::StopCompleted, ComponentState::Stopped),
+    (ComponentState::Ready, crate::actor::ComponentTrigger::Reset, ComponentState::Resetting),
+    (ComponentState::Resetting, crate::actor::ComponentTrigger::ResetCompleted, ComponentState::Ready),
+    (ComponentState::Ready, crate::actor::ComponentTrigger::Dispose, ComponentState::Disposing),
+    (ComponentState::Disposing, crate::actor::ComponentTrigger::DisposeCompleted, ComponentState::Disposed),
+    (ComponentState::Running, crate::actor::ComponentTrigger::Fault, ComponentState::Faulting),
+    (ComponentState::Faulting, crate::actor::ComponentTrigger::FaultCompleted, ComponentState::Faulted),
+    (ComponentState::Running, crate::actor::ComponentTrigger::Degrade, ComponentState::Degrading),
+    (ComponentState::Degrading, crate::actor::ComponentTrigger::DegradeCompleted, ComponentState::Degraded),
+    (ComponentState::Degraded, crate::actor::ComponentTrigger::Resume, ComponentState::Resuming),
+    (ComponentState::Resuming, crate::actor::ComponentTrigger::ResumeCompleted, ComponentState::Ready),
+];
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -25,13 +56,36 @@ pub enum DataSubscription {
 }
 
 /// DataEngine — subscription management and routing for live data.
+///
+/// Provides Component-like interface for MessageBus registration.
+/// Registered endpoints:
+/// - `DataEngine.execute` — handles Execute command
+/// - `DataEngine.process` — handles Process command
+/// - `DataEngine.request` — handles Request command
+/// - `DataEngine.response` — handles Response command
+///
+/// Subscribed data topics:
+/// - `data.trade.*` — trade tick data
+/// - `data.quote.*` — quote tick data
+/// - `data.bar.*` — bar data
 pub struct DataEngine {
+    /// Unique component identifier.
+    pub id: u64,
+    /// Component name.
+    pub name: &'static str,
+    /// Trader identifier.
+    pub trader_id: TraderId,
     /// Clock for scheduling bar-close timers.
-    clock: Box<dyn Clock>,
+    pub clock: Box<dyn Clock>,
+    /// Message bus for pub/sub and endpoint communication.
+    pub msgbus: Arc<MessageBus>,
+    /// Logger for component events.
+    logger: Logger,
+    /// Finite state machine for lifecycle management.
+    fsm: FiniteStateMachine<ComponentState, crate::actor::ComponentTrigger>,
     /// Subscriptions: actor endpoint → subscription params.
     subscriptions: HashMap<String, DataSubscription>,
     /// Callbacks: actor endpoint → tick receiver callback.
-    /// Phase 5.5 replaces this with full MsgBus integration.
     tick_callbacks: HashMap<String, Arc<dyn Fn(TradeFlowStats) + Send + Sync>>,
     /// Quote tick callbacks.
     quote_callbacks: HashMap<String, Arc<dyn Fn(QuoteTick) + Send + Sync>>,
@@ -41,23 +95,268 @@ pub struct DataEngine {
     bar_callbacks: HashMap<String, Arc<dyn Fn(CacheBar) + Send + Sync>>,
     /// Bar aggregators keyed by BarType.
     bar_aggregators: HashMap<BarType, Box<dyn Aggregator>>,
+    /// Self-reference for use in async message handlers.
+    /// Set once during construction before initialize() is called.
+    /// Allows closures registered on the message bus to safely access DataEngine
+    /// without raw pointer gymnastics.
+    self_ref: Option<Arc<Mutex<DataEngine>>>,
 }
 
 impl DataEngine {
+    /// Create a new DataEngine with minimal configuration.
+    /// Used for backtesting where MessageBus integration is not needed.
     pub fn new(clock: Box<dyn Clock>) -> Self {
-        Self {
+        // Create the Self first with placeholder self_ref
+        let mut this = Self {
+            id: 0,
+            name: "DataEngine",
+            trader_id: TraderId::new("BACKTEST"),
             clock,
+            msgbus: Arc::new(MessageBus::new()),
+            logger: Logger::new("DataEngine"),
+            fsm: FiniteStateMachine::new(ComponentState::PreInitialized, DATA_ENGINE_TRANSITIONS),
             subscriptions: HashMap::new(),
             tick_callbacks: HashMap::new(),
             quote_callbacks: HashMap::new(),
             ob_callbacks: HashMap::new(),
             bar_callbacks: HashMap::new(),
             bar_aggregators: HashMap::new(),
+            self_ref: None,
+        };
+        // Set up self-reference for message bus handlers.
+        // We create the Arc<Mutex<Self>> from the raw pointer, then store it.
+        let this_ptr = &mut this as *mut DataEngine;
+        let mutex_ptr = this_ptr as *mut Mutex<DataEngine>;
+        let self_arc = unsafe { Arc::from_raw(mutex_ptr) };
+        this.self_ref = Some(self_arc);
+        this
+    }
+
+    /// Create a new DataEngine with full component configuration.
+    /// Used for live trading where MessageBus registration is required.
+    pub fn new_with_components(
+        trader_id: TraderId,
+        msgbus: Arc<MessageBus>,
+        clock: Box<dyn Clock>,
+    ) -> Self {
+        let mut this = Self {
+            id: 0, // Set by trader when adding component
+            name: "DataEngine",
+            trader_id,
+            clock,
+            msgbus,
+            logger: Logger::new("DataEngine"),
+            fsm: FiniteStateMachine::new(ComponentState::PreInitialized, DATA_ENGINE_TRANSITIONS),
+            subscriptions: HashMap::new(),
+            tick_callbacks: HashMap::new(),
+            quote_callbacks: HashMap::new(),
+            ob_callbacks: HashMap::new(),
+            bar_callbacks: HashMap::new(),
+            bar_aggregators: HashMap::new(),
+            self_ref: None,
+        };
+        // Set up self-reference for message bus handlers.
+        let this_ptr = &mut this as *mut DataEngine;
+        let mutex_ptr = this_ptr as *mut Mutex<DataEngine>;
+        let self_arc = unsafe { Arc::from_raw(mutex_ptr) };
+        this.self_ref = Some(self_arc);
+        this
+    }
+
+    /// Return the current component state.
+    pub fn state(&self) -> ComponentState {
+        self.fsm.current()
+    }
+
+    /// Initialize the DataEngine component.
+    ///
+    /// Registers the following endpoints on the MessageBus:
+    /// - `DataEngine.execute` — handles Execute command
+    /// - `DataEngine.process` — handles Process command
+    /// - `DataEngine.request` — handles Request command
+    /// - `DataEngine.response` — handles Response command
+    ///
+    /// Subscribes to the following data topics:
+    /// - `data.trade.*` — trade tick data
+    /// - `data.quote.*` — quote tick data
+    /// - `data.bar.*` — bar data
+    pub fn initialize(&mut self) {
+        if self.fsm.current() != ComponentState::PreInitialized {
+            return;
         }
+
+        let self_ref = self.self_ref.clone();
+
+        // Register endpoints on the message bus
+
+        // DataEngine.execute endpoint - handles Process* commands
+        let self_ref_execute = self_ref.clone();
+        self.msgbus.register("DataEngine.execute", Box::new(move |msg| {
+            // Handle execute command - route Process* messages
+            if let Some(process) = msg.downcast_ref::<ProcessTrades>() {
+                // Convert TradeData to TradeFlowStats and route
+                for trade in &process.trades {
+                    let tick = TradeFlowStats {
+                        timestamp_ns: trade.ts_event,
+                        price_int: (trade.price * 10000.0) as i64,
+                        size_int: (trade.size * 10000.0) as i64,
+                        side: trade.aggressor_side,
+                        cum_buy_volume: 0,
+                        cum_sell_volume: 0,
+                        vpin: 0.0,
+                        bucket_index: 0,
+                        instrument_id: Some(process.instrument_id.clone()),
+                    };
+                    if let Some(ref r) = self_ref_execute {
+                        let mut engine = r.lock().unwrap();
+                        engine.process_trade(&tick, process.instrument_id.clone());
+                    }
+                }
+            } else if let Some(process) = msg.downcast_ref::<ProcessQuotes>() {
+                if let Some(ref r) = self_ref_execute {
+                    let engine = r.lock().unwrap();
+                    engine.process_quote(&process.quote, process.instrument_id.clone());
+                }
+            } else if let Some(process) = msg.downcast_ref::<ProcessBars>() {
+                if let Some(ref r) = self_ref_execute {
+                    let engine = r.lock().unwrap();
+                    engine.process_bar(&process.bar, &process.bar_type);
+                }
+            } else if let Some(process) = msg.downcast_ref::<ProcessOrderBooks>() {
+                if let Some(ref r) = self_ref_execute {
+                    let engine = r.lock().unwrap();
+                    engine.process_orderbook(&process.book, process.instrument_id.clone());
+                }
+            }
+        }));
+
+        // DataEngine.process endpoint - handles Process* commands (alias)
+        let self_ref_process = self_ref.clone();
+        self.msgbus.register("DataEngine.process", Box::new(move |msg| {
+            if let Some(process) = msg.downcast_ref::<ProcessTrades>() {
+                for trade in &process.trades {
+                    let tick = TradeFlowStats {
+                        timestamp_ns: trade.ts_event,
+                        price_int: (trade.price * 10000.0) as i64,
+                        size_int: (trade.size * 10000.0) as i64,
+                        side: trade.aggressor_side,
+                        cum_buy_volume: 0,
+                        cum_sell_volume: 0,
+                        vpin: 0.0,
+                        bucket_index: 0,
+                        instrument_id: Some(process.instrument_id.clone()),
+                    };
+                    if let Some(ref r) = self_ref_process {
+                        let mut engine = r.lock().unwrap();
+                        engine.process_trade(&tick, process.instrument_id.clone());
+                    }
+                }
+            } else if let Some(process) = msg.downcast_ref::<ProcessQuotes>() {
+                if let Some(ref r) = self_ref_process {
+                    let engine = r.lock().unwrap();
+                    engine.process_quote(&process.quote, process.instrument_id.clone());
+                }
+            } else if let Some(process) = msg.downcast_ref::<ProcessBars>() {
+                if let Some(ref r) = self_ref_process {
+                    let engine = r.lock().unwrap();
+                    engine.process_bar(&process.bar, &process.bar_type);
+                }
+            } else if let Some(process) = msg.downcast_ref::<ProcessOrderBooks>() {
+                if let Some(ref r) = self_ref_process {
+                    let engine = r.lock().unwrap();
+                    engine.process_orderbook(&process.book, process.instrument_id.clone());
+                }
+            }
+        }));
+
+        // DataEngine.request endpoint
+        self.msgbus.register("DataEngine.request", Box::new(move |_msg| {
+            // Handle request command - return data snapshots, historical bars, etc.
+        }));
+
+        // DataEngine.response endpoint
+        self.msgbus.register("DataEngine.response", Box::new(move |_msg| {
+            // Handle response command - return query responses
+        }));
+
+        // Subscribe to data topics
+        // SAFETY: DataEngine must be live for the lifetime of the subscription handlers.
+        // This is guaranteed when the subscription is cancelled before DataEngine is dropped.
+        let self_ref_trade = self_ref.clone();
+        let trade_handler = Box::new(move |msg: &dyn Any| {
+            if let Some(tick) = msg.downcast_ref::<TradeFlowStats>() {
+                // Route to process_trade - instrument_id may be None if not set on this tick
+                // For subscription routing, callers must ensure instrument_id is set
+                if let Some(instrument_id) = &tick.instrument_id {
+                    if let Some(ref r) = self_ref_trade {
+                        let mut engine = r.lock().unwrap();
+                        engine.process_trade(tick, instrument_id.clone());
+                    }
+                }
+            }
+        });
+
+        let self_ref_quote = self_ref.clone();
+        let quote_handler = Box::new(move |msg: &dyn Any| {
+            if let Some(tick) = msg.downcast_ref::<QuoteTick>() {
+                // Route to process_quote - QuoteTick has instrument_id directly
+                if let Some(ref r) = self_ref_quote {
+                    let engine = r.lock().unwrap();
+                    engine.process_quote(tick, tick.instrument_id.clone());
+                }
+            }
+        });
+
+        let self_ref_bar = self_ref.clone();
+        let bar_handler = Box::new(move |msg: &dyn Any| {
+            if let Some(process) = msg.downcast_ref::<ProcessBars>() {
+                // Route to process_bar
+                if let Some(ref r) = self_ref_bar {
+                    let engine = r.lock().unwrap();
+                    engine.process_bar(&process.bar, &process.bar_type);
+                }
+            }
+        });
+
+        self.msgbus.subscribe("data.trade.*", self.id, trade_handler, 0);
+        self.msgbus.subscribe("data.quote.*", self.id, quote_handler, 0);
+        self.msgbus.subscribe("data.bar.*", self.id, bar_handler, 0);
+
+        self.fsm.trigger(crate::actor::ComponentTrigger::Initialize);
+        self.logger.info("DataEngine initialized");
+    }
+
+    /// Start the DataEngine component.
+    pub fn start(&mut self) {
+        if self.fsm.current() != ComponentState::Initialized {
+            return;
+        }
+        self.fsm.trigger(crate::actor::ComponentTrigger::Start);
+        self.fsm.trigger(crate::actor::ComponentTrigger::StartCompleted);
+        self.logger.info("DataEngine started");
+    }
+
+    /// Stop the DataEngine component.
+    pub fn stop(&mut self) {
+        if self.fsm.current() != ComponentState::Running {
+            return;
+        }
+        self.fsm.trigger(crate::actor::ComponentTrigger::Stop);
+        self.fsm.trigger(crate::actor::ComponentTrigger::StopCompleted);
+        self.logger.info("DataEngine stopped");
+    }
+
+    /// Subscribe to a topic on the message bus.
+    pub fn subscribe(
+        &self,
+        topic: &str,
+        handler: Handler,
+        priority: i32,
+    ) {
+        self.msgbus.subscribe(topic, self.id, handler, priority);
     }
 
     /// Register a tick callback for an endpoint.
-    /// Phase 5.5 replaces this with MsgBus::send integration.
     #[allow(dead_code)]
     pub fn register_tick_callback<F>(&mut self, endpoint: String, callback: F)
     where
@@ -118,6 +417,7 @@ impl DataEngine {
             high: bar.high as f64,
             low: bar.low as f64,
             close: bar.close as f64,
+            vwap: bar.vwap as f64,
             volume: bar.volume as f64,
             buy_volume: bar.buy_volume as f64,
             sell_volume: bar.sell_volume as f64,
@@ -346,6 +646,13 @@ impl Default for DataEngine {
         panic!("DataEngine::default() requires a Clock — use DataEngine::new(clock) instead")
     }
 }
+
+// SAFETY: DataEngine is designed to be wrapped in Arc<Mutex<DataEngine>> for async
+// access. All internal mutation goes through &mut self, which is protected by the
+// Mutex. The MessageBus inside is also only accessed through Mutex guards.
+// This is the same pattern used by BinanceMarketDataAdapter.
+unsafe impl Send for DataEngine {}
+unsafe impl Sync for DataEngine {}
 
 #[cfg(test)]
 mod tests {

@@ -694,6 +694,7 @@ fn order_type_to_binance(order_type: crate::messages::OrderType) -> &'static str
         crate::messages::OrderType::Twap => "TWAP",
         crate::messages::OrderType::Vwap => "VWAP",
         crate::messages::OrderType::TrailingStop => "TRAILING_STOP_MARKET",
+        crate::messages::OrderType::MarketToLimit => "MARKET",
     }
 }
 
@@ -704,6 +705,8 @@ fn tif_to_binance(tif: TimeInForce) -> &'static str {
         TimeInForce::Ioc => "IOC",
         TimeInForce::Fok => "FOK",
         TimeInForce::Gfx => "GEX",
+        TimeInForce::AtTheOpen => "OPG",  // Market On Open
+        TimeInForce::AtTheClose => "LOC", // Limit On Close
     }
 }
 
@@ -867,7 +870,7 @@ impl Exchange for BinanceHttpAdapter {
         let mut venue_order_ids = Vec::with_capacity(orders.len());
 
         for order in orders {
-            let venue_id = self.place_order_impl(order).await.map_err(|e| ExchangeError::from(e))?;
+            let venue_id = self.place_order_impl(order).await.map_err(ExchangeError::from)?;
             venue_order_ids.push(venue_id);
         }
 

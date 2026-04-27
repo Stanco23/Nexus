@@ -75,7 +75,7 @@ fn generate_synthetic_ticks(n_ticks: usize) -> (std::path::PathBuf, InstrumentId
     use tvc::TvcWriter;
     use tvc::TradeTick;
 
-    let path = std::path::PathBuf::from(format!("/tmp/bench_ticks_{}.tvc", std::process::id()));
+    let path = std::path::PathBuf::from(format!("/tmp/bench_ticks_{}_{}.tvc", std::process::id(), n_ticks));
     let instrument_id = InstrumentId::new("BTCUSDT", "BINANCE");
 
     let mut writer = TvcWriter::new(&path, 1u32, 10, 9).unwrap();
@@ -134,7 +134,7 @@ fn run_benchmark(n_ticks: usize) -> BenchmarkResult {
 
     BenchmarkResult {
         ticks_processed: n_ticks,
-        duration_ns: elapsed.as nanos() as u64,
+        duration_ns: elapsed.as_nanos() as u64,
         final_equity: portfolio.portfolio_equity(),
         total_trades: portfolio.total_trades(),
         max_drawdown: portfolio.portfolio_max_drawdown(),

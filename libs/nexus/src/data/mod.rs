@@ -11,6 +11,6 @@
 
 pub mod messages;
 
-mod engine;
+pub mod engine;
 
 pub use engine::DataEngine;

@@ -5,7 +5,7 @@
 //! - US-004: `get_positions_open`, `get_equity_for_venue`
 //! - US-005: `Cache::snapshot`
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,7 +18,10 @@ pub use crate::buffer::BarType;
 use crate::instrument::{InstrumentId, Venue};
 use crate::instrument::registry::InstrumentRegistry;
 use crate::instrument::Instrument as InstrumentDef;
-use crate::messages::{ClientOrderId, PositionId, StrategyId, VenueOrderId};
+use crate::messages::{
+    ClientId, ClientOrderId, FundingRateUpdate, MarkPriceUpdate, PositionId,
+    StrategyId, VenueOrderId,
+};
 use crate::engine::oms::{OmsOrder, OrderState};
 
 // =============================================================================
@@ -71,6 +74,8 @@ pub struct Bar {
     pub low: f64,
     /// Closing price.
     pub close: f64,
+    /// Volume-weighted average price.
+    pub vwap: f64,
     /// Total volume (buy + sell).
     pub volume: f64,
     /// Volume from buy-side aggressor trades.
@@ -106,7 +111,6 @@ pub use crate::instrument::SyntheticInstrument;
 
 /// Bar type — re-exported from buffer module for cache use.
 /// Uses buffer::BarType which has symbol + venue + spec + aggregation_source.
-
 /// Order book — level 2 bid/ask.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderBook {
@@ -168,6 +172,32 @@ pub struct Cache {
     // Synthetic instruments index — maps underlying symbol to synthetic IDs
     index_synthetics_underlying: HashMap<String, Vec<InstrumentId>>,
 
+    // ─── US-LT-04: Missing critical index maps (live trading) ─────────────────
+    /// All orders (open + closed) — superset of index_orders_open and index_orders_closed
+    #[allow(dead_code)]
+    index_orders: HashSet<ClientOrderId>,
+    /// Orders submitted but not yet accepted by the venue
+    index_orders_inflight: HashSet<ClientOrderId>,
+    /// Orders awaiting cancel confirmation from the venue
+    index_orders_pending_cancel: HashSet<ClientOrderId>,
+    /// Current mark prices per instrument
+    mark_prices: HashMap<InstrumentId, MarkPriceUpdate>,
+    /// Current funding rates per instrument
+    funding_rates: HashMap<InstrumentId, FundingRateUpdate>,
+    /// Reverse lookup: venue order ID -> client order ID
+    index_venue_order_ids: HashMap<VenueOrderId, ClientOrderId>,
+    /// Order -> client/provider mapping
+    index_order_client: HashMap<ClientOrderId, ClientId>,
+    /// Position history snapshots for auditing
+    #[allow(dead_code)]
+    position_snapshots: HashMap<PositionId, Vec<Vec<u8>>>,
+    /// Generic blob store for arbitrary user data keyed by string.
+    general: BTreeMap<String, Vec<u8>>,
+    /// Currency rates or definitions keyed by currency code.
+    currencies: BTreeMap<String, crate::engine::account::Currency>,
+    /// FX rates for cross-currency conversions (code -> rate).
+    fx_rates: HashMap<String, f64>,
+
     #[allow(dead_code)]
     // Capacity
     tick_capacity: usize,
@@ -213,6 +243,18 @@ impl Cache {
             index_positions_open: HashSet::new(),
             index_positions_closed: HashSet::new(),
             index_synthetics_underlying: HashMap::new(),
+            // US-LT-04: Missing critical index maps
+            index_orders: HashSet::new(),
+            index_orders_inflight: HashSet::new(),
+            index_orders_pending_cancel: HashSet::new(),
+            mark_prices: HashMap::new(),
+            funding_rates: HashMap::new(),
+            index_venue_order_ids: HashMap::new(),
+            index_order_client: HashMap::new(),
+            position_snapshots: HashMap::new(),
+            general: BTreeMap::new(),
+            currencies: BTreeMap::new(),
+            fx_rates: HashMap::new(),
             tick_capacity,
             bar_capacity,
             database: None,
@@ -255,6 +297,18 @@ impl Cache {
             index_positions_open: HashSet::new(),
             index_positions_closed: HashSet::new(),
             index_synthetics_underlying: HashMap::new(),
+            // US-LT-04: Missing critical index maps
+            index_orders: HashSet::new(),
+            index_orders_inflight: HashSet::new(),
+            index_orders_pending_cancel: HashSet::new(),
+            mark_prices: HashMap::new(),
+            funding_rates: HashMap::new(),
+            index_venue_order_ids: HashMap::new(),
+            index_order_client: HashMap::new(),
+            position_snapshots: HashMap::new(),
+            general: BTreeMap::new(),
+            currencies: BTreeMap::new(),
+            fx_rates: HashMap::new(),
             tick_capacity: 1000,
             bar_capacity: 1000,
             registry: None,
@@ -613,6 +667,62 @@ impl Cache {
     }
 
     // =============================================================================
+    // Order <-> Position Linking
+    // =============================================================================
+
+    /// Link a client order ID to a position ID for cross-referencing.
+    pub fn link_order_to_position(&mut self, coid: ClientOrderId, posid: PositionId) {
+        self.index_order_position.insert(coid, posid);
+    }
+
+    /// Get the position ID linked to a client order ID.
+    pub fn position_for_order(&self, coid: &ClientOrderId) -> Option<&PositionId> {
+        self.index_order_position.get(coid)
+    }
+
+    // =============================================================================
+    // General Blob Store
+    // =============================================================================
+
+    /// Store arbitrary binary data under a string key.
+    pub fn set_general(&mut self, key: String, value: Vec<u8>) {
+        self.general.insert(key, value);
+    }
+
+    /// Retrieve binary data by string key.
+    pub fn get_general(&self, key: &str) -> Option<&Vec<u8>> {
+        self.general.get(key)
+    }
+
+    // =============================================================================
+    // Currency Store
+    // =============================================================================
+
+    /// Store a currency definition by code.
+    pub fn set_currency(&mut self, code: String, currency: crate::engine::account::Currency) {
+        self.currencies.insert(code, currency);
+    }
+
+    /// Retrieve a currency definition by code.
+    pub fn get_currency(&self, code: &str) -> Option<&crate::engine::account::Currency> {
+        self.currencies.get(code)
+    }
+
+    // =============================================================================
+    // FX Rates
+    // =============================================================================
+
+    /// Set an FX conversion rate for a currency pair code.
+    pub fn set_fx_rate(&mut self, code: String, rate: f64) {
+        self.fx_rates.insert(code, rate);
+    }
+
+    /// Get an FX conversion rate for a currency pair code.
+    pub fn get_fx_rate(&self, code: &str) -> Option<&f64> {
+        self.fx_rates.get(code)
+    }
+
+    // =============================================================================
     // Instrument Registry Integration (Phase 5.0i)
     // =============================================================================
 
@@ -662,24 +772,41 @@ impl Cache {
     pub fn get_synthetics_by_underlying(&self, symbol: &str) -> Vec<InstrumentId> {
         self.index_synthetics_underlying.get(symbol).cloned().unwrap_or_default()
     }
-}
 
-// =============================================================================
-// US-005: Cache Snapshot
-// =============================================================================
+    // =============================================================================
+    // Persistence and State Access (for Trader save/load/check_residuals)
+    // =============================================================================
 
-/// Point-in-time snapshot of cache state.
-///
-/// Serialized for Monte Carlo / Walk-Forward reseeding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheSnapshot {
-    pub orders: HashMap<ClientOrderId, Order>,
-    pub positions: HashMap<PositionId, Position>,
-    pub accounts: HashMap<AccountId, Account>,
-    pub timestamp_ns: u64,
-}
+    /// Get all positions from the cache.
+    pub fn get_all_positions(&self) -> Vec<&Position> {
+        self.positions.values().collect()
+    }
 
-impl Cache {
+    /// Get all orders from the cache.
+    pub fn get_all_orders(&self) -> Vec<&Order> {
+        self.orders.values().collect()
+    }
+
+    /// Get all accounts from the cache.
+    pub fn get_all_accounts(&self) -> Vec<&Account> {
+        self.accounts.values().collect()
+    }
+
+    /// Get open order client_order_ids.
+    pub fn get_open_order_ids(&self) -> Vec<&ClientOrderId> {
+        self.index_orders_open.iter().collect()
+    }
+
+    /// Get open OMS order client_order_ids.
+    pub fn get_open_oms_order_ids(&self) -> Vec<&ClientOrderId> {
+        self.index_oms_orders_open.iter().collect()
+    }
+
+    /// Get open position position_ids.
+    pub fn get_open_position_ids(&self) -> Vec<&PositionId> {
+        self.index_positions_open.iter().collect()
+    }
+
     /// Take a point-in-time snapshot of orders, positions, and accounts.
     ///
     /// Note: `timestamp_ns` is left as 0 — the caller sets it to the
@@ -715,6 +842,21 @@ impl Cache {
 
         snap
     }
+}
+
+// =============================================================================
+// US-005: Cache Snapshot
+// =============================================================================
+
+/// Point-in-time snapshot of cache state.
+///
+/// Serialized for Monte Carlo / Walk-Forward reseeding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheSnapshot {
+    pub orders: HashMap<ClientOrderId, Order>,
+    pub positions: HashMap<PositionId, Position>,
+    pub accounts: HashMap<AccountId, Account>,
+    pub timestamp_ns: u64,
 }
 
 // =============================================================================

@@ -188,6 +188,10 @@ impl OkxHttpAdapter {
             ord_type: String,
             #[serde(rename = "state")]
             state: String,
+            #[serde(rename = "accFillSz", default)]
+            acc_fill_sz: String,
+            #[serde(rename = "fillSz", default)]
+            fill_sz: String,
         }
 
         let response: OkxOrderResponse = self.signed_get("/v5/trade/order", &params).await?;
@@ -210,7 +214,7 @@ impl OkxHttpAdapter {
             symbol: detail.inst_id,
             price: detail.price,
             orig_qty: detail.qty,
-            executed_qty: "0".to_string(),
+            executed_qty: detail.fill_sz,
             status: order_status.to_string(),
             order_type: detail.ord_type,
             side: detail.side,
@@ -245,6 +249,8 @@ impl OkxHttpAdapter {
             ord_type: String,
             #[serde(rename = "state")]
             state: String,
+            #[serde(rename = "accFillSz", default)]
+            acc_fill_sz: String,
         }
 
         let params = serde_json::json!({ "state": "live" });
@@ -261,7 +267,7 @@ impl OkxHttpAdapter {
                 symbol: o.inst_id,
                 price: o.price,
                 orig_qty: o.qty,
-                executed_qty: "0".to_string(),
+                executed_qty: o.acc_fill_sz.clone(),
                 status: o.state,
                 order_type: o.ord_type,
                 side: o.side,

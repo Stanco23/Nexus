@@ -10,7 +10,6 @@
 //! 100-combo sweep wall time < sequential_time / num_cpus × 1.2. Results match sequential baseline.
 
 use crate::buffer::buffer_set::TickBufferSet;
-use crate::engine::Signal;
 use crate::portfolio::{Portfolio, PortfolioConfig, PortfolioStrategy};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -131,7 +130,7 @@ impl SweepRunner {
         combos
             .par_iter()
             .filter_map(|params| {
-                let mut strategy = strategy_factory(params.clone());
+                let strategy = strategy_factory(params.clone());
                 let mut portfolio = Portfolio::new(self.config.initial_equity_per_instrument);
 
                 for instrument_id in self.buffer_set.instrument_ids() {
@@ -154,8 +153,7 @@ impl SweepRunner {
                     let net = realized - commissions;
                     if self.config.initial_equity_per_instrument > 0.0 {
                         (net / (self.config.initial_equity_per_instrument * num_instruments))
-                            .max(-1.0)
-                            .min(1.0)
+                            .clamp(-1.0, 1.0)
                             * self.config.trading_days_per_year.sqrt()
                     } else {
                         0.0

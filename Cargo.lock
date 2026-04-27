@@ -1282,6 +1282,7 @@ dependencies = [
  "memmap2",
  "nalgebra",
  "once_cell",
+ "parking_lot",
  "rand 0.8.5",
  "rayon",
  "reqwest",

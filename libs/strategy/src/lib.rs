@@ -12,7 +12,7 @@ pub mod types;
 pub use actor_wrapper::StrategyAsActor;
 pub use context::StrategyCtx;
 pub use indicators::{
-    Atr, BollingerBands, Ema, Indicator, Macd, Rsi, Sma, Stochastic, Vwap,
+    Atr, Ema, Indicator, Macd, Rsi, Sma, Stochastic, Vwap,
     atr_update, stochastic_update,
 };
 pub use live_strategy::{LiveStrategy, LiveStrategyCtx};

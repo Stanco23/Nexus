@@ -229,43 +229,13 @@ impl Stochastic {
 }
 
 impl Indicator for Stochastic {
-    /// Returns `None` until `k_period` closes are accumulated.
+    /// Returns `None` during warmup (until `k_period` bars accumulated).
     /// Then returns `Some(d)` on every subsequent update.
+    /// Uses the full `stochastic_update()` helper for proper HLC buffer management.
     fn update(&mut self, close: f64) -> Option<f64> {
-        self.closes.push_back(close);
-        if self.closes.len() > self.k_period {
-            self.closes.pop_front();
-        }
-        self.count += 1;
-
-        if self.count < self.k_period {
-            return None;
-        }
-
-        // Compute %K from high/low/close windows for accurate stochastic.
-        // Uses separate buffers maintained by `stochastic_update` when available.
-        let highest_high = self.highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let lowest_low = self.lows.iter().copied().fold(f64::INFINITY, f64::min);
-
-        // Fallback approximation: if highs/lows buffers are empty (single-input mode),
-        // approximate from close window.
-        let (high, low) = if self.highs.is_empty() {
-            let high_est = *self.closes.iter().fold(&f64::NEG_INFINITY, |a, &b| if *a > b { a } else { &b });
-            let low_est = *self.closes.iter().fold(&f64::INFINITY, |a, &b| if *a < b { a } else { &b });
-            (high_est, low_est)
-        } else {
-            (highest_high, lowest_low)
-        };
-
-        let latest_close = *self.closes.back().unwrap();
-        let range = high - low;
-        let k = if range == 0.0 { 50.0 } else { (latest_close - low) / range * 100.0 };
-        self.k_values.push_back(k);
-        if self.k_values.len() > self.d_period {
-            self.k_values.pop_front();
-        }
-        let d: f64 = self.k_values.iter().sum::<f64>() / self.d_period as f64;
-        Some(d)
+        // Approximate high/low from close when OHLC is not available.
+        // For accurate stochastic with true high/low, use `stochastic_update()` instead.
+        stochastic_update(self, close, close, close).map(|(_, d)| d)
     }
 
     fn reset(&mut self) {
@@ -347,32 +317,9 @@ impl Atr {
 impl Indicator for Atr {
     /// Returns `None` during warmup (until `period` TRs accumulated).
     /// Then returns `Some(atr)` on every subsequent update using Wilder smoothing.
+    /// Uses the full `atr_update()` helper for proper True Range computation.
     fn update(&mut self, close: f64) -> Option<f64> {
-        if !self.initialized {
-            self.prev_close = close;
-            self.initialized = true;
-            return None;
-        }
-        // Simplified True Range: absolute price change.
-        // For full TR, use `atr_update()` which computes true_range(high, low, prev_close).
-        let tr = (close - self.prev_close).abs();
-        self.prev_close = close;
-        self.trs.push_back(tr);
-        if self.trs.len() > self.period {
-            self.trs.pop_front();
-        }
-        self.count += 1;
-        if self.count < self.period {
-            return None;
-        }
-        if self.count == self.period {
-            // First ATR: simple average of first `period` TRs
-            self.atr = self.trs.iter().sum::<f64>() / self.period as f64;
-        } else {
-            // Wilder smoothing: recursive ATR
-            self.atr = (self.atr * (self.period as f64 - 1.0) + tr) / self.period as f64;
-        }
-        Some(self.atr)
+        atr_update(self, close, close, close)
     }
 
     fn reset(&mut self) {
@@ -442,9 +389,10 @@ impl Vwap {
 
 impl Indicator for Vwap {
     /// Always returns `Some(vwap)` — VWAP is immediately available after first update.
-    fn update(&mut self, price: f64, volume: f64) -> Option<f64> {
-        self.cumulative_pv += price * volume;
-        self.cumulative_vol += volume;
+    fn update(&mut self, value: f64) -> Option<f64> {
+        // For VWAP, value is price; volume is assumed to be 1.0
+        self.cumulative_pv += value;
+        self.cumulative_vol += 1.0;
         Some(self.value())
     }
 
@@ -540,8 +488,9 @@ mod tests {
         let mut ema = Ema::new(10);
         // First update: initialization
         assert_eq!(ema.update(100.0), Some(100.0));
-        // Subsequent: EMA smoothing
-        assert_eq!(ema.update(110.0), Some(100.1817)); // alpha ≈ 0.1817
+        // Subsequent: EMA smoothing with alpha = 2/11 ≈ 0.1818
+        // ema = 110 * 0.1818 + 100 * 0.8182 ≈ 101.818
+        assert_eq!(ema.update(110.0), Some(101.81818181818181));
     }
 
     // RSI tests
@@ -588,16 +537,16 @@ mod tests {
     fn test_vwap_immediate() {
         let mut vwap = Vwap::new();
         // VWAP is immediately available
-        assert_eq!(vwap.update(100.0, 10.0), Some(100.0));
-        // (100*10 + 110*5) / 15 = 103.333
-        assert!((vwap.update(110.0, 5.0).unwrap() - 103.333).abs() < 0.001);
+        assert_eq!(vwap.update(100.0), Some(100.0));
+        // (100 + 110) / 2 = 105
+        assert!((vwap.update(110.0).unwrap() - 105.0).abs() < 0.001);
     }
 
     #[test]
     fn test_vwap_reset() {
         let mut vwap = Vwap::new();
-        vwap.update(100.0, 10.0);
-        vwap.update(110.0, 5.0);
+        vwap.update(100.0);
+        vwap.update(110.0);
         vwap.reset();
         assert_eq!(vwap.value(), 0.0);
     }

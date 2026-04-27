@@ -28,6 +28,9 @@ pub struct TradeFlowStats {
     pub cum_sell_volume: i64,
     pub vpin: f64,
     pub bucket_index: u32,
+    /// Optional instrument ID for subscription routing in DataEngine.
+    /// Set when created from TickBuffer via from_ring_buffer.
+    pub instrument_id: Option<InstrumentId>,
 }
 
 /// Errors for TickBuffer operations.
@@ -117,6 +120,7 @@ impl TickBuffer {
                 cum_sell_volume: cum_sell,
                 vpin,
                 bucket_index,
+                instrument_id: None, // RingBuffer doesn't store instrument_id directly
             });
 
             if (tick_idx + 1) % bucket_size == 0 {
@@ -230,6 +234,7 @@ mod tests {
             cum_sell_volume: 500,
             vpin: 0.5,
             bucket_index: 0,
+            instrument_id: None,
         };
         assert_eq!(stats.timestamp_ns, 1000000);
         assert_eq!(stats.price_int, 50_000_000_000_i64);

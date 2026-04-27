@@ -187,6 +187,10 @@ impl BybitHttpAdapter {
             order_type: String,
             #[serde(rename = "orderStatus")]
             order_status: String,
+            #[serde(rename = "cumExecQty", default)]
+            cum_exec_qty: String,
+            #[serde(rename = "avgPrice", default)]
+            avg_price: String,
         }
 
         let response: BybitOrderResponse = self.signed_get("/v5/order/realtime", &params).await?;
@@ -198,7 +202,7 @@ impl BybitHttpAdapter {
             symbol: detail.symbol,
             price: detail.price,
             orig_qty: detail.qty,
-            executed_qty: "0".to_string(),
+            executed_qty: detail.cum_exec_qty,
             status: detail.order_status,
             order_type: detail.order_type,
             side: detail.side,

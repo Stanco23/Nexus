@@ -196,27 +196,40 @@ impl OrderEmulator {
 
     /// Compute fill probability for an order at a given queue position.
     ///
-    /// `P(fill) = 1 / (1 + queue_position * 0.1)` scaled by volume ratio.
+    /// With true book-based matching, fill probability is 1.0 when the book can
+    /// satisfy the order (price crosses spread and has sufficient liquidity),
+    /// and 0.0 otherwise. This replaces the probabilistic model.
     #[allow(dead_code)]
-    pub fn fill_probability(&self, queue_position: u64, market_volume: f64) -> f64 {
-        let base_prob = 1.0 / (1.0 + queue_position as f64 * 0.1);
-        let volume_ratio = (market_volume / self.avg_market_volume).clamp(0.1, 2.0);
-        (base_prob * volume_ratio).min(1.0)
+    pub fn fill_probability(&self, _queue_position: u64, _market_volume: f64) -> f64 {
+        // With true book matching, probability is binary:
+        // - 1.0 if book can fill (price crossed + liquidity available)
+        // - 0.0 if not (price hasn't crossed or no liquidity)
+        // The actual fill check is done in process_fills which verifies
+        // both price crossing AND book liquidity.
+        1.0
     }
 
-    /// Compute fill event for a queued order (no mutable self borrow).
+    /// Compute fill event for a queued order using true book-based matching.
+    ///
+    /// Uses price-time priority: earlier orders at the same price level fill first.
+    /// A limit order fills when:
+    /// - BUY: market price drops to or below the limit price (can fill at bid)
+    /// - SELL: market price rises to or above the limit price (can fill at ask)
+    ///
+    /// Returns Some(FillEvent) if price has crossed AND book has liquidity.
+    /// Returns None if price hasn't crossed OR book cannot satisfy the order.
     #[allow(clippy::too_many_arguments)]
     fn compute_fill_event(
         qo: &QueuedOrder,
         current_price: f64,
-        market_volume: f64,
         vpin: f64,
         timestamp_ns: u64,
         slippage_config: &SlippageConfig,
         avg_market_volume: f64,
         maker_fee: f64,
+        book: &OrderBook,
     ) -> Option<FillEvent> {
-        // Check price crossing before fill probability:
+        // Check price crossing:
         // - BUY limit: fills when market price drops to or below the limit price
         //   (I want to buy at P or better — lower is better for buyer)
         // - SELL limit: fills when market price rises to or above the limit price
@@ -229,30 +242,46 @@ impl OrderEmulator {
             return None;
         }
 
-        let prob = {
-            let base_prob = 1.0 / (1.0 + qo.queue_position as f64 * 0.1);
-            let volume_ratio = (market_volume / avg_market_volume).clamp(0.1, 2.0);
-            (base_prob * volume_ratio).min(1.0)
-        };
-
-        if prob < 0.5 {
+        // Check if book has liquidity at this price level (price-time priority)
+        // Walk the book to see if we can actually fill
+        let fills = book.walk_book(qo.remaining_size, qo.side);
+        if fills.is_empty() {
+            // No liquidity in the book to fill this order
             return None;
         }
 
-        let order_size_ticks = (qo.remaining_size / avg_market_volume).max(1.0);
+        // Sum up available liquidity at the touching price
+        // For a BUY order, we walk the asks (take liquidity)
+        // For a SELL order, we walk the bids (take liquidity)
+        let mut total_available: f64 = 0.0;
+        for fill in &fills {
+            total_available += fill.size_filled;
+        }
+
+        // If book doesn't have enough liquidity, this is a partial fill scenario
+        // For limit orders, we only fill what the book can provide at the limit price
+        let fill_size = total_available.min(qo.remaining_size);
+        if fill_size <= 0.0 {
+            return None;
+        }
+
+        // Compute slippage based on fill size relative to market
+        let order_size_ticks = (fill_size / avg_market_volume).max(1.0);
         let avg_tick_duration_ns = 1_000_000; // 1ms average tick duration
         let delay_ns = slippage_config.compute_fill_delay(order_size_ticks, vpin, avg_tick_duration_ns);
         let impact_bps = slippage_config.compute_impact_bps(order_size_ticks, vpin);
 
+        // Fill price is the market price with slippage applied
+        // For a BUY, we pay more; for a SELL, we receive less
         let fill_price = current_price * (1.0 + impact_bps / 10000.0);
-        let fee = qo.remaining_size * maker_fee;
+        let fee = fill_size * maker_fee;
 
         Some(FillEvent {
             order_id: qo.order_id,
             side: qo.side,
             fill_price,
-            fill_size: qo.remaining_size,
-            remaining_size: 0.0, // limit orders fully fill in emulator
+            fill_size,
+            remaining_size: qo.remaining_size - fill_size,
             queue_position: qo.queue_position,
             vpin,
             slippage_bps: impact_bps,
@@ -265,6 +294,7 @@ impl OrderEmulator {
 
     /// Check and process fills for all pending limit orders at current market price.
     ///
+    /// Uses true book-based matching with price-time priority.
     /// Returns filled orders and their fill events.
     pub fn process_fills(
         &mut self,
@@ -272,21 +302,20 @@ impl OrderEmulator {
         vpin: f64,
         timestamp_ns: u64,
         maker_fee: f64,
+        book: &OrderBook,
     ) -> Vec<FillEvent> {
-        let market_volume = self.avg_market_volume;
-
         // First pass: collect order IDs that should fill (uses static method, no borrow conflict)
         let mut to_fill: Vec<(OrderId, FillEvent)> = Vec::new();
         for qo in &self.pending {
             if let Some(event) = Self::compute_fill_event(
                 qo,
                 current_price,
-                market_volume,
                 vpin,
                 timestamp_ns,
                 &self.slippage_config,
                 self.avg_market_volume,
                 maker_fee,
+                book,
             ) {
                 to_fill.push((qo.order_id, event));
             }
@@ -790,24 +819,26 @@ mod tests {
     #[test]
     fn test_order_emulator_fill_probability() {
         let emulator = OrderEmulator::new();
-        // At position 0, high probability
+        // With true book-based matching, fill_probability returns 1.0
+        // (actual fill check is done via book matching in process_fills)
         let p0 = emulator.fill_probability(0, 1.0);
-        // At position 5, lower probability
         let p5 = emulator.fill_probability(5, 1.0);
-        assert!(p0 > p5);
+        assert_eq!(p0, 1.0);
+        assert_eq!(p5, 1.0);
     }
 
     #[test]
     fn test_order_emulator_filled_log() {
         let mut emulator = OrderEmulator::new();
+        let mut book = OrderBook::new();
         emulator.update_market_volume(10.0);
         emulator.submit_limit(100.0, 1.0, Side::Buy, 1000);
 
-        // Simulate fills — with prob < 0.5 check, may not fill deterministically
-        // in test environment. Just verify structure.
-        let fills = emulator.process_fills(100.0, 0.0, 2000, 0.0);
-        // Without seeded randomness, this is deterministic — prob >= 0.5 should fill
-        assert_eq!(emulator.filled_log().len(), fills.len());
+        // With book-based matching, limit order at 100 fills when price <= 100
+        // But the book is empty, so no fill occurs
+        let fills = emulator.process_fills(100.0, 0.0, 2000, 0.0, &book);
+        assert!(fills.is_empty());
+        assert_eq!(emulator.filled_log().len(), 0);
     }
 
     #[test]
@@ -839,6 +870,7 @@ mod tests {
             cum_sell_volume: 50,
             vpin: 0.0,
             bucket_index: 0,
+            instrument_id: None,
         };
         book.update_from_trade(&buy_tick);
 
@@ -856,6 +888,7 @@ mod tests {
             cum_sell_volume: 50,
             vpin: 0.0,
             bucket_index: 0,
+            instrument_id: None,
         };
         book.update_from_trade(&sell_tick);
 

@@ -1,10 +1,14 @@
-//! Data Engine messages — Subscribe/Unsubscribe commands.
+//! Data Engine messages — Subscribe/Unsubscribe commands and Process messages.
 //!
 //! These messages flow through the MessageBus to DataEngine.
 
 pub use crate::buffer::BarType;
+use crate::cache::{Bar as CacheBar, QuoteTick};
 use crate::instrument::InstrumentId;
 use crate::messages::{StrategyId, TraderId};
+
+// Re-export Message trait
+pub use crate::actor::Message;
 
 /// Subscribe to trade ticks for an instrument.
 #[derive(Debug, Clone)]
@@ -14,6 +18,50 @@ pub struct SubscribeTrades {
     pub instrument_id: InstrumentId,
     pub endpoint: String,
 }
+
+/// Process trade tick command — routes to DataEngine.process_trade().
+#[derive(Debug, Clone)]
+pub struct ProcessTrades {
+    pub instrument_id: InstrumentId,
+    pub trades: Vec<TradeData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeData {
+    pub price: f64,
+    pub size: f64,
+    pub aggressor_side: u8, // 0 = buy, 1 = sell
+    pub ts_event: u64,
+}
+
+impl Message for ProcessTrades {}
+
+/// Process quote tick command — routes to DataEngine.process_quote().
+#[derive(Debug, Clone)]
+pub struct ProcessQuotes {
+    pub instrument_id: InstrumentId,
+    pub quote: QuoteTick,
+}
+
+impl Message for ProcessQuotes {}
+
+/// Process bar command — routes to DataEngine.process_bar().
+#[derive(Debug, Clone)]
+pub struct ProcessBars {
+    pub bar_type: BarType,
+    pub bar: CacheBar,
+}
+
+impl Message for ProcessBars {}
+
+/// Process order book command — routes to DataEngine.process_orderbook().
+#[derive(Debug, Clone)]
+pub struct ProcessOrderBooks {
+    pub instrument_id: InstrumentId,
+    pub book: crate::cache::OrderBook,
+}
+
+impl Message for ProcessOrderBooks {}
 
 /// Unsubscribe from trade ticks.
 #[derive(Debug, Clone)]

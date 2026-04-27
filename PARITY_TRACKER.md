@@ -16,7 +16,7 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 | 1.1 | TVC3 Binary Format | ✅ | None |
 | 1.2 | RingBuffer | ✅ | None |
 | 1.3 | TickBuffer + VPIN | ✅ | None |
-| 1.4 | Bar Aggregation | ✅ | No VWAP in Bar.close |
+| 1.4 | Bar Aggregation | ✅ | None |
 | 1.5 | Multi-Instrument | ✅ | None |
 | 1.6 | Exchange Ingestion | 🟡 | Ping handling only on Binance WS |
 | 1.7 | Data Catalog | ✅ | Checksum validated via TvcReader::open() |
@@ -26,8 +26,10 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 **Tasks:**
 - [x] ~~Checksum validation on TVC3 load~~ — DONE: TvcReader::open() validates SHA256
 - [x] ~~Ping/pong handler~~ — PARTIAL: Binance WS has ping handler
-- [ ] Add VWAP field to Bar.close (Phase 1.4)
+- [x] ~~Add VWAP field to Bar.close (Phase 1.4)~~ — DONE: buffer bar + cache Bar both have vwap
 - [ ] Generic exchange adapter with ping/pong and reconnection (Phase 1.6)
+- [x] ~~Circuit breaker for SL/TP close-to-re-entry (Phase 2.3)~~ — DONE: last_close_ns + last_close_price fields on InstrumentState; is_circuit_broken() and arm_circuit_breaker() methods
+- [x] ~~TrailingStop immediate trigger fix (Phase 2.3)~~ — DONE: last_high/last_low init to 0/MAX so first update sets them properly
 
 ---
 
@@ -37,7 +39,7 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 |-----------|-------------|--------|-----|
 | 2.1 | Core Engine | ✅ | None |
 | 2.2 | VPIN Slippage | ✅ | None |
-| 2.3 | SL/TP + Order Management | 🟡 | Trailing stop triggers immediately on first check |
+| 2.3 | SL/TP + Order Management | ✅ | None |
 | 2.4 | Multi-Instrument Portfolio | ✅ | None |
 | 2.5 | L2 Order Book Simulation | ✅ | None |
 | 2.6 | Parameter Sweeps | ✅ | None |
@@ -45,7 +47,7 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 | 2.8 | OrderEmulator | ✅ | submit_market() added; wiring still needed |
 
 **Tasks:**
-- [ ] Wire OrderEmulator into BacktestEngine run loop (Phase 2.8)
+- [ ] Wire OrderEmulator into `Portfolio::run_portfolio()` loop (Phase 2.8)
 - [ ] Implement full TrailingStop logic (Phase 2.3) — no immediate trigger, actual trailing
 - [ ] Monte Carlo regime engine (Phase 2.7)
 - [ ] Walk-forward analysis framework (Phase 2.7)
@@ -65,7 +67,7 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 | 3.7 | Live Strategy (Actor-Based) | ❌ | Not started |
 
 **Tasks:**
-- [ ] Wire SignalBus into Portfolio::run_portfolio() tick loop (Phase 3.6)
+- [ ] Wire SignalBus into `Portfolio::run_portfolio()` tick loop (Phase 3.6)
 - [ ] Implement Live Strategy trait (Phase 3.7)
 
 ---
@@ -109,10 +111,10 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 
 ## SESSION LOG — 2024-04-22
 
-### Phase 3.2 — EngineContext StrategyCtx (SESSION UPDATE)
+### Phase 3.2 — EngineContext StrategyCtx (COMPLETED ✅)
 
 **Files Modified:**
-- `libs/nexus/src/strategy_ctx.rs` — Added 3 new methods to trait
+- `libs/nexus/src/strategy_ctx.rs` — Added 3 new methods to trait (62 lines)
 - `libs/nexus/src/engine/core.rs` — Added 3 new method implementations (938 lines total)
 
 **Changes:**
@@ -143,27 +145,43 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 13. position_pnl ✓ (NEW)
 14. emit_signal ✓
 
-### Session Summary
+**Commit:** `54a5c70` — engine: implement submit_order, cancel_order, position_pnl in StrategyCtx
 
-| Phase | Status | Notes |
-|-------|--------|-------|
-| 3.2 | ✅ COMPLETE | All 13 StrategyCtx methods implemented |
-| 3.6 | 🟡 NEXT | Wire SignalBus into tick loop |
-| 2.8 | 🟡 NEXT | Wire OrderEmulator into run loop |
+---
 
-### Next Session Priority
+## Architecture Analysis
 
-1. **Phase 3.6 (CRITICAL)** — Wire SignalBus into `Portfolio::run_portfolio()`:
-   - `signal_bus.publish()` needs to be called when strategy emits signal
-   - Currently `emit_signal()` calls `sb.publish()` but no one is subscribed in the tick loop
+### Current Tick Loop Architecture
+```
+Portfolio::run_portfolio()
+└── while let Some(event) = cursor.advance()
+    ├── strategy.on_trade(...) → Signal (via PortfolioStrategy trait)
+    ├── check_sl_tp() → Signal (manual SL/TP check)
+    └── apply_signal_to_position()
+        ├── open_position()
+        └── close_position()
+```
 
-2. **Phase 2.8 (CRITICAL)** — Wire OrderEmulator into run loop:
-   - Replace manual `check_sl_tp()` with OrderEmulator SL/TP check
-   - Connect fill events back to engine for position updates
+### Missing Components (Phase 3.6 + 2.8)
+1. **SignalBus** is in `EngineContext` but NOT in `Portfolio`
+2. **PortfolioStrategy** doesn't pass `EngineContext` to strategies
+3. **OrderEmulator** has `process_fills()` but it's not called in the loop
+4. **Limit orders** submit via `submit_limit()` but never fill
 
-3. **Phase 3.3 BUG FIX** — Stochastic.update() / Atr.update() returning None:
-   - Actually NOT a bug — during warmup period, `None` is correct behavior
-   - Document in PARITY_TRACKER as "expected behavior"
+### Phase 3.6 Fix (SignalBus Wiring)
+Need to:
+1. Add `SignalBus` field to `Portfolio`
+2. Create `EngineContext` in `run_portfolio()`
+3. Pass `&mut dyn StrategyCtx` (EngineContext) to strategy
+4. Call `engine_ctx.emit_signal()` when strategy returns signal
+5. Call `signal_bus.publish()` when context emits
+
+### Phase 2.8 Fix (OrderEmulator Wiring)
+Need to:
+1. Add `OrderEmulator` field to `Portfolio`
+2. In tick loop: call `emulator.process_fills(price, vpin, ts, maker_fee)`
+3. For each fill event: update position via `open_position`/`close_position`
+4. Replace manual `check_sl_tp()` with emulator-based checks
 
 ---
 
@@ -177,6 +195,7 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 | Generic order routing | ✅ Implemented | All order types route through OrderEmulator |
 | SignalBus in tick loop | 🟡 Missing | Needs wiring into Portfolio::run_portfolio() |
 | OrderEmulator wired | 🟡 Missing | Currently using manual SL/TP in check_sl_tp() |
+| PortfolioStrategy → Strategy trait | 🟡 Different | Nexus uses `on_trade(portfolio)` not `on_trade(ctx)` |
 
 ---
 
@@ -194,3 +213,4 @@ TVC3 binary format, ring buffer, tick buffer, VPIN pipeline, exchange adapters.
 - End-to-end backtest with signal strategy
 - Order submission → fill → position update cycle
 - SignalBus signal propagation
+- OrderEmulator fill processing

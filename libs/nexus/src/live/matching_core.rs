@@ -4,9 +4,9 @@
 //! price-level processing, and event callbacks. This module provides a correct implementation
 //! for paper trading where local matching is needed.
 
-use crate::book::{OrderBook, LevelFill, Side as BookSide};
+use crate::book::Side as BookSide;
 use crate::instrument::InstrumentId;
-use crate::messages::{OrderFilled, OrderSide, TradeId};
+use crate::messages::OrderSide;
 use std::collections::{BTreeMap, HashMap};
 
 /// A resting order in the matching engine.
@@ -57,7 +57,7 @@ impl BookOrder {
     }
 
     /// Check if order is fully filled.
-    pub fn isFilled(&self) -> bool {
+    pub fn is_filled(&self) -> bool {
         self.remaining <= 0.0
     }
 }
@@ -140,6 +140,7 @@ pub struct MatchingCore {
     /// VPIN for slippage calculation
     vpin: f64,
     /// Slippage config
+    #[allow(dead_code)]
     maker_fee: f64,
     taker_fee: f64,
 }
@@ -192,6 +193,7 @@ impl MatchingCore {
     }
 
     /// Submit a limit order. Returns fills if immediate match.
+    /// If `post_only` is true, reject if order would cross the spread.
     pub fn submit_limit(
         &mut self,
         client_order_id: String,
@@ -199,6 +201,7 @@ impl MatchingCore {
         price: f64,
         size: f64,
         ts_init: u64,
+        post_only: bool,
     ) -> Vec<MatchResult> {
         let order_id = self.next_order_id;
         self.next_order_id += 1;
@@ -211,6 +214,12 @@ impl MatchingCore {
 
         // Check if this limit order crosses the spread (immediate fill)
         let would_fills = self.would_fill_limit(price, size, book_side);
+
+        // Post-only: reject if order would cross the spread
+        if post_only && !would_fills.is_empty() {
+            return vec![];
+        }
+
         if !would_fills.is_empty() {
             // Immediate fill — order doesn't rest
             return self.execute_market_like(order_id, client_order_id, side, price, size, ts_init);
@@ -228,8 +237,27 @@ impl MatchingCore {
         self.orders.insert(order_id, order);
 
         // Check if it immediately crosses at-touch or better price
-        let fills = self.check_limit_fill(order_id, price, size, book_side, ts_init);
-        fills
+        
+        self.check_limit_fill(order_id, price, size, book_side, ts_init)
+    }
+
+    /// Submit a Market-To-Limit order.
+    /// Converts to a limit order at the last trade price when triggered.
+    pub fn submit_market_to_limit(
+        &mut self,
+        client_order_id: String,
+        side: OrderSide,
+        size: f64,
+        ts_init: u64,
+    ) -> Vec<MatchResult> {
+        let limit_price = if self.last_price > 0.0 {
+            self.last_price
+        } else if let Some(mid) = self.mid_price() {
+            mid
+        } else {
+            return self.submit_market(client_order_id, side, size, ts_init);
+        };
+        self.submit_limit(client_order_id, side, limit_price, size, ts_init, false)
     }
 
     /// Submit a market order. Walks the book for liquidity.
@@ -243,7 +271,7 @@ impl MatchingCore {
         let order_id = self.next_order_id;
         self.next_order_id += 1;
 
-        let book_side = match side {
+        let _book_side = match side {
             OrderSide::Buy => BookSide::Buy,
             OrderSide::Sell => BookSide::Sell,
         };
@@ -295,10 +323,10 @@ impl MatchingCore {
     /// Execute a market-like order (fully taking liquidity).
     fn execute_market_like(
         &mut self,
-        order_id: u64,
-        client_order_id: String,
+        _order_id: u64,
+        _client_order_id: String,
         side: OrderSide,
-        reference_price: f64,
+        _reference_price: f64,
         size: f64,
         ts_init: u64,
     ) -> Vec<MatchResult> {
@@ -331,7 +359,7 @@ impl MatchingCore {
                 if let Some(order) = self.orders.get_mut(&oid) {
                     let filled_qty = order.fill(remaining);
                     let fill_price = level_price; // Maker's price
-                    let fee = filled_qty * self.taker_fee;
+                    let _fee = filled_qty * self.taker_fee;
 
                     remaining -= filled_qty;
 
@@ -348,7 +376,7 @@ impl MatchingCore {
                     });
 
                     // Remove if fully filled
-                    if order.isFilled() {
+                    if order.is_filled() {
                         self.orders.remove(&oid);
                         // Level will be cleaned up after iteration
                     }
@@ -368,18 +396,18 @@ impl MatchingCore {
     /// were submitted but may cross due to subsequent price moves).
     fn check_limit_fill(
         &mut self,
-        order_id: u64,
+        _order_id: u64,
         _price: f64,
         _size: f64,
         side: BookSide,
-        ts_init: u64,
+        _ts_init: u64,
     ) -> Vec<MatchResult> {
         // For a resting limit order, check if market moved to cross it.
         // This is called when a new order is added to see if it immediately fills.
         // In practice, a properly submitted limit order that crosses should not rest.
         // This method handles edge cases where the order was already in the book
         // and market moved.
-        let mut fills = Vec::new();
+        let fills = Vec::new();
 
         match side {
             BookSide::Buy => {
@@ -424,8 +452,8 @@ mod tests {
     fn test_matching_core_best_bid_ask() {
         let mut core = MatchingCore::new(instr(), 0.001, 0.001);
 
-        core.submit_limit("c1".into(), OrderSide::Buy, 99.0, 1.0, 1000);
-        core.submit_limit("c2".into(), OrderSide::Sell, 101.0, 1.0, 1001);
+        core.submit_limit("c1".into(), OrderSide::Buy, 99.0, 1.0, 1000, false);
+        core.submit_limit("c2".into(), OrderSide::Sell, 101.0, 1.0, 1001, false);
 
         assert_eq!(core.best_bid(), Some(99.0));
         assert_eq!(core.best_ask(), Some(101.0));
@@ -437,10 +465,10 @@ mod tests {
         let mut core = MatchingCore::new(instr(), 0.001, 0.001);
 
         // Sell at 101, buy at 100 — should not immediately fill
-        let fills = core.submit_limit("sell1".into(), OrderSide::Sell, 101.0, 1.0, 1000);
+        let fills = core.submit_limit("sell1".into(), OrderSide::Sell, 101.0, 1.0, 1000, false);
         assert!(fills.is_empty(), "Limit sell at 101 should rest when bid is 100");
 
-        let fills2 = core.submit_limit("buy1".into(), OrderSide::Buy, 100.0, 1.0, 1001);
+        let fills2 = core.submit_limit("buy1".into(), OrderSide::Buy, 100.0, 1.0, 1001, false);
         assert!(fills2.is_empty(), "Limit buy at 100 should rest when ask is 101");
 
         assert_eq!(core.num_resting(), 2);
@@ -451,8 +479,8 @@ mod tests {
         let mut core = MatchingCore::new(instr(), 0.001, 0.001);
 
         // Set up some liquidity
-        core.submit_limit("s1".into(), OrderSide::Sell, 100.0, 5.0, 1000);
-        core.submit_limit("s2".into(), OrderSide::Sell, 101.0, 5.0, 1001);
+        core.submit_limit("s1".into(), OrderSide::Sell, 100.0, 5.0, 1000, false);
+        core.submit_limit("s2".into(), OrderSide::Sell, 101.0, 5.0, 1001, false);
 
         // Market buy should walk the book
         core.update_market(100.5, 0.0, 1.0);
@@ -468,11 +496,11 @@ mod tests {
         let mut core = MatchingCore::new(instr(), 0.001, 0.001);
 
         // Set up best bid at 99
-        core.submit_limit("b1".into(), OrderSide::Buy, 99.0, 5.0, 1000);
+        core.submit_limit("b1".into(), OrderSide::Buy, 99.0, 5.0, 1000, false);
 
         // Sell limit at 98 — crosses spread (98 <= 99), should immediately fill
         core.update_market(99.5, 0.0, 1.0);
-        let fills = core.submit_limit("s1".into(), OrderSide::Sell, 98.0, 2.0, 2000);
+        let fills = core.submit_limit("s1".into(), OrderSide::Sell, 98.0, 2.0, 2000, false);
 
         assert!(!fills.is_empty(), "Sell at 98 should immediately fill against bid at 99");
         assert_eq!(fills[0].fill_price, 99.0); // Gets bid price
@@ -483,7 +511,7 @@ mod tests {
     fn test_cancel_order() {
         let mut core = MatchingCore::new(instr(), 0.001, 0.001);
 
-        let fills = core.submit_limit("b1".into(), OrderSide::Buy, 99.0, 5.0, 1000);
+        let fills = core.submit_limit("b1".into(), OrderSide::Buy, 99.0, 5.0, 1000, false);
         assert!(fills.is_empty());
 
         // The order is resting — find its ID (it's the first order, ID = 1)
@@ -497,8 +525,8 @@ mod tests {
         let mut core = MatchingCore::new(instr(), 0.001, 0.001);
 
         // Two sell orders at same price, different times
-        core.submit_limit("s1".into(), OrderSide::Sell, 100.0, 2.0, 1000);
-        core.submit_limit("s2".into(), OrderSide::Sell, 100.0, 3.0, 1001);
+        core.submit_limit("s1".into(), OrderSide::Sell, 100.0, 2.0, 1000, false);
+        core.submit_limit("s2".into(), OrderSide::Sell, 100.0, 3.0, 1001, false);
 
         // Buy market order takes 3.0 — should fill s1 first (earlier)
         let fills = core.submit_market("m1".into(), OrderSide::Buy, 3.0, 2000);
@@ -515,7 +543,7 @@ mod tests {
     fn test_filled_order_removed_from_book() {
         let mut core = MatchingCore::new(instr(), 0.001, 0.001);
 
-        core.submit_limit("s1".into(), OrderSide::Sell, 100.0, 2.0, 1000);
+        core.submit_limit("s1".into(), OrderSide::Sell, 100.0, 2.0, 1000, false);
         assert_eq!(core.num_resting(), 1);
 
         // Buy exactly 2.0 — should fully fill s1

@@ -94,6 +94,10 @@ impl Actor for StrategyAsActor {
         self.actor.component()
     }
 
+    fn component_mut(&mut self) -> &mut Component {
+        self.actor.component_mut()
+    }
+
     fn trader_id(&self) -> &str {
         self.actor.trader_id()
     }
@@ -371,6 +375,7 @@ mod tests {
             high: 101.0,
             low: 99.0,
             close: 100.5,
+            vwap: 100.5, // single-tick bar: vwap equals close
             volume: 100.0,
             buy_volume: 60.0,
             sell_volume: 40.0,

@@ -14,12 +14,16 @@
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::cache::{OrderBook, QuoteTick};
+use crate::data::DataEngine;
 use crate::instrument::instrument_id::fnv1a_hash;
+use crate::instrument::InstrumentId;
 use crate::live::exchange::{
     MarketDataAdapter, MarketDataMessage, NormalizedTrade, WsError,
 };
@@ -64,7 +68,11 @@ pub struct BybitMarketDataAdapter {
     /// Set of active trade subscriptions (e.g. `trade.BTCUSDT`).
     active_subscriptions: Vec<String>,
     /// Running message ID counter for subscribe/unsubscribe ops.
+    #[allow(dead_code)]
     msg_id: u64,
+    /// Data engine for routing quote ticks and order book updates.
+    /// US-LT-03: Wired to route parsed market data to DataEngine.
+    data_engine: Arc<Mutex<DataEngine>>,
 }
 
 impl BybitMarketDataAdapter {
@@ -72,7 +80,8 @@ impl BybitMarketDataAdapter {
     ///
     /// `ws_url` — base WebSocket URL, e.g. `wss://stream.bybit.com/v5/public/spot`
     ///             for spot or `wss://stream.bybit.com/v5/public/linear` for linear.
-    pub fn new(ws_url: &str) -> Self {
+    /// `data_engine` — DataEngine for routing quote ticks and order book updates (US-LT-03).
+    pub fn new(ws_url: &str, data_engine: Arc<Mutex<DataEngine>>) -> Self {
         Self {
             ws_url: ws_url.to_string(),
             send_tx: None,
@@ -80,6 +89,7 @@ impl BybitMarketDataAdapter {
             connected: false,
             active_subscriptions: Vec::new(),
             msg_id: 0,
+            data_engine,
         }
     }
 
@@ -102,12 +112,13 @@ impl MarketDataAdapter for BybitMarketDataAdapter {
         let (send_tx, send_rx) = mpsc::channel::<AdapterCommand>(32);
         let (recv_tx, recv_rx) = mpsc::channel::<MarketDataMessage>(64);
         let ws_url = self.ws_url.clone();
+        let data_engine = Arc::clone(&self.data_engine);
         let active_subscriptions = std::sync::Arc::new(tokio::sync::Mutex::new(
             std::mem::take(&mut self.active_subscriptions),
         ));
 
         tokio::spawn(async move {
-            Self::receive_loop(ws_url, send_rx, recv_tx, active_subscriptions).await;
+            Self::receive_loop(ws_url, send_rx, recv_tx, active_subscriptions, data_engine).await;
         });
 
         self.send_tx = Some(send_tx);
@@ -186,6 +197,7 @@ impl BybitMarketDataAdapter {
         mut send_rx: mpsc::Receiver<AdapterCommand>,
         recv_tx: mpsc::Sender<MarketDataMessage>,
         active_subscriptions: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+        data_engine: Arc<Mutex<DataEngine>>,
     ) {
         let mut attempts: u32 = 0;
 
@@ -195,6 +207,7 @@ impl BybitMarketDataAdapter {
                 &mut send_rx,
                 &recv_tx,
                 &active_subscriptions,
+                Arc::clone(&data_engine),
             )
             .await
             {
@@ -226,6 +239,7 @@ impl BybitMarketDataAdapter {
         send_rx: &mut mpsc::Receiver<AdapterCommand>,
         recv_tx: &mpsc::Sender<MarketDataMessage>,
         active_subscriptions: &std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+        data_engine: Arc<Mutex<DataEngine>>,
     ) -> Result<(), WsError> {
         let (ws_stream, _) = connect_async(ws_url)
             .await
@@ -253,6 +267,8 @@ impl BybitMarketDataAdapter {
                                     if let Some(data_msg) = Self::parse_message(&text) {
                                         let _ = recv_tx.send(data_msg).await;
                                     }
+                                    // US-LT-03: Route quote/orderbook to DataEngine
+                                    Self::route_to_data_engine(&text, &data_engine);
                                 }
                                 Message::Binary(data) => {
                                     // Bybit sends binary ping frames
@@ -416,6 +432,79 @@ impl BybitMarketDataAdapter {
             trade_id,
         })
     }
+
+    /// Route quote and orderbook messages to DataEngine (US-LT-03).
+    fn route_to_data_engine(raw: &str, data_engine: &Arc<Mutex<DataEngine>>) {
+        let json: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let topic = match json.get("topic").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return,
+        };
+
+        let data = match json.get("data") {
+            Some(d) => d,
+            None => return,
+        };
+
+        let symbol_part = topic.strip_prefix("orderbook.").or_else(|| topic.strip_prefix("ticker.")).and_then(|s| s.split('.').next_back());
+        let instrument_id = match symbol_part {
+            Some(s) => InstrumentId::new(s, "BYBIT"),
+            None => return,
+        };
+        let ts_event = json.get("ts").and_then(|v| v.as_u64()).unwrap_or(0) * 1_000_000;
+
+        if topic.starts_with("orderbook.") {
+            // Bybit orderbook snapshot
+            let bids: Vec<(f64, f64)> = data.get("b").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|b| {
+                    let price = b[0].as_str().and_then(|s| s.parse().ok())?;
+                    let size = b[1].as_str().and_then(|s| s.parse().ok())?;
+                    Some((price, size))
+                }).collect()
+            }).unwrap_or_default();
+
+            let asks: Vec<(f64, f64)> = data.get("a").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|a| {
+                    let price = a[0].as_str().and_then(|s| s.parse().ok())?;
+                    let size = a[1].as_str().and_then(|s| s.parse().ok())?;
+                    Some((price, size))
+                }).collect()
+            }).unwrap_or_default();
+
+            let book = OrderBook {
+                instrument_id: instrument_id.clone(),
+                bids,
+                asks,
+                ts_event,
+            };
+
+            if let Ok(engine) = data_engine.lock() {
+                engine.process_orderbook(&book, instrument_id.clone());
+            }
+        } else if topic.starts_with("ticker.") {
+            // Bybit ticker (quote-like)
+            let last_price = data.get("last_price").and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
+            let quote = QuoteTick {
+                ts_event,
+                ts_init: ts_event,
+                bid_price: last_price * 0.9999,
+                ask_price: last_price * 1.0001,
+                bid_size: 0.0,
+                ask_size: 0.0,
+                instrument_id: instrument_id.clone(),
+            };
+
+            if let Ok(engine) = data_engine.lock() {
+                engine.process_quote(&quote, instrument_id);
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -521,7 +610,9 @@ mod tests {
 
     #[test]
     fn test_adapter_creation() {
-        let adapter = BybitMarketDataAdapter::new("wss://stream.bybit.com/v5/public/spot");
+        let clock = Box::new(crate::actor::TestClock::new());
+        let engine = crate::data::DataEngine::new(clock);
+        let adapter = BybitMarketDataAdapter::new("wss://stream.bybit.com/v5/public/spot", Arc::new(Mutex::new(engine)));
         assert!(!adapter.is_connected());
     }
 

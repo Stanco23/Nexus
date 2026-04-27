@@ -4,7 +4,7 @@
 //! trading action), `NamedSignal` carries arbitrary data e.g., "RSI_OVERSOLD", "BB_LOW".
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 /// Callback type for signal notifications: (signal_name, value, timestamp_ns).
 pub type SignalCallback = Box<dyn Fn(&str, f64, u64) + Send + Sync>;

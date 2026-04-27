@@ -179,6 +179,7 @@ impl PaperBroker {
                     self.order_book.vpin,
                     ts,
                     self.maker_fee,
+                    &self.order_book,
                 );
                 let mut results = Vec::new();
                 for fill in fills {
@@ -229,6 +230,7 @@ impl PaperBroker {
             self.order_book.vpin,
             tick.timestamp_ns,
             self.maker_fee,
+            &self.order_book,
         );
 
         for fill in fills {

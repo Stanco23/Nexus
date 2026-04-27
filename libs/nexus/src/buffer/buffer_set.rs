@@ -283,7 +283,7 @@ impl<'a> MergeCursor<'a> {
         let mut iterators = Vec::new();
 
         for instrument_id in buffer_set.instrument_ids() {
-            if let Some(tb) = buffer_set.get(&instrument_id) {
+            if let Some(tb) = buffer_set.get(instrument_id) {
                 iterators.push(MergeState {
                     instrument_id: instrument_id.clone(),
                     buffer: tb,

@@ -333,6 +333,7 @@ pub struct Bar {
     pub high: i64,
     pub low: i64,
     pub close: i64,
+    pub vwap: i64,              // volume-weighted average price (nanounits)
     pub volume: i64,
     pub buy_volume: i64,
     pub sell_volume: i64,
@@ -362,6 +363,9 @@ pub struct BarBuilder {
     volume: i64,
     buy_volume: i64,
     sell_volume: i64,
+    /// Running sum of price * volume for VWAP computation.
+    /// Stored as floating point to avoid overflow; values are in (price-unit * volume-unit).
+    vwap_sum: f64,
 }
 
 impl BarBuilder {
@@ -380,6 +384,7 @@ impl BarBuilder {
             volume: 0,
             buy_volume: 0,
             sell_volume: 0,
+            vwap_sum: 0.0,
         }
     }
 
@@ -407,6 +412,10 @@ impl BarBuilder {
             }
         }
 
+        // Accumulate price * volume for VWAP.
+        // price and size are in nanounits (price = dollars * 1e9, size = units * 1e9).
+        // Convert to float dollars and float units before multiplying.
+        self.vwap_sum += (price as f64 / 1e9) * (size as f64 / 1e9);
         self.volume += size;
     }
 
@@ -435,6 +444,9 @@ impl BarBuilder {
         }
 
         self.close = Some(bar.close);
+        // Accumulate bar's price*volume into running sum for VWAP.
+        // bar.vwap is in nanounits, bar.volume is in nanounits — convert before multiplying.
+        self.vwap_sum += (bar.vwap as f64 / 1e9) * (bar.volume as f64 / 1e9);
         self.volume += bar.volume;
         self.buy_volume += bar.buy_volume;
         self.sell_volume += bar.sell_volume;
@@ -453,6 +465,7 @@ impl BarBuilder {
         self.volume = 0;
         self.buy_volume = 0;
         self.sell_volume = 0;
+        self.vwap_sum = 0.0;
     }
 
     /// Build a bar with the given ts_event.
@@ -463,6 +476,14 @@ impl BarBuilder {
         let low = self.low.unwrap_or_else(|| self.last_close.unwrap_or(0));
         let close = self.close.unwrap_or_else(|| self.last_close.unwrap_or(0));
 
+        // Compute VWAP: vwap_sum is in (dollar * unit), volume is in nanounits.
+        // VWAP (nanounits) = (vwap_sum / (volume / 1e9)) * 1e9 = (vwap_sum * 1e9) / volume.
+        let vwap = if self.volume > 0 {
+            (self.vwap_sum * 1e9 / (self.volume as f64 / 1e9)) as i64
+        } else {
+            close // No volume — use close as proxy
+        };
+
         let bar = Bar {
             ts_event,
             ts_init,
@@ -471,6 +492,7 @@ impl BarBuilder {
             high,
             low,
             close,
+            vwap,
             volume: self.volume,
             buy_volume: self.buy_volume,
             sell_volume: self.sell_volume,
@@ -589,6 +611,7 @@ impl TimeBarAggregator {
             high: tick.price_int,
             low: tick.price_int,
             close: tick.price_int,
+            vwap: tick.price_int, // single-tick bar: vwap = price
             volume,
             buy_volume: buy_vol,
             sell_volume: sell_vol,
@@ -622,6 +645,7 @@ impl TimeBarAggregator {
             cum_sell_volume: 0,
             vpin: 0.0,
             bucket_index: 0,
+            instrument_id: None,
         };
         self.update(&tick)
     }
@@ -833,7 +857,7 @@ impl ValueBarAggregator {
             let bars_to_close = self.cum_value / self.step as i128;
             if bars_to_close >= 1 {
                 let bar = self.builder.build_now();
-                self.cum_value = self.cum_value % self.step as i128;
+                self.cum_value %= self.step as i128;
                 return Some(bar);
             }
             None

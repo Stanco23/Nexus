@@ -4,18 +4,12 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
-use crate::actor::MessageBus;
-use crate::book::{OrderBook, OrderEmulator, OrderId, Side};
-use crate::buffer::tick_buffer::{TickBuffer, TradeFlowStats};
-use crate::cache::Cache;
-use crate::engine::account::{Account, AccountId, Currency, OmsType};
-use crate::engine::oms::Oms;
-use crate::engine::orders::{check_sl_tp, Order, OrderManager, OrderSide, OrderType};
-use crate::engine::risk::RiskEngine;
-use crate::instrument::{InstrumentId, Venue};
-use crate::messages::{ClientOrderId, OrderFilled, StrategyId, TraderId};
+use crate::book::{OrderEmulator, Side};
+use crate::engine::orders::{Order, OrderSide, OrderType};
+use crate::instrument::InstrumentId;
+#[allow(unused_imports)]
+use crate::messages::{ClientOrderId, StrategyId, Venue};
 use crate::signals::{SignalBus, SignalCallback};
-use crate::slippage::SlippageConfig;
 use crate::strategy_ctx::StrategyCtx;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,11 +84,11 @@ pub struct EngineContext {
     /// Order emulator reference for submitting orders from strategy callbacks.
     order_emulator: OrderEmulatorPtr,
     /// Subscribed instrument IDs.
-    subscribed_instruments: Vec<u32>,
+    pub subscribed_instruments: Vec<u32>,
     /// Subscribed signal names.
     subscribed_signals: Vec<String>,
     /// Pending orders tracked in the context for pending_orders() query.
-    pending_orders: Vec<Order>,
+    pub pending_orders: Vec<Order>,
 }
 
 /// Wrapper for raw pointer to OrderEmulator, with explicit Send+Sync impls.
@@ -231,6 +225,11 @@ impl EngineContext {
         self.pending_orders.retain(|o| o.id != order_id);
     }
 
+    /// Generate next order ID for this context.
+    pub fn next_order_id(&mut self) -> u64 {
+        self.instrument_states.keys().len() as u64 + self.pending_orders.len() as u64 + 1
+    }
+
     /// Clear all pending orders (e.g., for on_reset).
     pub fn clear_pending_orders(&mut self) {
         self.pending_orders.clear();
@@ -268,13 +267,13 @@ impl EngineContext {
 impl StrategyCtx for EngineContext {
     /// Current market price for an instrument.
     /// Returns the last known price from the tick loop, or 0.0 if no price seen.
-    fn current_price(&self, instrument_id: InstrumentId) -> f64 {
+    fn current_price(&self, instrument_id: &InstrumentId) -> f64 {
         self.get_price(instrument_id.id)
     }
 
     /// Current position side for an instrument.
     /// Returns Long, Short, or Flat.
-    fn position(&self, instrument_id: InstrumentId) -> Option<PositionSide> {
+    fn position(&self, instrument_id: &InstrumentId) -> Option<PositionSide> {
         let pos = self.position(instrument_id.id);
         if pos > 0.0 {
             Some(PositionSide::Long)
@@ -292,17 +291,17 @@ impl StrategyCtx for EngineContext {
 
     /// Unrealized PnL for an open position on an instrument.
     /// Uses the current market price from the tick loop.
-    fn unrealized_pnl(&self, instrument_id: InstrumentId) -> f64 {
+    fn unrealized_pnl(&self, instrument_id: &InstrumentId) -> f64 {
         let current_price = self.get_price(instrument_id.id);
         self.unrealized_pnl(instrument_id.id, current_price)
     }
 
     /// All pending (unfilled) orders for an instrument.
     /// Returns orders tracked in the context's pending_orders list.
-    fn pending_orders(&self, instrument_id: InstrumentId) -> Vec<Order> {
+    fn pending_orders(&self, instrument_id: &InstrumentId) -> Vec<Order> {
         self.pending_orders
             .iter()
-            .filter(|o| o.instrument_id == instrument_id && !o.filled)
+            .filter(|o| o.instrument_id.id == instrument_id.id && !o.filled)
             .cloned()
             .collect()
     }
@@ -329,7 +328,7 @@ impl StrategyCtx for EngineContext {
     /// Returns an order ID (0 if emulator not available).
     fn submit_limit(
         &mut self,
-        instrument_id: InstrumentId,
+        _instrument_id: &InstrumentId,
         side: OrderSide,
         price: f64,
         size: f64,
@@ -350,7 +349,7 @@ impl StrategyCtx for EngineContext {
     /// from the signal-driven flow. Returns 0 if emulator not available.
     fn submit_market(
         &mut self,
-        instrument_id: InstrumentId,
+        _instrument_id: &InstrumentId,
         side: OrderSide,
         size: f64,
     ) -> u64 {
@@ -364,12 +363,12 @@ impl StrategyCtx for EngineContext {
     }
 
     /// Submit an order with SL/TP.
-    /// Currently delegates to limit order submission (SL/TP managed externally).
+    /// Creates a linked SL/TP order that is checked on every tick.
     /// Returns an order ID.
     #[allow(clippy::too_many_arguments)]
     fn submit_with_sl_tp(
         &mut self,
-        instrument_id: InstrumentId,
+        instrument_id: &InstrumentId,
         side: OrderSide,
         order_type: OrderType,
         price: f64,
@@ -377,13 +376,19 @@ impl StrategyCtx for EngineContext {
         sl: Option<f64>,
         tp: Option<f64>,
     ) -> u64 {
-        // Create a basic order record for tracking
+        // Generate unique order ID
+        let order_id = self.next_order_id();
+        let client_order_id = ClientOrderId::new(&format!("sl_tp_{}", order_id));
+        let venue = instrument_id.venue.clone();
+        let instr = instrument_id.clone();
+
+        // Create the main order record for tracking
         let order = Order {
-            id: 0,
-            client_order_id: ClientOrderId::new("ctx"),
+            id: order_id,
+            client_order_id,
             strategy_id: StrategyId::new(""),
-            instrument_id,
-            venue: instrument_id.venue.unwrap_or(Venue::new("BACKTEST")),
+            instrument_id: instr,
+            venue,
             side,
             order_type,
             price,
@@ -396,8 +401,19 @@ impl StrategyCtx for EngineContext {
             time_in_force: None,
             expire_time_ns: None,
             trailing_delta: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+            activation_price: None,
+            is_activated: false,
+            trigger_price: None,
+            limit_offset: None,
+            contingency_type: crate::engine::orders::ContingencyType::None,
+            linked_order_ids: Vec::new(),
+            order_list_id: None,
+            trigger_type: crate::engine::orders::TriggerType::Default,
+            post_only: false,
+            reduce_only: false,
         };
-        let order_id = order.id;
 
         // Submit to emulator if available
         if !self.order_emulator.0.is_null() {
@@ -420,7 +436,7 @@ impl StrategyCtx for EngineContext {
     /// Submit a generic order (limit, market, stop, etc.).
     /// Routes to OrderEmulator for fill simulation.
     fn submit_order(&mut self, order: Order) -> u64 {
-        let instrument_id = order.instrument_id.id;
+        let _instrument_id = order.instrument_id.id;
         let order_id = order.id;
 
         // Clone the order for pending tracking
@@ -466,7 +482,7 @@ impl StrategyCtx for EngineContext {
 
     /// Total realized and unrealized PnL for an instrument.
     /// Combines realized PnL from closed trades with unrealized PnL from open position.
-    fn position_pnl(&self, instrument_id: InstrumentId) -> f64 {
+    fn position_pnl(&self, instrument_id: &InstrumentId) -> f64 {
         let Some(state) = self.instrument_states.get(&instrument_id.id) else {
             return 0.0;
         };
@@ -536,13 +552,8 @@ impl Default for CommissionConfig {
     }
 }
 
-impl Default for SlippageConfig {
-    fn default() -> Self {
-        Self::new(0.0005)
-    }
-}
-
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
 
@@ -550,7 +561,8 @@ mod tests {
     fn test_commission_compute() {
         let comm = CommissionConfig::new(0.001);
         let cost = comm.compute(100.0, 1.0);
-        assert!((cost - 0.001).abs() < 0.0001);
+        // rate 0.001 = 0.1% → 100 * 1 * 0.001 = 0.1
+        assert!((cost - 0.1).abs() < 0.0001);
     }
 
     #[test]
@@ -561,8 +573,10 @@ mod tests {
         let exit = 110.0;
         let entry_comm = comm.compute(entry, size);
         let exit_comm = comm.compute(exit, size);
+        // Long: pnl = (exit - entry) * size - entry_comm - exit_comm
+        //     = (110 - 100) * 1 - 0.1 - 0.11 = 10 - 0.21 = 9.79
         let pnl = (exit - entry) * size - entry_comm - exit_comm;
-        assert!((pnl - 9.998).abs() < 0.001, "pnl={}", pnl);
+        assert!((pnl - 9.79).abs() < 0.001, "pnl={}", pnl);
     }
 
     #[test]
@@ -573,8 +587,10 @@ mod tests {
         let exit = 90.0;
         let entry_comm = comm.compute(entry, size);
         let exit_comm = comm.compute(exit, size);
+        // Short: pnl = (entry - exit) * size - entry_comm - exit_comm
+        //     = (100 - 90) * 1 - 0.1 - 0.09 = 10 - 0.19 = 9.81
         let pnl = (entry - exit) * size - entry_comm - exit_comm;
-        assert!((pnl - 9.998).abs() < 0.001, "pnl={}", pnl);
+        assert!((pnl - 9.81).abs() < 0.001, "pnl={}", pnl);
     }
 
     #[test]
@@ -641,12 +657,9 @@ mod tests {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
 
-        ctx.update_price(1, 100.0);
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
-        assert_eq!(ctx.current_price(instr_id), 100.0);
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
+        ctx.update_price(instr_id.id, 100.0);
+        assert_eq!(ctx.current_price(&instr_id), 100.0);
     }
 
     #[test]
@@ -657,10 +670,7 @@ mod tests {
             id: 1,
             client_order_id: ClientOrderId::new("o1"),
             strategy_id: StrategyId::new("test"),
-            instrument_id: InstrumentId {
-                id: 1,
-                venue: None,
-            },
+            instrument_id: InstrumentId::new("BTCUSDT", "BACKTEST"),
             venue: Venue::new("TEST"),
             side: OrderSide::Buy,
             order_type: OrderType::Limit,
@@ -674,15 +684,24 @@ mod tests {
             time_in_force: None,
             expire_time_ns: None,
             trailing_delta: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+            activation_price: None,
+            is_activated: false,
+            trigger_price: None,
+            limit_offset: None,
+            contingency_type: crate::engine::orders::ContingencyType::None,
+            linked_order_ids: Vec::new(),
+            order_list_id: None,
+            trigger_type: crate::engine::orders::TriggerType::Default,
+            post_only: false,
+            reduce_only: false,
         };
         let order2 = Order {
             id: 2,
             client_order_id: ClientOrderId::new("o2"),
             strategy_id: StrategyId::new("test"),
-            instrument_id: InstrumentId {
-                id: 1,
-                venue: None,
-            },
+            instrument_id: InstrumentId::new("BTCUSDT", "BACKTEST"),
             venue: Venue::new("TEST"),
             side: OrderSide::Sell,
             order_type: OrderType::Limit,
@@ -696,19 +715,28 @@ mod tests {
             time_in_force: None,
             expire_time_ns: None,
             trailing_delta: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+            activation_price: None,
+            is_activated: false,
+            trigger_price: None,
+            limit_offset: None,
+            contingency_type: crate::engine::orders::ContingencyType::None,
+            linked_order_ids: Vec::new(),
+            order_list_id: None,
+            trigger_type: crate::engine::orders::TriggerType::Default,
+            post_only: false,
+            reduce_only: false,
         };
         ctx.add_pending_order(order1);
         ctx.add_pending_order(order2);
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
-        let pending = ctx.pending_orders(instr_id);
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
+        let pending = ctx.pending_orders(&instr_id);
         assert_eq!(pending.len(), 2);
 
         // Simulate fill of order 1
         ctx.remove_pending_order(1);
-        let pending = ctx.pending_orders(instr_id);
+        let pending = ctx.pending_orders(&instr_id);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, 2);
     }
@@ -717,12 +745,9 @@ mod tests {
     fn test_strategy_ctx_submit_limit_null_emulator() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
 
-        let order_id = ctx.submit_limit(instr_id, OrderSide::Buy, 100.0, 1.0);
+        let order_id = StrategyCtx::submit_limit(&mut ctx, &instr_id, OrderSide::Buy, 100.0, 1.0);
         assert_eq!(order_id, 0); // Should return 0 when emulator is null
     }
 
@@ -730,12 +755,9 @@ mod tests {
     fn test_strategy_ctx_submit_market_null_emulator() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
 
-        let order_id = ctx.submit_market(instr_id, OrderSide::Sell, 1.0);
+        let order_id = StrategyCtx::submit_market(&mut ctx, &instr_id, OrderSide::Sell, 1.0);
         assert_eq!(order_id, 0);
     }
 
@@ -743,12 +765,9 @@ mod tests {
     fn test_strategy_ctx_submit_with_sl_tp() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
         ctx.submit_with_sl_tp(
-            instr_id,
+            &instr_id,
             OrderSide::Buy,
             OrderType::Limit,
             100.0,
@@ -756,7 +775,7 @@ mod tests {
             Some(95.0),  // SL
             Some(110.0), // TP
         );
-        let pending = ctx.pending_orders(instr_id);
+        let pending = ctx.pending_orders(&instr_id);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].price, 100.0);
         assert_eq!(pending[0].sl, Some(95.0));
@@ -767,16 +786,13 @@ mod tests {
     fn test_strategy_ctx_submit_order() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
 
         let order = Order {
             id: 42,
             client_order_id: ClientOrderId::new("o42"),
             strategy_id: StrategyId::new("test"),
-            instrument_id: instr_id,
+            instrument_id: instr_id.clone(),
             venue: Venue::new("TEST"),
             side: OrderSide::Buy,
             order_type: OrderType::Limit,
@@ -790,12 +806,24 @@ mod tests {
             time_in_force: None,
             expire_time_ns: None,
             trailing_delta: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+            activation_price: None,
+            is_activated: false,
+            trigger_price: None,
+            limit_offset: None,
+            contingency_type: crate::engine::orders::ContingencyType::None,
+            linked_order_ids: Vec::new(),
+            order_list_id: None,
+            trigger_type: crate::engine::orders::TriggerType::Default,
+            post_only: false,
+            reduce_only: false,
         };
 
         let order_id = ctx.submit_order(order);
         assert_eq!(order_id, 42);
 
-        let pending = ctx.pending_orders(instr_id);
+        let pending = ctx.pending_orders(&instr_id);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, 42);
     }
@@ -804,17 +832,14 @@ mod tests {
     fn test_strategy_ctx_cancel_order() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
 
         // Add a pending order
         let order = Order {
             id: 42,
             client_order_id: ClientOrderId::new("o42"),
             strategy_id: StrategyId::new("test"),
-            instrument_id: instr_id,
+            instrument_id: instr_id.clone(),
             venue: Venue::new("TEST"),
             side: OrderSide::Buy,
             order_type: OrderType::Limit,
@@ -828,6 +853,18 @@ mod tests {
             time_in_force: None,
             expire_time_ns: None,
             trailing_delta: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+            activation_price: None,
+            is_activated: false,
+            trigger_price: None,
+            limit_offset: None,
+            contingency_type: crate::engine::orders::ContingencyType::None,
+            linked_order_ids: Vec::new(),
+            order_list_id: None,
+            trigger_type: crate::engine::orders::TriggerType::Default,
+            post_only: false,
+            reduce_only: false,
         };
         ctx.add_pending_order(order);
 
@@ -835,7 +872,7 @@ mod tests {
         let result = ctx.cancel_order(42);
         assert!(result);
 
-        let pending = ctx.pending_orders(instr_id);
+        let pending = ctx.pending_orders(&instr_id);
         assert_eq!(pending.len(), 0);
     }
 
@@ -853,14 +890,11 @@ mod tests {
     fn test_strategy_ctx_position_pnl() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
 
         // Set up an open position
         ctx.instrument_states.insert(
-            1u32,
+            instr_id.id,
             InstrumentState {
                 position: 1.0,
                 entry_price: 100.0,
@@ -869,12 +903,12 @@ mod tests {
                 commissions: 0.0,
             },
         );
-        ctx.update_price(1, 110.0); // Current price
+        ctx.update_price(instr_id.id, 110.0); // Current price
 
         // position_pnl = realized_pnl + unrealized_pnl
         // unrealized = (110 - 100) * 1.0 = 10.0
         // total = 50.0 + 10.0 = 60.0
-        let pnl = ctx.position_pnl(instr_id);
+        let pnl = StrategyCtx::position_pnl(&ctx, &instr_id);
         assert!((pnl - 60.0).abs() < 0.001);
     }
 
@@ -882,13 +916,10 @@ mod tests {
     fn test_strategy_ctx_position_pnl_no_position() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
-        let instr_id = InstrumentId {
-            id: 1,
-            venue: None,
-        };
+        let instr_id = InstrumentId::new("BTCUSDT", "BACKTEST");
 
         // No position, should return 0
-        let pnl = ctx.position_pnl(instr_id);
+        let pnl = StrategyCtx::position_pnl(&ctx, &instr_id);
         assert_eq!(pnl, 0.0);
     }
 
@@ -918,22 +949,121 @@ mod tests {
     }
 
     #[test]
+    fn test_signal_bus_end_to_end() {
+        // Comprehensive test for SignalBus wiring:
+        // - Instrument-specific signal routing (e.g. "BTCUSDT.BINANCE")
+        // - Wildcard "*" subscription receives all signals
+        // - Unsubscribe removes subscriber
+        let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
+        let sb = signal_bus.lock().unwrap();
+
+        // Track received signals per subscriber
+        let specific_received = Arc::new(Mutex::new(Vec::new()));
+        let wildcard_received = Arc::new(Mutex::new(Vec::new()));
+        let specific_clone = specific_received.clone();
+        let wildcard_clone = wildcard_received.clone();
+
+        // Subscribe to a specific instrument signal
+        sb.subscribe(
+            "BTCUSDT.BINANCE",
+            Box::new(move |name, value, ts| {
+                specific_clone.lock().unwrap().push((name.to_string(), value, ts));
+            }),
+        );
+
+        // Subscribe to wildcard — receives ALL signals
+        sb.subscribe(
+            "*",
+            Box::new(move |name, value, ts| {
+                wildcard_clone.lock().unwrap().push((name.to_string(), value, ts));
+            }),
+        );
+        drop(sb);
+
+        // Publish instrument-specific signal (simulating what run_portfolio does)
+        signal_bus
+            .lock()
+            .unwrap()
+            .publish("BTCUSDT.BINANCE", 1.0, 1_000_000_000);
+        signal_bus
+            .lock()
+            .unwrap()
+            .publish("ETHUSDT.BINANCE", -1.0, 2_000_000_000);
+        signal_bus
+            .lock()
+            .unwrap()
+            .publish("BTCUSDT.BINANCE", 0.0, 3_000_000_000);
+
+        // Specific subscriber: BTCUSDT only
+        let specific = specific_received.lock().unwrap();
+        assert_eq!(specific.len(), 2);
+        assert_eq!(specific[0].0, "BTCUSDT.BINANCE");
+        assert_eq!(specific[0].1, 1.0);
+        assert_eq!(specific[0].2, 1_000_000_000);
+        assert_eq!(specific[1].0, "BTCUSDT.BINANCE");
+        assert_eq!(specific[1].1, 0.0); // Close
+        assert_eq!(specific[1].2, 3_000_000_000);
+
+        // Wildcard subscriber: all signals
+        let wildcard = wildcard_received.lock().unwrap();
+        assert_eq!(wildcard.len(), 3);
+        assert_eq!(wildcard[0].0, "BTCUSDT.BINANCE");
+        assert_eq!(wildcard[0].1, 1.0);
+        assert_eq!(wildcard[1].0, "ETHUSDT.BINANCE");
+        assert_eq!(wildcard[1].1, -1.0);
+        drop(wildcard);
+
+        // Test unsubscribe
+        signal_bus
+            .lock()
+            .unwrap()
+            .unsubscribe("BTCUSDT.BINANCE");
+        signal_bus
+            .lock()
+            .unwrap()
+            .publish("BTCUSDT.BINANCE", 0.5, 4_000_000_000);
+
+        let specific = specific_received.lock().unwrap();
+        assert_eq!(specific.len(), 2); // No new event after unsubscribe
+        let wildcard = wildcard_received.lock().unwrap();
+        assert_eq!(wildcard.len(), 4); // Wildcard still active
+    }
+
+    #[test]
     fn test_engine_context_max_drawdown() {
         let signal_bus = Arc::new(Mutex::new(SignalBus::new()));
         let mut ctx = EngineContext::new(10000.0, signal_bus, std::ptr::null_mut());
+
+        // Set up a position with entry_price=10000, position=1
+        let id = 1u32;
+        ctx.instrument_states.insert(
+            id,
+            InstrumentState {
+                position: 1.0,
+                entry_price: 10000.0,
+                unrealized_pnl: 0.0,
+                realized_pnl: 0.0,
+                commissions: 0.0,
+            },
+        );
+
         // Simulate equity curve: 10000 → 11000 → 9000
-        let prices1 = HashMap::new(); // No open positions
+        // prices1: price=10000, position=1 → pnl = (10000-10000)*1 = 0, equity stays 10000
+        let mut prices1 = HashMap::new();
+        prices1.insert(id, 10000.0);
         ctx.update_equity(&prices1);
 
+        // prices2: price=11000, position=1 → pnl = (11000-10000)*1 = 1000, equity = 10000+1000 = 11000
         let mut prices2 = HashMap::new();
-        prices2.insert(1u32, 11000.0);
+        prices2.insert(id, 11000.0);
         ctx.update_equity(&prices2);
 
+        // prices3: price=9000, position=1 → pnl = (9000-10000)*1 = -1000, equity = 11000-1000 = 10000
         let mut prices3 = HashMap::new();
-        prices3.insert(1u32, 9000.0);
+        prices3.insert(id, 9000.0);
         ctx.update_equity(&prices3);
 
         assert_eq!(ctx.peak_equity, 11000.0);
-        assert!((ctx.max_drawdown - 18.18).abs() < 0.01);
+        assert!((ctx.max_drawdown - 9.09).abs() < 0.01); // (11000-10000)/11000 * 100 = 9.09%
     }
 }

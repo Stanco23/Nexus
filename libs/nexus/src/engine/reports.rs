@@ -4,6 +4,49 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::account::AccountId;
+use crate::messages::{TradeId, VenueOrderId};
+
+/// Liquidity side — whether the fill came from a maker or taker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiquiditySide {
+    Maker,
+    Taker,
+}
+
+/// Order status report — represents a current order state snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderStatusReport {
+    pub client_order_id: String,
+    pub venue_order_id: VenueOrderId,
+    pub account_id: AccountId,
+    pub instrument_id: String,
+    pub side: String,
+    pub order_type: String,
+    pub size: f64,
+    pub filled_qty: f64,
+    pub avg_fill_price: f64,
+    pub status: String,
+    pub venue: String,
+    pub timestamp_ns: u64,
+}
+
+/// Position status report — represents a current position state snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionStatusReport {
+    pub position_id: String,
+    pub account_id: AccountId,
+    pub instrument_id: String,
+    pub side: String,
+    pub quantity: f64,
+    pub avg_fill_price: f64,
+    pub unrealized_pnl: f64,
+    pub realized_pnl: f64,
+    pub commission: f64,
+    pub venue: String,
+    pub timestamp_ns: u64,
+}
+
 /// Commission side — maker or taker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommissionSide {
@@ -62,6 +105,10 @@ pub struct FillReport {
     pub queue_position: Option<u32>,
     pub vpin_at_fill: Option<f64>,
     pub latency_ns: Option<u64>,
+    pub account_id: AccountId,
+    pub trade_id: TradeId,
+    pub venue_order_id: VenueOrderId,
+    pub liquidity_side: LiquiditySide,
 }
 
 impl FillReport {
@@ -77,6 +124,10 @@ impl FillReport {
         fill_price: f64,
         market_price: f64,
         commission: Commission,
+        account_id: AccountId,
+        trade_id: TradeId,
+        venue_order_id: VenueOrderId,
+        liquidity_side: LiquiditySide,
     ) -> Self {
         let slippage_bps = (fill_price - market_price).abs() / market_price * 10000.0;
         Self {
@@ -94,6 +145,10 @@ impl FillReport {
             queue_position: None,
             vpin_at_fill: None,
             latency_ns: None,
+            account_id,
+            trade_id,
+            venue_order_id,
+            liquidity_side,
         }
     }
 
@@ -205,6 +260,10 @@ mod tests {
             50_050.0,
             50_000.0,
             commission,
+            AccountId::new("ACC-001"),
+            TradeId::new("TRADE-001"),
+            VenueOrderId::new("VENUE-001"),
+            LiquiditySide::Taker,
         );
         // slippage = |50050 - 50000| / 50000 * 10000 = 50/50000*10000 = 10 bps
         assert!((fill.slippage_bps - 10.0).abs() < 0.01);
@@ -224,6 +283,10 @@ mod tests {
             50_000.0,
             50_000.0,
             commission,
+            AccountId::new("ACC-001"),
+            TradeId::new("TRADE-001"),
+            VenueOrderId::new("VENUE-001"),
+            LiquiditySide::Taker,
         );
         // commission = 50000 * 1.0 * 0.0006 = 30
         // effective_price = 50000 + 30/1 = 50030
@@ -244,6 +307,10 @@ mod tests {
             50_000.0,
             50_000.0,
             commission,
+            AccountId::new("ACC-001"),
+            TradeId::new("TRADE-001"),
+            VenueOrderId::new("VENUE-001"),
+            LiquiditySide::Taker,
         );
         // effective_price = 50000 - 30 = 49970
         assert!((fill.effective_price() - 49_970.0).abs() < 0.01);
@@ -282,6 +349,10 @@ mod tests {
             50_000.0,
             50_000.0,
             commission,
+            AccountId::new("ACC-001"),
+            TradeId::new("TRADE-001"),
+            VenueOrderId::new("VENUE-001"),
+            LiquiditySide::Taker,
         );
         report.add_fill(fill);
         assert_eq!(report.total_filled, 0.5);
@@ -312,6 +383,10 @@ mod tests {
             50_000.0,
             50_000.0,
             commission,
+            AccountId::new("ACC-001"),
+            TradeId::new("TRADE-001"),
+            VenueOrderId::new("VENUE-001"),
+            LiquiditySide::Taker,
         );
         report.add_fill(fill);
         report.finalize(2_000_000_000);
@@ -343,6 +418,10 @@ mod tests {
             50_100.0,
             50_000.0,
             commission,
+            AccountId::new("ACC-001"),
+            TradeId::new("TRADE-001"),
+            VenueOrderId::new("VENUE-001"),
+            LiquiditySide::Taker,
         );
         report.add_fill(fill);
         report.finalize(2_000_000_000);
@@ -381,6 +460,10 @@ mod tests {
             50_000.0,
             50_000.0,
             commission,
+            AccountId::new("ACC-001"),
+            TradeId::new("TRADE-001"),
+            VenueOrderId::new("VENUE-001"),
+            LiquiditySide::Taker,
         );
         let json = serde_json::to_string(&fill).unwrap();
         let parsed: FillReport = serde_json::from_str(&json).unwrap();

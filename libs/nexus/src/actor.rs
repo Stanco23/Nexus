@@ -35,17 +35,18 @@
 
 use crate::cache::{Bar, OrderBook, QuoteTick, TradeTick};
 use crate::instrument::Instrument;
+#[allow(unused_imports)]
 use crate::messages::{
-    FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-    MarkPriceUpdate, OrderAccepted, OrderCancelled, OrderFilled, OrderRejected,
-    PositionChanged, PositionClosed, PositionOpened, SignalData, OrderSubmitted, TraderId,
+    AccountState, ClientOrderId, FundingRateUpdate, IndexPriceUpdate, InstrumentClose,
+    InstrumentStatus, MarkPriceUpdate, OrderAccepted, OrderCancelled, OrderFilled,
+    OrderPartiallyFilled, OrderRejected, PositionChanged, PositionClosed, PositionOpened,
+    PositionId, SignalData, OrderSide, OrderSubmitted, StrategyId, TradeId, TraderId,
+    VenueOrderId,
 };
 use std::any::Any;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-#[allow(unused_imports)]
-use std::rc::Rc;
 use std::sync::Arc;
+use parking_lot::RwLock;
 
 // =============================================================================
 // SECTION 1: Clock trait + implementations
@@ -665,7 +666,13 @@ pub enum TradingState {
 // SECTION 6: MessageBus
 // =============================================================================
 
-type Handler = Box<dyn Fn(&dyn std::any::Any)>;
+type Handler = Box<dyn Fn(&dyn std::any::Any) + Send + Sync>;
+
+/// Subscription entry: (priority, subscription_id, handler)
+type SubscriptionEntry = (i32, u64, Arc<Handler>);
+
+/// Topic → list of subscriptions
+type SubscriptionMap = HashMap<String, Vec<SubscriptionEntry>>;
 
 /// A synchronous message bus with pub/sub, endpoint registration, and wildcard topics.
 ///
@@ -682,18 +689,16 @@ pub struct MessageBus {
 
 #[allow(clippy::arc_with_non_send_sync)]
 struct BusInner {
-    #[allow(clippy::type_complexity)]
-    subscriptions: RefCell<HashMap<String, Vec<(i32, u64, Arc<Handler>)>>>,
-    endpoints: RefCell<HashMap<String, Handler>>,
+    subscriptions: RwLock<SubscriptionMap>,
+    endpoints: RwLock<HashMap<String, Handler>>,
 }
 
 impl Default for MessageBus {
     fn default() -> Self {
         Self {
-            #[allow(clippy::arc_with_non_send_sync)]
             inner: Arc::new(BusInner {
-                subscriptions: RefCell::new(HashMap::new()),
-                endpoints: RefCell::new(HashMap::new()),
+                subscriptions: RwLock::new(HashMap::new()),
+                endpoints: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -704,26 +709,22 @@ impl MessageBus {
         Self::default()
     }
 
-    /// Subscribe to a topic with a handler and priority.
-    /// Handlers with higher priority receive messages first.
     pub fn subscribe(&self, topic: &str, component_id: u64, handler: Handler, priority: i32) {
-        let mut subs = self.inner.subscriptions.borrow_mut();
+        let mut subs = self.inner.subscriptions.write();
         let entries = subs.entry(topic.to_string()).or_default();
-        #[allow(clippy::arc_with_non_send_sync)]
         entries.push((priority, component_id, Arc::new(handler)));
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.0));
     }
 
     /// Publish a message to all handlers subscribed to the topic (and matching
     /// wildcard patterns).
     pub fn publish(&self, topic: &str, msg: &dyn std::any::Any) {
         let handlers: Vec<Arc<Handler>> = {
-            let subs = self.inner.subscriptions.borrow();
+            let subs = self.inner.subscriptions.read();
             let mut out = Vec::new();
             for (pattern, entries) in subs.iter() {
                 if is_matching(pattern, topic) {
                     for (_, _, handler) in entries {
-                        #[allow(clippy::arc_with_non_send_sync)]
                         out.push(Arc::clone(handler));
                     }
                 }
@@ -737,13 +738,13 @@ impl MessageBus {
 
     /// Register a direct endpoint (point-to-point messaging).
     pub fn register(&self, endpoint: &str, handler: Handler) {
-        let mut eps = self.inner.endpoints.borrow_mut();
+        let mut eps = self.inner.endpoints.write();
         eps.insert(endpoint.to_string(), handler);
     }
 
     /// Send a message directly to a registered endpoint.
     pub fn send(&self, endpoint: &str, msg: &dyn Message) {
-        let eps = self.inner.endpoints.borrow();
+        let eps = self.inner.endpoints.read();
         if let Some(handler) = eps.get(endpoint) {
             handler(msg);
         }
@@ -751,7 +752,7 @@ impl MessageBus {
 
     /// Unsubscribe a component from a topic.
     pub fn unsubscribe(&self, topic: &str, component_id: u64) {
-        let mut subs = self.inner.subscriptions.borrow_mut();
+        let mut subs = self.inner.subscriptions.write();
         if let Some(handlers) = subs.get_mut(topic) {
             handlers.retain(|(_, id, _)| *id != component_id);
         }
@@ -759,7 +760,7 @@ impl MessageBus {
 
     /// Unsubscribe a component from all topics.
     pub fn unsubscribe_all(&self, component_id: u64) {
-        let mut subs = self.inner.subscriptions.borrow_mut();
+        let mut subs = self.inner.subscriptions.write();
         for handlers in subs.values_mut() {
             handlers.retain(|(_, id, _)| *id != component_id);
         }
@@ -809,6 +810,7 @@ fn is_matching_recursive(pat: &[u8], text: &[u8]) -> bool {
 
 /// Simple logger stub — prints to stdout with timestamp and level.
 /// Replace with full implementation in Phase 5.1 (file logging, levels, etc.)
+#[derive(Clone)]
 pub struct Logger {
     name: String,
 }
@@ -850,6 +852,22 @@ fn timestamp_iso() -> String {
 // SECTION 8: Component
 // =============================================================================
 
+/// Component trait — provides unified access to component fields.
+///
+/// This trait allows external code (e.g. traders, tests) to access component
+/// fields without knowing the concrete type. All actor components implement it.
+pub trait ComponentTrait {
+    fn id(&self) -> u64;
+    fn trader_id(&self) -> &TraderId;
+    fn label(&self) -> Option<&str>;
+    fn msgbus(&self) -> &MessageBus;
+    fn clock(&self) -> &dyn Clock;
+    fn component(&self) -> &Component;
+    fn component_mut(&mut self) -> &mut Component;
+    fn on_save(&mut self) -> std::collections::HashMap<String, Vec<u8>>;
+    fn on_load(&mut self, state: &std::collections::HashMap<String, Vec<u8>>);
+}
+
 /// Base struct for all system components.
 ///
 /// A Component has:
@@ -866,9 +884,9 @@ pub struct Component {
     pub id: u64,
     pub name: &'static str,
     pub trader_id: TraderId,
-    clock: Box<dyn Clock>,
-    msgbus: MessageBus,
-    logger: Logger,
+    pub logger: Logger,
+    pub clock: Box<dyn Clock>,
+    pub msgbus: MessageBus,
     fsm: FiniteStateMachine<ComponentState, ComponentTrigger>,
 }
 
@@ -1066,6 +1084,9 @@ pub trait Actor {
     /// Return the actor's component.
     fn component(&self) -> &Component;
 
+    /// Return the actor's mutable component.
+    fn component_mut(&mut self) -> &mut Component;
+
     /// Return the actor's trader ID.
     fn trader_id(&self) -> &str;
 
@@ -1148,6 +1169,18 @@ pub trait Actor {
     /// Called when a generic data update is received.
     fn on_data(&mut self, _data: &dyn Any) {}
 
+    /// Called when an order book depth update is received.
+    fn on_order_book_depth(&mut self, _depth: &OrderBook) {}
+
+    /// Called when historical data is received (e.g., for backfill).
+    fn on_historical_data(&mut self, _data: &dyn Any) {}
+
+    /// Called when option Greeks are received.
+    fn on_option_greeks(&mut self, _greeks: &dyn Any) {}
+
+    /// Called when an option chain is received.
+    fn on_option_chain(&mut self, _chain: &dyn Any) {}
+
     // === Order/position event handlers ===
 
     /// Called when an order is submitted to the venue.
@@ -1160,7 +1193,7 @@ pub trait Actor {
     fn on_order_filled(&mut self, _event: &OrderFilled) {}
 
     /// Called when an order is partially filled.
-    fn on_order_partially_filled(&mut self, _event: &OrderFilled) {}
+    fn on_order_partially_filled(&mut self, _event: &OrderPartiallyFilled) {}
 
     /// Called when an order is cancelled.
     fn on_order_cancelled(&mut self, _event: &OrderCancelled) {}
@@ -1182,6 +1215,19 @@ pub trait Actor {
 
     /// Called when a signal is received.
     fn on_signal(&mut self, _signal: &SignalData) {}
+
+    // === Account handlers ===
+
+    /// Called when an account state update is received.
+    fn on_account_state(&mut self, _event: &AccountState) {}
+
+    /// Called when account info is received.
+    fn on_account_info(&mut self, _event: &AccountState) {}
+
+    // === Risk handlers ===
+
+    /// Called when risk state changes.
+    fn on_risk_state_changed(&mut self, _event: &dyn Any) {}
 }
 
 /// A concrete Actor implementation with a boxed inner type.
@@ -1231,6 +1277,10 @@ impl Actor for GenericActor {
         &self.component
     }
 
+    fn component_mut(&mut self) -> &mut Component {
+        &mut self.component
+    }
+
     fn trader_id(&self) -> &str {
         &self.trader_id_str
     }
@@ -1241,9 +1291,11 @@ impl Actor for GenericActor {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use crate::instrument::InstrumentId;
+    use std::sync::{Arc, Mutex};
 
     // --- Clock tests ---
 
@@ -1287,18 +1339,18 @@ mod tests {
         let mut clock = TestClock::new();
         clock.set_time(1000);
 
-        let fired = Rc::new(RefCell::new(Vec::new()));
-        let fired_clone = Rc::clone(&fired);
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let fired_clone = Arc::clone(&fired);
 
         let mut handler = Box::new(move |e: TimeEvent| {
-            fired_clone.borrow_mut().push(e.name.clone());
+            fired_clone.lock().unwrap().push(e.name.clone());
         });
 
         clock.set_timer("cb_timer", 2000, Vec::new(), handler);
 
         let events = clock.advance_time(2000);
         assert_eq!(events.len(), 1);
-        assert_eq!(*fired.borrow(), vec!["cb_timer"]);
+        assert_eq!(*fired.lock().unwrap(), vec!["cb_timer"]);
     }
 
     #[test]
@@ -1363,10 +1415,10 @@ mod tests {
         let mut clock = TestClock::new();
         clock.set_time(1000);
 
-        let count = Rc::new(RefCell::new(0u32));
-        let count_clone = Rc::clone(&count);
+        let count = Arc::new(Mutex::new(0u32));
+        let count_clone = Arc::clone(&count);
         let mut handler = Box::new(move |_: TimeEvent| {
-            *count_clone.borrow_mut() += 1;
+            *count_clone.lock().unwrap() += 1;
         });
 
         // Repeating every 1000ns, starting at 1000
@@ -1374,20 +1426,20 @@ mod tests {
 
         // First fire at 2000
         clock.advance_time(2000);
-        assert_eq!(*count.borrow(), 1);
+        assert_eq!(*count.lock().unwrap(), 1);
 
         // Second fire at 3000
         clock.advance_time(3000);
-        assert_eq!(*count.borrow(), 2);
+        assert_eq!(*count.lock().unwrap(), 2);
 
         // Third fire at 4000
         clock.advance_time(4000);
-        assert_eq!(*count.borrow(), 3);
+        assert_eq!(*count.lock().unwrap(), 3);
 
         // Cancel
         clock.cancel_timer("repeater");
         clock.advance_time(5000);
-        assert_eq!(*count.borrow(), 3); // No more fires
+        assert_eq!(*count.lock().unwrap(), 3); // No more fires
     }
 
     #[test]
@@ -1395,10 +1447,10 @@ mod tests {
         let mut clock = TestClock::new();
         clock.set_time(1000);
 
-        let count = Rc::new(RefCell::new(0u32));
-        let count_clone = Rc::clone(&count);
+        let count = Arc::new(Mutex::new(0u32));
+        let count_clone = Arc::clone(&count);
         let mut handler = Box::new(move |_: TimeEvent| {
-            *count_clone.borrow_mut() += 1;
+            *count_clone.lock().unwrap() += 1;
         });
 
         // Repeating every 1000ns, starting at 1000, stops at 3500
@@ -1408,7 +1460,7 @@ mod tests {
         clock.advance_time(3000); // fires at 3000
         clock.advance_time(4000); // stop_ns exceeded, no more fires
 
-        assert_eq!(*count.borrow(), 2);
+        assert_eq!(*count.lock().unwrap(), 2);
         assert!(clock.timer_names().is_empty());
     }
 
@@ -1417,20 +1469,20 @@ mod tests {
         let mut clock = TestClock::new();
         clock.set_time(1000);
 
-        let count = Rc::new(RefCell::new(0u32));
-        let count_clone = Rc::clone(&count);
+        let count = Arc::new(Mutex::new(0u32));
+        let count_clone = Arc::clone(&count);
         let mut handler = Box::new(move |_: TimeEvent| {
-            *count_clone.borrow_mut() += 1;
+            *count_clone.lock().unwrap() += 1;
         });
 
         // fire_immediately=true → fires at 1000 (start_ns), then 2000, 3000...
         clock.set_timer_repeating("immediate", 1000, 1000, None, handler, true);
 
         clock.advance_time(1000);
-        assert_eq!(*count.borrow(), 1);
+        assert_eq!(*count.lock().unwrap(), 1);
 
         clock.advance_time(2000);
-        assert_eq!(*count.borrow(), 2);
+        assert_eq!(*count.lock().unwrap(), 2);
     }
 
     #[test]
@@ -1438,10 +1490,10 @@ mod tests {
         let mut clock = TestClock::new();
         clock.set_time(1000);
 
-        let received = Rc::new(RefCell::new(Vec::new()));
-        let received_clone = Rc::clone(&received);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
         let mut default = Box::new(move |e: TimeEvent| {
-            received_clone.borrow_mut().push(e.name.clone());
+            received_clone.lock().unwrap().push(e.name.clone());
         });
         clock.register_default_handler(default);
 
@@ -1449,7 +1501,7 @@ mod tests {
         clock.set_timer_anonymous("default_test", 2000);
 
         clock.advance_time(2000);
-        assert_eq!(*received.borrow(), vec!["default_test"]);
+        assert_eq!(*received.lock().unwrap(), vec!["default_test"]);
     }
 
     #[test]
@@ -1590,15 +1642,15 @@ mod tests {
     #[test]
     fn test_msgbus_publish_subscribe() {
         let bus = MessageBus::new();
-        let received = Rc::new(RefCell::new(Vec::new()));
-        let received_clone = Rc::clone(&received);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
 
         bus.subscribe(
             "test.topic",
             1,
             Box::new(move |msg| {
                 if let Some(s) = downcast::<ShutdownSystem>(msg) {
-                    received_clone.borrow_mut().push(s.reason.clone());
+                    received_clone.lock().unwrap().push(s.reason.clone());
                 }
             }),
             0,
@@ -1606,21 +1658,21 @@ mod tests {
 
         bus.publish("test.topic", &ShutdownSystem { reason: "hello".to_string() });
 
-        assert_eq!(received.borrow().as_slice(), &["hello".to_string()]);
+        assert_eq!(received.lock().unwrap().as_slice(), &["hello".to_string()]);
     }
 
     #[test]
     fn test_msgbus_wildcard_star() {
         let bus = MessageBus::new();
-        let received = Rc::new(RefCell::new(Vec::new()));
-        let received_clone = Rc::clone(&received);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
 
         bus.subscribe(
             "events.system.*",
             1,
             Box::new(move |msg| {
                 if let Some(c) = downcast::<ComponentStateChanged>(msg) {
-                    received_clone.borrow_mut().push(c.state);
+                    received_clone.lock().unwrap().push(c.state);
                 }
             }),
             0,
@@ -1635,21 +1687,21 @@ mod tests {
             },
         );
 
-        assert_eq!(received.borrow().len(), 1);
-        assert_eq!(received.borrow()[0], ComponentState::Running);
+        assert_eq!(received.lock().unwrap().len(), 1);
+        assert_eq!(received.lock().unwrap()[0], ComponentState::Running);
     }
 
     #[test]
     fn test_msgbus_wildcard_question_mark() {
         let bus = MessageBus::new();
-        let received = Rc::new(RefCell::new(0u32));
-        let received_clone = Rc::clone(&received);
+        let received = Arc::new(Mutex::new(0u32));
+        let received_clone = Arc::clone(&received);
 
         bus.subscribe(
             "events.?.stopped",
             1,
             Box::new(move |_| {
-                *received_clone.borrow_mut() += 1;
+                *received_clone.lock().unwrap() += 1;
             }),
             0,
         );
@@ -1659,22 +1711,22 @@ mod tests {
         // Should NOT match
         bus.publish("events.ab.stopped", &ShutdownSystem { reason: "".to_string() });
 
-        assert_eq!(*received.borrow(), 2);
+        assert_eq!(*received.lock().unwrap(), 2);
     }
 
     #[test]
     fn test_msgbus_priority_ordering() {
         let bus = MessageBus::new();
-        let order = Rc::new(RefCell::new(Vec::new()));
-        let order_clone1 = Rc::clone(&order);
-        let order_clone2 = Rc::clone(&order);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let order_clone1 = Arc::clone(&order);
+        let order_clone2 = Arc::clone(&order);
 
         // Higher priority (10) should receive first
         bus.subscribe(
             "prio",
             1,
             Box::new(move |_| {
-                order_clone1.borrow_mut().push(1);
+                order_clone1.lock().unwrap().push(1);
             }),
             10,
         );
@@ -1682,7 +1734,7 @@ mod tests {
             "prio",
             2,
             Box::new(move |_| {
-                order_clone2.borrow_mut().push(2);
+                order_clone2.lock().unwrap().push(2);
             }),
             0,
         );
@@ -1690,51 +1742,51 @@ mod tests {
         bus.publish("prio", &ShutdownSystem { reason: "".to_string() });
 
         // Order should be [1, 2] (priority 10 then priority 0)
-        assert_eq!(*order.borrow(), vec![1, 2]);
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
     }
 
     #[test]
     fn test_msgbus_endpoint_send() {
         let bus = MessageBus::new();
-        let received = Rc::new(RefCell::new(String::new()));
-        let received_clone = Rc::clone(&received);
+        let received = Arc::new(Mutex::new(String::new()));
+        let received_clone = Arc::clone(&received);
 
         bus.register(
             "actor.123",
             Box::new(move |msg| {
                 if let Some(s) = downcast::<ShutdownSystem>(msg) {
-                    *received_clone.borrow_mut() = s.reason.clone();
+                    *received_clone.lock().unwrap() = s.reason.clone();
                 }
             }),
         );
 
         bus.send("actor.123", &ShutdownSystem { reason: "direct".to_string() });
 
-        assert_eq!(&*received.borrow(), "direct");
+        assert_eq!(&*received.lock().unwrap(), "direct");
     }
 
     #[test]
     fn test_msgbus_unsubscribe() {
         let bus = MessageBus::new();
-        let count = Rc::new(RefCell::new(0u32));
-        let count_clone = Rc::clone(&count);
+        let count = Arc::new(Mutex::new(0u32));
+        let count_clone = Arc::clone(&count);
 
         bus.subscribe(
             "topic",
             5,
             Box::new(move |_| {
-                *count_clone.borrow_mut() += 1;
+                *count_clone.lock().unwrap() += 1;
             }),
             0,
         );
 
         bus.publish("topic", &ShutdownSystem { reason: "".to_string() });
-        assert_eq!(*count.borrow(), 1);
+        assert_eq!(*count.lock().unwrap(), 1);
 
         bus.unsubscribe("topic", 5);
 
         bus.publish("topic", &ShutdownSystem { reason: "".to_string() });
-        assert_eq!(*count.borrow(), 1); // Still 1, not 2
+        assert_eq!(*count.lock().unwrap(), 1); // Still 1, not 2
     }
 
     #[test]
@@ -1779,14 +1831,14 @@ mod tests {
         let logger = Logger::new("subscriber");
         let comp = Component::new(10, "Subscriber", TraderId::new("TEST-Trader"), clock, bus.clone(), logger);
 
-        let received = Rc::new(RefCell::new(false));
-        let received_clone = Rc::clone(&received);
+        let received = Arc::new(Mutex::new(false));
+        let received_clone = Arc::clone(&received);
 
         comp.subscribe(
             "test.events",
             Box::new(move |msg| {
                 if downcast::<ComponentStateChanged>(msg).is_some() {
-                    *received_clone.borrow_mut() = true;
+                    *received_clone.lock().unwrap() = true;
                 }
             }),
             0,
@@ -1798,7 +1850,7 @@ mod tests {
             state: ComponentState::Running,
         });
 
-        assert!(*received.borrow());
+        assert!(*received.lock().unwrap());
     }
 
     // --- Actor tests ---
@@ -1820,14 +1872,14 @@ mod tests {
             bus.clone(),
         );
 
-        let received_state = Rc::new(RefCell::new(None::<ComponentState>));
-        let received_state_clone = Rc::clone(&received_state);
+        let received_state = Arc::new(Mutex::new(None::<ComponentState>));
+        let received_state_clone = Arc::clone(&received_state);
 
         actor_a.component().subscribe(
             "events.system.ActorB.*",
             Box::new(move |msg| {
                 if let Some(c) = downcast::<ComponentStateChanged>(msg) {
-                    *received_state_clone.borrow_mut() = Some(c.state);
+                    *received_state_clone.lock().unwrap() = Some(c.state);
                 }
             }),
             0,
@@ -1857,7 +1909,7 @@ mod tests {
         );
 
         assert_eq!(
-            *received_state.borrow(),
+            *received_state.lock().unwrap(),
             Some(ComponentState::Running),
             "Actor A should have received Actor B's Running state"
         );
@@ -1870,15 +1922,15 @@ mod tests {
         let logger = Logger::new("state_tester");
         let mut comp = Component::new(42, "StateTester", TraderId::new("TEST-Trader"), clock, bus.clone(), logger);
 
-        let received_events = Rc::new(RefCell::new(Vec::new()));
-        let received_events_clone = Rc::clone(&received_events);
+        let received_events = Arc::new(Mutex::new(Vec::new()));
+        let received_events_clone = Arc::clone(&received_events);
 
         bus.subscribe(
             "events.system.StateTester.42",
             99,
             Box::new(move |msg| {
                 if let Some(c) = downcast::<ComponentStateChanged>(msg) {
-                    received_events_clone.borrow_mut().push(c.state);
+                    received_events_clone.lock().unwrap().push(c.state);
                 }
             }),
             0,
@@ -1888,12 +1940,12 @@ mod tests {
         comp.start();
         comp.stop();
 
-        let states: Vec<_> = received_events.borrow().clone().into_iter().collect();
-        assert!(states.contains(&&ComponentState::Initialized));
-        assert!(states.contains(&&ComponentState::Starting));
-        assert!(states.contains(&&ComponentState::Running));
-        assert!(states.contains(&&ComponentState::Stopping));
-        assert!(states.contains(&&ComponentState::Stopped));
+        let states: Vec<_> = received_events.lock().unwrap().clone();
+        assert!(states.contains(&ComponentState::Initialized));
+        assert!(states.contains(&ComponentState::Starting));
+        assert!(states.contains(&ComponentState::Running));
+        assert!(states.contains(&ComponentState::Stopping));
+        assert!(states.contains(&ComponentState::Stopped));
     }
 
     #[test]
@@ -1950,5 +2002,37 @@ mod tests {
             ts_event: 0,
         };
         actor.on_index_price(&_index);
+
+        // New handlers added
+        let _partial = OrderPartiallyFilled {
+            trader_id: TraderId::new("TESTER-001"),
+            strategy_id: StrategyId::new("TEST"),
+            client_order_id: ClientOrderId::new("O1"),
+            venue_order_id: VenueOrderId::new("V1"),
+            position_id: PositionId::new("P1"),
+            trade_id: TradeId::new("T1"),
+            instrument_id: "BTCUSDT.BINANCE".to_string(),
+            order_side: OrderSide::Buy,
+            filled_qty: 0.5,
+            remaining_qty: 0.5,
+            fill_price: 100.0,
+            commission: 0.1,
+            slippage_bps: 0.5,
+            ts_event: 0,
+            ts_init: 0,
+        };
+        actor.on_order_partially_filled(&_partial);
+
+        let _account = AccountState {
+            trader_id: TraderId::new("TESTER-001"),
+            account_id: "ACC-001".to_string(),
+            balance: 10000.0,
+            margin_used: 1000.0,
+            equity: 11000.0,
+            ts_event: 0,
+            ts_init: 0,
+        };
+        actor.on_account_state(&_account);
+        actor.on_account_info(&_account);
     }
 }

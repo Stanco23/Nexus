@@ -27,6 +27,8 @@ pub mod portfolio;
 pub mod signals;
 pub mod slippage;
 pub mod strategy_ctx;
+pub use strategy_ctx::StrategyCtx;
 pub mod sweep;
+pub mod trader;
 
 pub use database::{Database, DatabaseError, SqliteDatabase, MemoryDatabase};
