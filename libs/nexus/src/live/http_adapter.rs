@@ -82,7 +82,7 @@ pub struct BinanceHttpAdapter {
 }
 
 /// Simple token-bucket rate limiter for Binance API request weights.
-struct RateLimiter {
+pub struct RateLimiter {
     /// Remaining request weight.
     tokens: f64,
     /// Max tokens (bucket capacity).
@@ -94,7 +94,7 @@ struct RateLimiter {
 }
 
 impl RateLimiter {
-    fn new(max_tokens: f64, refill_per_minute: f64) -> Self {
+    pub fn new(max_tokens: f64, refill_per_minute: f64) -> Self {
         let refill_per_ms = refill_per_minute / 60_000.0;
         Self {
             tokens: max_tokens,
@@ -105,7 +105,7 @@ impl RateLimiter {
     }
 
     /// Try to acquire `weight` tokens. Returns Ok(()) if acquired.
-    async fn acquire(&mut self, weight: u32) -> Result<(), u64> {
+    pub async fn acquire(&mut self, weight: u32) -> Result<(), u64> {
         self.refill();
         let weight = weight as f64;
         if self.tokens >= weight {

@@ -5,6 +5,7 @@
 //!
 //! Nautilus source: `adapters/okx/http.py`, `adapters/okx/v5/http.py`
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -12,12 +13,13 @@ use reqwest::Client;
 use secrecy::{ExposeSecret, Secret};
 use serde::Deserialize;
 use sha2::Sha256;
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 
 use crate::live::exchange::{
     AccountInfoResponse, AssetBalance, Exchange, ExchangeError,
 };
-use crate::live::http_adapter::{OrderInfoResponse, OrderStatusResponse};
+use crate::live::http_adapter::{OrderInfoResponse, OrderStatusResponse, RateLimiter};
 use crate::live::normalizer::{OkxSymbolNormalizer, SymbolNormalizer};
 use crate::messages::{CancelOrder, ClientOrderId, OrderSide, SubmitOrder, VenueOrderId};
 
@@ -38,6 +40,8 @@ pub struct OkxHttpAdapter {
     base_url: String,
     client: Client,
     normalizer: OkxSymbolNormalizer,
+    /// Rate limiter: tracks remaining request weight.
+    rate_limiter: Arc<RwLock<RateLimiter>>,
 }
 
 impl OkxHttpAdapter {
@@ -62,6 +66,7 @@ impl OkxHttpAdapter {
             base_url: base_url.to_string(),
             client,
             normalizer: OkxSymbolNormalizer,
+            rate_limiter: Arc::new(RwLock::new(RateLimiter::new(300.0, 300.0))),
         }
     }
 
@@ -93,6 +98,11 @@ impl OkxHttpAdapter {
             "clOrdId": order.client_order_id.to_string(),
         });
 
+        // OKX rate limit: ~300 orders/min for spot
+        if let Err(retry_ms) = self.rate_limiter.write().await.acquire(1).await {
+            return Err(ExchangeError::RateLimited { retry_after_ms: retry_ms });
+        }
+
         let response: OrderCreateResponse = self
             .signed_post("/v5/trade/order", &params)
             .await?;
@@ -109,6 +119,11 @@ impl OkxHttpAdapter {
         let params = serde_json::json!({
             "clOrdId": cancel.client_order_id.to_string(),
         });
+
+        // OKX rate limit: ~300 orders/min for spot
+        if let Err(retry_ms) = self.rate_limiter.write().await.acquire(1).await {
+            return Err(ExchangeError::RateLimited { retry_after_ms: retry_ms });
+        }
 
         let _: OrderCancelResponse = self.signed_post("/v5/trade/cancel-order", &params).await?;
         Ok(true)
@@ -143,6 +158,11 @@ impl OkxHttpAdapter {
         }
         if let Some(q) = new_quantity {
             params["sz"] = serde_json::json!(q.to_string());
+        }
+
+        // OKX rate limit: ~300 orders/min for spot
+        if let Err(retry_ms) = self.rate_limiter.write().await.acquire(1).await {
+            return Err(ExchangeError::RateLimited { retry_after_ms: retry_ms });
         }
 
         let response: OrderAmendResponse = self.signed_post("/v5/trade/amend-order", &params).await?;

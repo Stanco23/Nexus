@@ -5,6 +5,7 @@
 //!
 //! Nautilus source: `adapters/bybit/http.py`, `adapters/bybit/v5/http.py`
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -12,12 +13,13 @@ use reqwest::Client;
 use secrecy::{ExposeSecret, Secret};
 use serde::Deserialize;
 use sha2::Sha256;
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 
 use crate::live::exchange::{
     AccountInfoResponse, AssetBalance, Exchange, ExchangeError,
 };
-use crate::live::http_adapter::{OrderInfoResponse, OrderStatusResponse};
+use crate::live::http_adapter::{OrderInfoResponse, OrderStatusResponse, RateLimiter};
 use crate::live::normalizer::{BybitSymbolNormalizer, SymbolNormalizer};
 use crate::messages::{CancelOrder, ClientOrderId, OrderSide, SubmitOrder, VenueOrderId};
 
@@ -33,6 +35,8 @@ pub struct BybitHttpAdapter {
     base_url: String,
     client: Client,
     normalizer: BybitSymbolNormalizer,
+    /// Rate limiter: tracks remaining request weight.
+    rate_limiter: Arc<RwLock<RateLimiter>>,
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -62,6 +66,7 @@ impl BybitHttpAdapter {
             base_url: base_url.to_string(),
             client,
             normalizer: BybitSymbolNormalizer,
+            rate_limiter: Arc::new(RwLock::new(RateLimiter::new(200.0, 200.0))),
         }
     }
 
@@ -91,6 +96,11 @@ impl BybitHttpAdapter {
             "orderLinkId": order.client_order_id.to_string(),
         });
 
+        // Bybit rate limit: ~200 orders/min for unified margin
+        if let Err(retry_ms) = self.rate_limiter.write().await.acquire(1).await {
+            return Err(ExchangeError::RateLimited { retry_after_ms: retry_ms });
+        }
+
         let response: OrderCreateResponse = self
             .signed_post("/v5/order/create", &params)
             .await?;
@@ -103,6 +113,11 @@ impl BybitHttpAdapter {
         &self,
         cancel: &CancelOrder,
     ) -> Result<bool, ExchangeError> {
+        // Bybit rate limit: ~200 orders/min for unified margin
+        if let Err(retry_ms) = self.rate_limiter.write().await.acquire(1).await {
+            return Err(ExchangeError::RateLimited { retry_after_ms: retry_ms });
+        }
+
         // Bybit cancel by orderLinkId (client_order_id) — symbol is optional
         let params = serde_json::json!({
             "category": "spot",
@@ -144,6 +159,11 @@ impl BybitHttpAdapter {
         }
         if let Some(vid) = venue_order_id {
             params["orderId"] = serde_json::json!(vid.to_string());
+        }
+
+        // Bybit rate limit: ~200 orders/min for unified margin
+        if let Err(retry_ms) = self.rate_limiter.write().await.acquire(1).await {
+            return Err(ExchangeError::RateLimited { retry_after_ms: retry_ms });
         }
 
         let response: OrderAmendResponse = self.signed_post("/v5/order/amend", &params).await?;
