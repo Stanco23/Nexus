@@ -311,6 +311,10 @@ impl ExecutionClient {
             equity,
             drawdown_pct,
         ) {
+            // Record rejection in OMS cache and publish order.rejected
+            // This must happen BEFORE returning error so the rejection is persisted
+            let strategy_id = submit.strategy_id.clone();
+            self.oms.record_rejection(&submit, &strategy_id, reason);
             return Err(ExchangeError::RiskRejected(reason));
         }
 

@@ -572,6 +572,54 @@ impl Oms {
         true
     }
 
+    /// Record a rejection for an order that was blocked before reaching the exchange.
+    /// Used when risk checks fail *before* the order is submitted to OMS.
+    /// Creates an OmsOrder in `Rejected` state in cache and publishes `order.rejected`.
+    ///
+    /// For post-submission rejections (exchange rejected), use `apply_rejection` instead.
+    pub fn record_rejection(
+        &mut self,
+        submit: &SubmitOrder,
+        strategy_id: &StrategyId,
+        reason: &str,
+    ) {
+        let position_id = self.position_id_gen.next_with_oms(
+            &crate::instrument::Venue::new(""),
+            strategy_id,
+            &crate::instrument::InstrumentId::new(&submit.instrument_id, ""),
+            self.oms_type,
+        );
+
+        let oms_order = OmsOrder::new(
+            submit.client_order_id.clone(),
+            position_id,
+            strategy_id.clone(),
+            submit.instrument_id.clone(),
+            submit.order_side,
+            submit.order_type,
+            submit.quantity,
+            submit.price,
+            submit.ts_init,
+        );
+
+        // Update state to Rejected and persist
+        let mut order = oms_order;
+        order.state = OrderState::Rejected;
+        self.cache.lock().unwrap().update_oms_order(order);
+
+        let event = OrderRejected {
+            trader_id: submit.trader_id.clone(),
+            strategy_id: strategy_id.clone(),
+            client_order_id: submit.client_order_id.clone(),
+            venue_order_id: None,
+            instrument_id: submit.instrument_id.clone(),
+            ts_event: submit.ts_init,
+            ts_init: submit.ts_init,
+            reason: reason.to_string(),
+        };
+        self.msgbus.publish("order.rejected", &event);
+    }
+
     /// Reject an order. Transitions to Rejected.
     /// Follows Lock-Then-Publish: extracts data, drops lock, then publishes.
     pub fn apply_rejection(&self, client_order_id: &ClientOrderId, reason: &str) {
