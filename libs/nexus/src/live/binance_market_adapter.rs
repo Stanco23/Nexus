@@ -461,9 +461,11 @@ fn try_parse_quote(text: &str, data_engine: &Arc<Mutex<DataEngine>>) -> Option<(
         instrument_id: instrument_id.clone(),
     };
 
-    // Route to DataEngine (US-LT-03)
+    // Route to DataEngine via MsgBus — DataEngine subscribes to data.quote.* topics
+    // and will process_quote + invoke registered callbacks
     if let Ok(engine) = data_engine.lock() {
-        engine.process_quote(&quote, instrument_id);
+        let topic = format!("data.quote.{}.BINANCE", msg.symbol);
+        engine.msgbus.publish(&topic, &quote);
     }
 
     Some(())
@@ -521,9 +523,11 @@ fn try_parse_orderbook(text: &str, data_engine: &Arc<Mutex<DataEngine>>) -> Opti
         ts_event,
     };
 
-    // Route to DataEngine (US-LT-03)
+    // Route to DataEngine via MsgBus — DataEngine subscribes to data.ob.* topics
+    // and will process_orderbook + invoke registered callbacks
     if let Ok(engine) = data_engine.lock() {
-        engine.process_orderbook(&book, instrument_id.clone());
+        let topic = format!("data.ob.{}.BINANCE", msg.symbol);
+        engine.msgbus.publish(&topic, &book);
     }
 
     Some(())

@@ -497,7 +497,8 @@ impl OkxMarketDataAdapter {
                 };
 
                 if let Ok(engine) = data_engine.lock() {
-                    engine.process_quote(&quote, instrument_id.clone());
+                    let topic = format!("data.quote.{}.OKX", inst_id);
+                    engine.msgbus.publish(&topic, &quote);
                 }
             }
         } else if channel == "books" {
@@ -525,7 +526,8 @@ impl OkxMarketDataAdapter {
                 };
 
                 if let Ok(engine) = data_engine.lock() {
-                    engine.process_orderbook(&book, instrument_id.clone());
+                    let topic = format!("data.ob.{}.OKX", inst_id);
+                    engine.msgbus.publish(&topic, &book);
                 }
             }
         }

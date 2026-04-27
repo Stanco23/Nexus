@@ -455,6 +455,7 @@ impl BybitMarketDataAdapter {
             Some(s) => InstrumentId::new(s, "BYBIT"),
             None => return,
         };
+        let symbol_upper = symbol_part.map(|s| s.to_uppercase()).unwrap_or_default();
         let ts_event = json.get("ts").and_then(|v| v.as_u64()).unwrap_or(0) * 1_000_000;
 
         if topic.starts_with("orderbook.") {
@@ -483,7 +484,8 @@ impl BybitMarketDataAdapter {
             };
 
             if let Ok(engine) = data_engine.lock() {
-                engine.process_orderbook(&book, instrument_id.clone());
+                let topic = format!("data.ob.{}.BYBIT", symbol_upper);
+                engine.msgbus.publish(&topic, &book);
             }
         } else if topic.starts_with("ticker.") {
             // Bybit ticker (quote-like)
@@ -501,7 +503,8 @@ impl BybitMarketDataAdapter {
             };
 
             if let Ok(engine) = data_engine.lock() {
-                engine.process_quote(&quote, instrument_id);
+                let topic = format!("data.quote.{}.BYBIT", symbol_upper);
+                engine.msgbus.publish(&topic, &quote);
             }
         }
     }

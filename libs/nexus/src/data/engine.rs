@@ -318,9 +318,21 @@ impl DataEngine {
             }
         });
 
+        let self_ref_ob = self_ref.clone();
+        let ob_handler = Box::new(move |msg: &dyn Any| {
+            if let Some(book) = msg.downcast_ref::<crate::cache::OrderBook>() {
+                // Route to process_orderbook - OrderBook has instrument_id directly
+                if let Some(ref r) = self_ref_ob {
+                    let engine = r.lock().unwrap();
+                    engine.process_orderbook(book, book.instrument_id.clone());
+                }
+            }
+        });
+
         self.msgbus.subscribe("data.trade.*", self.id, trade_handler, 0);
         self.msgbus.subscribe("data.quote.*", self.id, quote_handler, 0);
         self.msgbus.subscribe("data.bar.*", self.id, bar_handler, 0);
+        self.msgbus.subscribe("data.ob.*", self.id, ob_handler, 0);
 
         self.fsm.trigger(crate::actor::ComponentTrigger::Initialize);
         self.logger.info("DataEngine initialized");
@@ -525,11 +537,15 @@ impl DataEngine {
     /// Handle a subscribe trades message.
     pub fn subscribe_trades(&mut self, msg: SubscribeTrades) {
         self.subscriptions.insert(
-            msg.endpoint,
+            msg.endpoint.clone(),
             DataSubscription::Trades {
                 instrument_id: msg.instrument_id,
             },
         );
+        // Register the callback so route_trade_to_endpoint() can invoke it
+        if let Some(cb) = msg.callback {
+            self.tick_callbacks.insert(msg.endpoint, cb);
+        }
     }
 
     /// Handle an unsubscribe trades message.
@@ -594,11 +610,15 @@ impl DataEngine {
     /// Handle a subscribe quotes message.
     pub fn subscribe_quotes(&mut self, msg: crate::data::messages::SubscribeQuotes) {
         self.subscriptions.insert(
-            msg.endpoint,
+            msg.endpoint.clone(),
             DataSubscription::Quotes {
                 instrument_id: msg.instrument_id,
             },
         );
+        // Register the callback so route_quote_to_endpoint() can invoke it
+        if let Some(cb) = msg.callback {
+            self.quote_callbacks.insert(msg.endpoint, cb);
+        }
     }
 
     /// Handle an unsubscribe quotes message.
@@ -609,11 +629,15 @@ impl DataEngine {
     /// Handle a subscribe order books message.
     pub fn subscribe_orderbooks(&mut self, msg: crate::data::messages::SubscribeOrderBooks) {
         self.subscriptions.insert(
-            msg.endpoint,
+            msg.endpoint.clone(),
             DataSubscription::OrderBooks {
                 instrument_id: msg.instrument_id,
             },
         );
+        // Register the callback so route_ob_to_endpoint() can invoke it
+        if let Some(cb) = msg.callback {
+            self.ob_callbacks.insert(msg.endpoint, cb);
+        }
     }
 
     /// Handle an unsubscribe order books message.
@@ -672,6 +696,7 @@ mod tests {
             strategy_id: StrategyId::new("strategy-001"),
             instrument_id: InstrumentId::new("BTCUSDT", "BINANCE"),
             endpoint: "MyStrategy.on_trade_tick".to_string(),
+            callback: None,
         });
         assert_eq!(engine.subscription_count(), 1);
 
@@ -713,6 +738,7 @@ mod tests {
             strategy_id: StrategyId::new("strategy-001"),
             instrument_id: btc.clone(),
             endpoint: "Strategy1.on_trade_tick_btc".to_string(),
+            callback: None,
         });
 
         engine.subscribe_trades(SubscribeTrades {
@@ -720,6 +746,7 @@ mod tests {
             strategy_id: StrategyId::new("strategy-001"),
             instrument_id: eth.clone(),
             endpoint: "Strategy1.on_trade_tick_eth".to_string(),
+            callback: None,
         });
 
         engine.subscribe_bars(SubscribeBars {

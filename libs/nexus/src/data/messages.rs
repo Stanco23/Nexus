@@ -2,8 +2,11 @@
 //!
 //! These messages flow through the MessageBus to DataEngine.
 
+use std::sync::Arc;
+
 pub use crate::buffer::BarType;
-use crate::cache::{Bar as CacheBar, QuoteTick};
+use crate::buffer::tick_buffer::TradeFlowStats;
+use crate::cache::{Bar as CacheBar, OrderBook, QuoteTick};
 use crate::instrument::InstrumentId;
 use crate::messages::{StrategyId, TraderId};
 
@@ -11,12 +14,14 @@ use crate::messages::{StrategyId, TraderId};
 pub use crate::actor::Message;
 
 /// Subscribe to trade ticks for an instrument.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubscribeTrades {
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
     pub endpoint: String,
+    /// Callback invoked when a trade tick arrives for this subscription.
+    pub callback: Option<Arc<dyn Fn(TradeFlowStats) + Send + Sync>>,
 }
 
 /// Process trade tick command — routes to DataEngine.process_trade().
@@ -85,12 +90,14 @@ pub struct UnsubscribeBars {
 }
 
 /// Subscribe to quote ticks for an instrument.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubscribeQuotes {
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
     pub endpoint: String,
+    /// Callback invoked when a quote tick arrives for this subscription.
+    pub callback: Option<Arc<dyn Fn(QuoteTick) + Send + Sync>>,
 }
 
 /// Unsubscribe from quote ticks.
@@ -100,12 +107,14 @@ pub struct UnsubscribeQuotes {
 }
 
 /// Subscribe to order book updates for an instrument.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubscribeOrderBooks {
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
     pub endpoint: String,
+    /// Callback invoked when an order book update arrives for this subscription.
+    pub callback: Option<Arc<dyn Fn(OrderBook) + Send + Sync>>,
 }
 
 /// Unsubscribe from order book updates.
