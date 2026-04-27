@@ -642,6 +642,20 @@ pub struct OrderModified {
 }
 impl Message for OrderModified {}
 
+/// Order modify (price/qty change) rejected by the exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderModifyRejected {
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub client_order_id: ClientOrderId,
+    pub venue_order_id: Option<VenueOrderId>,
+    pub instrument_id: String,
+    pub ts_event: u64,
+    pub ts_init: u64,
+    pub reason: String,
+}
+impl Message for OrderModifyRejected {}
+
 // =============================================================================
 // SECTION 5: Position Events
 // =============================================================================

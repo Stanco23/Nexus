@@ -781,6 +781,7 @@ impl From<ExchangeError> for BinanceApiError {
             ExchangeError::InsufficientBalance => BinanceApiError::InsufficientBalance,
             ExchangeError::OrderNotFound => BinanceApiError::OrderNotFound,
             ExchangeError::RiskRejected(reason) => BinanceApiError::Unknown(reason.to_string()),
+            ExchangeError::InvalidOrder(msg) => BinanceApiError::Unknown(msg.to_string()),
             ExchangeError::Unknown(msg) => BinanceApiError::Unknown(msg),
         }
     }

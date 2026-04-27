@@ -202,6 +202,57 @@ impl ExecutionClient {
     }
 
     // -------------------------------------------------------------------------
+    // Order validation
+    // -------------------------------------------------------------------------
+
+    /// Validate order price and quantity against instrument definition.
+    /// Returns Some descriptive error message if invalid, None if valid.
+    fn validate_order(price: Option<f64>, quantity: f64, instrument: &crate::instrument::Instrument) -> Option<&'static str> {
+        // Validate price tick size (skip for market orders which have no price)
+        if let Some(p) = price {
+            let precision = instrument.price_precision as i32;
+            let price_int = (p * 10f64.powi(precision)).round() as i64;
+            if price_int % instrument.price_increment != 0 {
+                return Some("price not aligned to tick size");
+            }
+            if let Some(min_price) = instrument.min_price {
+                if price_int < min_price {
+                    return Some("price below minimum");
+                }
+            }
+            if let Some(max_price) = instrument.max_price {
+                if price_int > max_price {
+                    return Some("price above maximum");
+                }
+            }
+        }
+
+        // Validate quantity
+        let size_prec = instrument.size_precision as i32;
+        let qty_int = (quantity * 10f64.powi(size_prec)).round() as i64;
+        if qty_int % instrument.size_increment != 0 {
+            return Some("quantity not aligned to size increment");
+        }
+        if instrument.lot_size > 0 && qty_int % instrument.lot_size != 0 {
+            return Some("quantity not aligned to lot size");
+        }
+        if qty_int <= 0 {
+            return Some("quantity must be positive");
+        }
+        if let Some(min_qty) = instrument.min_quantity {
+            if qty_int < min_qty {
+                return Some("quantity below minimum");
+            }
+        }
+        if let Some(max_qty) = instrument.max_quantity {
+            if qty_int > max_qty {
+                return Some("quantity above maximum");
+            }
+        }
+
+        None
+    }
+
     // Order handling
     // -------------------------------------------------------------------------
 
@@ -215,6 +266,17 @@ impl ExecutionClient {
         // Parse instrument_id to InstrumentId for Cache lookup
         let instrument_id = crate::instrument::InstrumentId::parse(&submit.instrument_id)
             .unwrap_or_else(|_| crate::instrument::InstrumentId::new(&submit.instrument_id, "BINANCE"));
+
+        // Validate order price and quantity against instrument definition
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(instrument) = cache.get_instrument(instrument_id.clone()) {
+                if let Some(reason) = Self::validate_order(submit.price, submit.quantity, &instrument) {
+                    return Err(ExchangeError::InvalidOrder(reason));
+                }
+            }
+            // If instrument not in cache, skip validation (will fail at exchange anyway)
+        }
 
         // Get current position for this instrument
         let position_qty = {
@@ -794,7 +856,7 @@ impl ExecutionClient {
             .unwrap_or(&instrument_id_str);
 
         // Send modification to exchange via HTTP
-        let venue_order_id = self.http
+        let venue_order_id = match self.http
             .modify_order(
                 &modify.client_order_id,
                 modify.venue_order_id.as_ref(),
@@ -803,7 +865,25 @@ impl ExecutionClient {
                 modify.new_quantity,
                 symbol,
             )
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // Publish OrderModifyRejected to MsgBus
+                let reject = crate::messages::OrderModifyRejected {
+                    trader_id: self.trader_id.clone(),
+                    strategy_id: StrategyId::new("UNKNOWN"),
+                    client_order_id: modify.client_order_id.clone(),
+                    venue_order_id: modify.venue_order_id.clone(),
+                    instrument_id: instrument_id_str,
+                    ts_event: 0,
+                    ts_init: 0,
+                    reason: e.to_string(),
+                };
+                self.msgbus.publish("order.modify_rejected", &reject);
+                return Err(e);
+            }
+        };
 
         // Store in pending_modifications — only apply to OMS after exchange
         // sends ExecutionReport with REPLACED status via WebSocket.

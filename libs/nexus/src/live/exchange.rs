@@ -28,6 +28,7 @@ pub enum ExchangeError {
     InsufficientBalance,
     OrderNotFound,
     RiskRejected(&'static str),
+    InvalidOrder(&'static str),
     Unknown(String),
 }
 
@@ -43,6 +44,7 @@ impl std::fmt::Display for ExchangeError {
             ExchangeError::InsufficientBalance => write!(f, "InsufficientBalance"),
             ExchangeError::OrderNotFound => write!(f, "OrderNotFound"),
             ExchangeError::RiskRejected(reason) => write!(f, "RiskRejected: {}", reason),
+            ExchangeError::InvalidOrder(msg) => write!(f, "InvalidOrder: {}", msg),
             ExchangeError::Unknown(msg) => write!(f, "Unknown: {}", msg),
         }
     }
