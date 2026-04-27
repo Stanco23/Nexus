@@ -214,7 +214,7 @@ pub struct Trader {
     cache: Arc<std::sync::Mutex<Cache>>,
     msgbus: Arc<MessageBus>,
     clock: Box<dyn Clock>,
-    data_engine: DataEngine,
+    data_engine: Arc<std::sync::Mutex<DataEngine>>,
     risk_engine: RiskEngine,
     oms: Oms,
     actors: Vec<Box<dyn Actor>>,
@@ -234,12 +234,13 @@ impl Trader {
         let clock: Box<dyn Clock> = Box::new(SystemClock::new());
 
         // Build DataEngine with shared msgbus — registers endpoints for subscribe/unsubscribe
-        let mut data_engine = DataEngine::new_with_components(
+        let data_engine = Arc::new(std::sync::Mutex::new(DataEngine::new_with_components(
             config.trader_id.clone(),
             Arc::clone(&msgbus),
             Box::new(SystemClock::new()),
-        );
-        data_engine.initialize();
+        )));
+        // Initialize the DataEngine (must hold lock during init to avoid races)
+        data_engine.lock().unwrap().initialize();
 
         // Build RiskEngine with configured risk parameters
         let risk_engine = RiskEngine::new(config.risk.clone(), 100_000.0);
@@ -401,12 +402,12 @@ impl Trader {
     }
 
     /// Get a reference to the data engine.
-    pub fn data_engine(&self) -> &DataEngine {
+    pub fn data_engine(&self) -> &Arc<std::sync::Mutex<DataEngine>> {
         &self.data_engine
     }
 
     /// Get a mutable reference to the data engine.
-    pub fn data_engine_mut(&mut self) -> &mut DataEngine {
+    pub fn data_engine_mut(&mut self) -> &mut Arc<std::sync::Mutex<DataEngine>> {
         &mut self.data_engine
     }
 
