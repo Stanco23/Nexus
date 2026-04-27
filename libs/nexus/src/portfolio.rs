@@ -14,6 +14,8 @@ use crate::buffer::buffer_set::MergeCursor;
 use crate::engine::orders::TrailingOffsetType;
 use crate::engine::{CommissionConfig, Signal};
 use crate::instrument::InstrumentId;
+use crate::live::matching_core::{MatchingCore, MatchResult};
+use crate::messages::OrderSide;
 use crate::signals::SignalBus;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +31,10 @@ pub struct PortfolioConfig {
     pub take_profit_pct: f64,
     /// Trading days per year for Sharpe annualization (252 = standard, 365 = calendar)
     pub trading_days_per_year: f64,
+    /// Use MatchingCore (price-time FIFO) instead of OrderEmulator (probabilistic).
+    /// MatchingCore requires L2 order book data; use for live simulation or
+    /// backtests with synthetic book data. Defaults to false (OrderEmulator).
+    pub use_matching_core: bool,
 }
 
 impl PortfolioConfig {
@@ -39,6 +45,7 @@ impl PortfolioConfig {
             stop_loss_pct: 2.0,
             take_profit_pct: 5.0,
             trading_days_per_year: 252.0,
+            use_matching_core: false,
         }
     }
 
@@ -54,6 +61,11 @@ impl PortfolioConfig {
 
     pub fn with_trading_days(mut self, days: f64) -> Self {
         self.trading_days_per_year = days;
+        self
+    }
+
+    pub fn with_matching_core(mut self) -> Self {
+        self.use_matching_core = true;
         self
     }
 }
@@ -181,8 +193,11 @@ pub struct Portfolio {
     initial_equity_per_instrument: f64,
     states: HashMap<InstrumentId, InstrumentState>,
     signal_bus: Option<Arc<SignalBus>>,
-    /// Order emulator for limit order fill simulation.
+    /// Order emulator for limit order fill simulation (used when use_matching_core = false).
     order_emulator: OrderEmulator,
+    /// Matching cores per instrument (used when use_matching_core = true).
+    /// Provides price-time FIFO matching instead of probabilistic fill modeling.
+    matching_cores: HashMap<InstrumentId, MatchingCore>,
     /// Per-instrument order books built from tick stream.
     order_books: HashMap<InstrumentId, OrderBook>,
 }
@@ -194,6 +209,7 @@ impl Portfolio {
             states: HashMap::new(),
             signal_bus: None,
             order_emulator: OrderEmulator::new(),
+            matching_cores: HashMap::new(),
             order_books: HashMap::new(),
         }
     }
@@ -207,6 +223,14 @@ impl Portfolio {
     /// Strategies can use this to subscribe to signals from other instruments.
     pub fn signal_bus(&self) -> Option<Arc<SignalBus>> {
         self.signal_bus.clone()
+    }
+
+    /// Add a MatchingCore for an instrument. Called automatically when
+    /// `use_matching_core = true` in config and instrument is registered.
+    pub fn add_matching_core(&mut self, instrument_id: InstrumentId, maker_fee: f64, taker_fee: f64) {
+        self.matching_cores
+            .entry(instrument_id.clone())
+            .or_insert_with(|| MatchingCore::new(instrument_id, maker_fee, taker_fee));
     }
 
     pub fn register_instrument(&mut self, instrument_id: InstrumentId) {
@@ -514,19 +538,39 @@ impl Portfolio {
             let book = self.order_books.entry(instrument_id.clone()).or_insert_with(OrderBook::new);
             // Update order book from trade (builds synthetic L2 book from tick flow)
             book.update_from_trade(event.tick);
-            // Update market volume estimate for emulator's fill modeling
-            self.order_emulator.update_market_volume(size);
 
-            // Process pending limit orders — get fills at current price
-            // This must happen before the signal-based position logic so fills
-            // update positions before the strategy sees the new state.
-            let fills = self.order_emulator.process_fills(
-                price,
-                event.tick.vpin,
-                event.tick.timestamp_ns,
-                config.commission.maker_rate,
-                book,
-            );
+            // ── Conditional fill engine: MatchingCore (FIFO) vs OrderEmulator (probabilistic) ──
+            // MatchingCore requires L2 book data — use when running live or with synthetic book.
+            // OrderEmulator uses VPIN-based probabilistic fill modeling — use for tick-based backtest.
+            let fills = if config.use_matching_core {
+                // Get or create MatchingCore for this instrument
+                let core = self.matching_cores
+                    .entry(instrument_id.clone())
+                    .or_insert_with(|| {
+                        MatchingCore::new(
+                            instrument_id.clone(),
+                            config.commission.maker_rate,
+                            config.commission.rate,
+                        )
+                    });
+                // Update market state (price, VPIN, spread estimate)
+                // Default 1.0 bps spread when no quote data available in tick
+                core.update_market(price, event.tick.vpin, 1.0);
+                Vec::new() // MatchingCore fills are returned via submit_limit, not here
+            } else {
+                // Update market volume estimate for emulator's fill modeling
+                self.order_emulator.update_market_volume(size);
+                // Process pending limit orders — get fills at current price
+                // This must happen before the signal-based position logic so fills
+                // update positions before the strategy sees the new state.
+                self.order_emulator.process_fills(
+                    price,
+                    event.tick.vpin,
+                    event.tick.timestamp_ns,
+                    config.commission.maker_rate,
+                    book,
+                )
+            };
 
             for fill in fills {
                 // Handle fill: open or close position based on fill side
@@ -600,15 +644,53 @@ impl Portfolio {
 
             let last_sig = last_signal.get(&instrument_id).copied().unwrap_or(Signal::Close);
 
-            // ── OrderEmulator: submit limit order on signal transition ─────────
-            // When strategy signals a new direction and position is flat,
-            // queue a limit order in the emulator for fill-at-market processing.
-            // The fill handler above will open/close the position when/if fills occur.
-            // ── Market-order signal path (unchanged) ─────────────────────────
-            // NOTE: Both paths run in parallel. Phase 2.9 will add logic to
-            // suppress the market path when a limit order is pending.
-            if final_signal != last_sig {
-                // Limit-order submission to emulator
+            // ── Conditional fill engine: MatchingCore (FIFO) vs OrderEmulator (probabilistic) ──
+            // When MatchingCore is enabled, submit to matching core (returns immediate fills).
+            // When using OrderEmulator, queue in emulator for batch fill processing.
+            if final_signal != last_sig && config.use_matching_core {
+                // MatchingCore: submit_limit returns fills immediately if price crosses
+                let side = match final_signal {
+                    Signal::Buy if current_position <= 0.0 => Some(OrderSide::Buy),
+                    Signal::Sell if current_position >= 0.0 => Some(OrderSide::Sell),
+                    _ => None,
+                };
+                if let Some(side) = side {
+                    let core = self.matching_cores.get_mut(&instrument_id).unwrap();
+                    let client_order_id = format!("o_{}", event.tick.timestamp_ns);
+                    let fills = core.submit_limit(
+                        client_order_id,
+                        side,
+                        price,
+                        size,
+                        event.tick.timestamp_ns,
+                        false, // post_only — not set for signal-based orders
+                    );
+                    // Process fills returned by MatchingCore
+                    for fill in fills {
+                        let fill_side = if fill.side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+                        if fill_side == Side::Buy {
+                            let cur_pos = self.state(&instrument_id).map(|s| s.position).unwrap_or(0.0);
+                            if cur_pos < 0.0 {
+                                self.close_position(&instrument_id, fill.fill_price, &config.commission, fill.ts_event);
+                            }
+                            let pos_after = self.state(&instrument_id).map(|s| s.position).unwrap_or(0.0);
+                            if pos_after <= 0.0 {
+                                self.open_position(&instrument_id, fill.fill_price, fill.fill_size, Signal::Buy, &config.commission, None, None, None);
+                            }
+                        } else {
+                            let cur_pos = self.state(&instrument_id).map(|s| s.position).unwrap_or(0.0);
+                            if cur_pos > 0.0 {
+                                self.close_position(&instrument_id, fill.fill_price, &config.commission, fill.ts_event);
+                            }
+                            let pos_after = self.state(&instrument_id).map(|s| s.position).unwrap_or(0.0);
+                            if pos_after >= 0.0 {
+                                self.open_position(&instrument_id, fill.fill_price, fill.fill_size, Signal::Sell, &config.commission, None, None, None);
+                            }
+                        }
+                    }
+                }
+            } else if final_signal != last_sig {
+                // OrderEmulator: queue limit order for batch fill processing
                 match final_signal {
                     Signal::Buy => {
                         if current_position <= 0.0 {
@@ -635,32 +717,33 @@ impl Portfolio {
                         // (cancel_order removes from pending; no-op if already empty)
                     }
                 }
-                // Market-order position execution (existing behavior unchanged)
-                match final_signal {
-                    Signal::Buy => {
-                        if current_position <= 0.0 {
-                            if current_position < 0.0 {
-                                self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
-                            }
-                            self.open_position(&instrument_id, price, size, Signal::Buy, &config.commission, None, None, None);
-                        }
-                    }
-                    Signal::Sell => {
-                        if current_position >= 0.0 {
-                            if current_position > 0.0 {
-                                self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
-                            }
-                            self.open_position(&instrument_id, price, size, Signal::Sell, &config.commission, None, None, None);
-                        }
-                    }
-                    Signal::Close => {
-                        if current_position != 0.0 {
+            }
+
+            // Market-order position execution (always runs, not gated on signal change)
+            match final_signal {
+                Signal::Buy => {
+                    if current_position <= 0.0 {
+                        if current_position < 0.0 {
                             self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
                         }
+                        self.open_position(&instrument_id, price, size, Signal::Buy, &config.commission, None, None, None);
                     }
                 }
-                last_signal.insert(instrument_id, final_signal);
+                Signal::Sell => {
+                    if current_position >= 0.0 {
+                        if current_position > 0.0 {
+                            self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
+                        }
+                        self.open_position(&instrument_id, price, size, Signal::Sell, &config.commission, None, None, None);
+                    }
+                }
+                Signal::Close => {
+                    if current_position != 0.0 {
+                        self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
+                    }
+                }
             }
+            last_signal.insert(instrument_id, final_signal);
 
             // Update peaks after each tick
             self.update_peaks(&prices);

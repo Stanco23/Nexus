@@ -117,7 +117,7 @@ pub struct MatchResult {
 }
 
 /// Price-time priority matching engine.
-///
+#[derive(Debug)]
 /// Implements proper limit order book matching:
 /// - Price priority: best bid/ask first
 /// - Time priority: FIFO at same price level
