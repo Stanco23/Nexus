@@ -584,6 +584,36 @@ impl OrderBook {
         }
     }
 
+    /// Seed the order book with L2 data (price, size) pairs.
+    /// Clears existing book state before seeding.
+    /// `side`: 1 = bids, 2 = asks.
+    pub fn seed_from_l2(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
+        // Clear existing book
+        self.bids.clear();
+        self.asks.clear();
+        self.bid_queue_depths.clear();
+        self.ask_queue_depths.clear();
+
+        // Seed bids (side = 1)
+        for &(price, size) in bids {
+            self.add_limit_order(price, size, 1);
+        }
+
+        // Seed asks (side = 2)
+        for &(price, size) in asks {
+            self.add_limit_order(price, size, 2);
+        }
+
+        // Compute last_price and spread from seeded levels
+        self.last_price = match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) => (bid + ask) / 2.0,
+            (Some(bid), None) => bid,
+            (None, Some(ask)) => ask,
+            _ => 0.0,
+        };
+        self.spread_bps = self.compute_spread_bps();
+    }
+
     pub fn remove_size(&mut self, price: f64, size: f64, side: u8) {
         let price_int = (price * 1_000_000_000.0) as i64;
         let book_side = if side == 1 {
