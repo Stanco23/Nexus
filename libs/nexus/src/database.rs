@@ -44,16 +44,16 @@ pub trait Database: Send + Sync {
     fn load_positions(&self) -> Result<HashMap<PositionId, Position>>;
 
     // Instruments (stub)
-    fn save_instrument(&self, _instrument_id: &str, _data: &[u8]) -> Result<()> { Ok(()) }
-    fn load_instrument(&self, _instrument_id: &str) -> Result<Option<Vec<u8>>> { Ok(None) }
+    fn save_instrument(&self, instrument_id: &str, data: &[u8]) -> Result<()>;
+    fn load_instrument(&self, instrument_id: &str) -> Result<Option<Vec<u8>>>;
 
     // Accounts
     fn save_account(&self, account: &Account) -> Result<()>;
     fn load_accounts(&self) -> Result<HashMap<AccountId, Account>>;
 
-    // Strategy state (stub)
-    fn save_strategy_state(&self, _strategy_id: &str, _state: &[u8]) -> Result<()> { Ok(()) }
-    fn load_strategy_state(&self, _strategy_id: &str) -> Result<Option<Vec<u8>>> { Ok(None) }
+    // Strategy state
+    fn save_strategy_state(&self, strategy_id: &str, state: &[u8]) -> Result<()>;
+    fn load_strategy_state(&self, strategy_id: &str) -> Result<Option<Vec<u8>>>;
 
     // Equity curve snapshots
     fn save_equity_curve(&self, snapshot: &CacheSnapshot) -> Result<()>;
@@ -129,6 +129,20 @@ impl SqliteDatabase {
             "CREATE TABLE IF NOT EXISTS heartbeats (
                 trader_id TEXT PRIMARY KEY,
                 ts_ns INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS instruments (
+                instrument_id TEXT PRIMARY KEY,
+                data BLOB NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS strategy_state (
+                strategy_id TEXT PRIMARY KEY,
+                data BLOB NOT NULL
             )",
             [],
         )?;
@@ -287,6 +301,52 @@ impl Database for SqliteDatabase {
         })
     }
 
+    fn save_instrument(&self, instrument_id: &str, data: &[u8]) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO instruments (instrument_id, data) VALUES (?1, ?2)",
+                rusqlite::params![instrument_id, data],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn load_instrument(&self, instrument_id: &str) -> Result<Option<Vec<u8>>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT data FROM instruments WHERE instrument_id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![instrument_id])?;
+            if let Some(row) = rows.next()? {
+                let data: Vec<u8> = row.get(0)?;
+                Ok(Some(data))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn save_strategy_state(&self, strategy_id: &str, state: &[u8]) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO strategy_state (strategy_id, data) VALUES (?1, ?2)",
+                rusqlite::params![strategy_id, state],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn load_strategy_state(&self, strategy_id: &str) -> Result<Option<Vec<u8>>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT data FROM strategy_state WHERE strategy_id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![strategy_id])?;
+            if let Some(row) = rows.next()? {
+                let data: Vec<u8> = row.get(0)?;
+                Ok(Some(data))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
     fn flush(&self) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -314,6 +374,8 @@ pub struct MemoryDatabase {
     accounts: Mutex<HashMap<AccountId, Account>>,
     equity_curves: Mutex<Vec<CacheSnapshot>>,
     heartbeat: Mutex<HashMap<String, u64>>,
+    instruments: Mutex<HashMap<String, Vec<u8>>>,
+    strategy_state: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryDatabase {
@@ -324,6 +386,8 @@ impl MemoryDatabase {
             accounts: Mutex::new(HashMap::new()),
             equity_curves: Mutex::new(Vec::new()),
             heartbeat: Mutex::new(HashMap::new()),
+            instruments: Mutex::new(HashMap::new()),
+            strategy_state: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -378,6 +442,24 @@ impl Database for MemoryDatabase {
 
     fn load_heartbeat(&self, trader_id: &TraderId) -> Result<Option<u64>> {
         Ok(self.heartbeat.lock().unwrap().get(&trader_id.0).copied())
+    }
+
+    fn save_instrument(&self, instrument_id: &str, data: &[u8]) -> Result<()> {
+        self.instruments.lock().unwrap().insert(instrument_id.to_string(), data.to_vec());
+        Ok(())
+    }
+
+    fn load_instrument(&self, instrument_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.instruments.lock().unwrap().get(instrument_id).cloned())
+    }
+
+    fn save_strategy_state(&self, strategy_id: &str, state: &[u8]) -> Result<()> {
+        self.strategy_state.lock().unwrap().insert(strategy_id.to_string(), state.to_vec());
+        Ok(())
+    }
+
+    fn load_strategy_state(&self, strategy_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.strategy_state.lock().unwrap().get(strategy_id).cloned())
     }
 
     fn flush(&self) -> Result<()> {
@@ -469,11 +551,15 @@ mod tests {
     #[test]
     fn test_memory_database_all_methods() {
         let db = MemoryDatabase::new();
-        // Verify all stub methods don't panic
+        // Verify instrument storage
         assert!(db.save_instrument("inst1", &[1, 2, 3]).is_ok());
-        assert!(db.load_instrument("inst1").unwrap().is_none());
-        assert!(db.save_strategy_state("strat1", &[1, 2, 3]).is_ok());
-        assert!(db.load_strategy_state("strat1").unwrap().is_none());
+        assert_eq!(db.load_instrument("inst1").unwrap(), Some(vec![1, 2, 3]));
+        // Verify strategy state storage
+        assert!(db.save_strategy_state("strat1", &[4, 5, 6]).is_ok());
+        assert_eq!(db.load_strategy_state("strat1").unwrap(), Some(vec![4, 5, 6]));
+        // Verify missing keys return None
+        assert!(db.load_instrument("missing").unwrap().is_none());
+        assert!(db.load_strategy_state("missing").unwrap().is_none());
         assert!(db.flush().is_ok());
         assert!(db.close().is_ok());
     }

@@ -212,7 +212,7 @@ pub struct Trader {
     trader_id: TraderId,
     config: TraderConfig,
     cache: Arc<std::sync::Mutex<Cache>>,
-    msgbus: MessageBus,
+    msgbus: Arc<MessageBus>,
     clock: Box<dyn Clock>,
     data_engine: DataEngine,
     risk_engine: RiskEngine,
@@ -230,11 +230,16 @@ impl Trader {
     /// Call `add_actor()` to register strategies and adapters, then `start()`.
     pub fn new(config: TraderConfig) -> Self {
         let cache = Arc::new(std::sync::Mutex::new(Cache::new(100_000, 10_000)));
-        let msgbus = MessageBus::new();
+        let msgbus = Arc::new(MessageBus::new());
         let clock: Box<dyn Clock> = Box::new(SystemClock::new());
 
-        // Build DataEngine with its own clock
-        let data_engine = DataEngine::new(Box::new(SystemClock::new()));
+        // Build DataEngine with shared msgbus — registers endpoints for subscribe/unsubscribe
+        let mut data_engine = DataEngine::new_with_components(
+            config.trader_id.clone(),
+            Arc::clone(&msgbus),
+            Box::new(SystemClock::new()),
+        );
+        data_engine.initialize();
 
         // Build RiskEngine with configured risk parameters
         let risk_engine = RiskEngine::new(config.risk.clone(), 100_000.0);
@@ -242,7 +247,7 @@ impl Trader {
         // Build Oms with shared cache and msgbus
         let oms = Oms::new(
             Arc::clone(&cache),
-            Arc::new(msgbus.clone()),
+            Arc::clone(&msgbus),
             crate::engine::account::OmsType::Hedge,
             None,
             None, // submit_child: set via set_submit_child_fn() in live mode
@@ -268,7 +273,7 @@ impl Trader {
             trader_id: config.trader_id.clone(),
             config,
             cache,
-            msgbus,
+            msgbus: Arc::clone(&msgbus),
             clock,
             data_engine,
             risk_engine,
