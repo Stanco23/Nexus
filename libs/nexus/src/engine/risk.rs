@@ -13,6 +13,10 @@
 //! - **Trading state machine**: Active → ReduceOnly → Halted transitions
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::sync::RwLock;
+use tokio::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::actor::{
@@ -37,6 +41,10 @@ pub struct RiskConfig {
     pub daily_loss_limit_pct: f64,
     /// Per-order size hard cap.
     pub max_order_size: f64,
+    /// Max submit order operations per second (0 = no limit).
+    pub max_submit_per_sec: f64,
+    /// Max modify order operations per second (0 = no limit).
+    pub max_modify_per_sec: f64,
 }
 
 impl RiskConfig {
@@ -47,6 +55,8 @@ impl RiskConfig {
             max_drawdown_pct: 1.0,
             daily_loss_limit_pct: 0.05,
             max_order_size: f64::INFINITY,
+            max_submit_per_sec: 10.0, // Default 10 submit/s
+            max_modify_per_sec: 20.0, // Default 20 modify/s
         }
     }
 
@@ -74,6 +84,16 @@ impl RiskConfig {
         self.max_order_size = size;
         self
     }
+
+    pub fn with_max_submit_per_sec(mut self, rate: f64) -> Self {
+        self.max_submit_per_sec = rate;
+        self
+    }
+
+    pub fn with_max_modify_per_sec(mut self, rate: f64) -> Self {
+        self.max_modify_per_sec = rate;
+        self
+    }
 }
 
 impl Default for RiskConfig {
@@ -81,6 +101,60 @@ impl Default for RiskConfig {
         Self::new()
     }
 }
+
+// ============================================================================
+// Throttler — token-bucket rate limiter for order operations
+// ============================================================================
+
+/// Token-bucket throttler for order submit/modify operations.
+struct Throttler {
+    tokens: f64,
+    max_tokens: f64,
+    refill_per_ms: f64,
+    last_refill_ms: u64,
+}
+
+impl Throttler {
+    fn new(max_per_sec: f64, _burst: f64) -> Self {
+        Self {
+            tokens: max_per_sec,
+            max_tokens: max_per_sec,
+            refill_per_ms: max_per_sec / 1000.0,
+            last_refill_ms: current_timestamp_ms(),
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = current_timestamp_ms();
+        let elapsed = now.saturating_sub(self.last_refill_ms);
+        if elapsed > 0 {
+            let refill = elapsed as f64 * self.refill_per_ms;
+            self.tokens = (self.tokens + refill).min(self.max_tokens);
+            self.last_refill_ms = now;
+        }
+    }
+
+    /// Try to acquire 1 token. Returns Ok(()) if acquired, Err(wait_ms) if throttled.
+    fn try_acquire(&mut self) -> Result<(), u64> {
+        self.refill();
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            Ok(())
+        } else {
+            let wait_ms = ((1.0 - self.tokens) / self.refill_per_ms).ceil() as u64;
+            Err(wait_ms)
+        }
+    }
+}
+
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 
 /// Risk engine — evaluates risk checks before order submission.
 pub struct RiskEngine {
@@ -95,6 +169,10 @@ pub struct RiskEngine {
     daily_start_equity: f64,
     /// Live trading state machine — transitions: Active → ReduceOnly → Halted
     trading_state: TradingState,
+    /// Submit order throttle (max N orders per second).
+    submit_throttler: Arc<RwLock<Throttler>>,
+    /// Modify order throttle (max N modifies per second).
+    modify_throttler: Arc<RwLock<Throttler>>,
 }
 
 impl RiskEngine {
@@ -148,6 +226,8 @@ impl RiskEngine {
             daily_loss: 0.0,
             daily_start_equity: initial_equity,
             trading_state: TradingState::Active,
+            submit_throttler: Arc::new(RwLock::new(Throttler::new(10.0, 10.0))),
+            modify_throttler: Arc::new(RwLock::new(Throttler::new(20.0, 20.0))),
         };
 
         engine.initialize();
@@ -288,6 +368,24 @@ impl RiskEngine {
         max_drawdown_pct: f64,
     ) -> Option<&'static str> {
         self.check_order(signal_size, price, current_position, equity, max_drawdown_pct)
+    }
+
+    /// Try to acquire a submit slot. Returns Ok(()) if allowed, Err(retry_ms) if throttled.
+    pub async fn try_submit(&self) -> Result<(), u64> {
+        if self.config.max_submit_per_sec <= 0.0 {
+            return Ok(());
+        }
+        let mut throttle = self.submit_throttler.write().await;
+        throttle.try_acquire()
+    }
+
+    /// Try to acquire a modify slot. Returns Ok(()) if allowed, Err(retry_ms) if throttled.
+    pub async fn try_modify(&self) -> Result<(), u64> {
+        if self.config.max_modify_per_sec <= 0.0 {
+            return Ok(());
+        }
+        let mut throttle = self.modify_throttler.write().await;
+        throttle.try_acquire()
     }
 
     /// Update peak equity after each tick.
