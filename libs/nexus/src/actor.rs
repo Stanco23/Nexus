@@ -54,7 +54,7 @@ use parking_lot::RwLock;
 
 /// Clock time source — object-safe trait for time abstraction.
 /// Implementations: [`TestClock`] for backtesting, [`SystemClock`] for live trading.
-pub trait Clock {
+pub trait Clock: Send + Sync {
     /// Return the current UNIX timestamp in nanoseconds.
     fn timestamp_ns(&self) -> u64;
 
@@ -74,7 +74,7 @@ pub trait Clock {
     /// When the deadline is reached, `handler` is called with the `TimeEvent`.
     /// If no handler is provided, the default handler (if registered) receives it.
     /// The name must be unique per clock.
-    fn set_timer(&mut self, name: &str, deadline_ns: u64, payload: Vec<u8>, handler: Box<dyn FnMut(TimeEvent)>);
+    fn set_timer(&mut self, name: &str, deadline_ns: u64, payload: Vec<u8>, handler: Box<dyn FnMut(TimeEvent) + Send + Sync>);
 
     /// Set a one-shot timer with no specific handler (uses default handler).
     fn set_timer_anonymous(&mut self, name: &str, deadline_ns: u64);
@@ -90,7 +90,7 @@ pub trait Clock {
         interval_ns: u64,
         start_ns: u64,
         stop_ns: Option<u64>,
-        handler: Box<dyn FnMut(TimeEvent)>,
+        handler: Box<dyn FnMut(TimeEvent) + Send + Sync>,
         fire_immediately: bool,
     );
 
@@ -105,7 +105,7 @@ pub trait Clock {
     fn next_time_ns(&self, name: &str) -> u64;
 
     /// Register a default handler for timers that have no specific handler.
-    fn register_default_handler(&mut self, handler: Box<dyn FnMut(TimeEvent)>);
+    fn register_default_handler(&mut self, handler: Box<dyn FnMut(TimeEvent) + Send + Sync>);
 
     /// Advance the clock to `to_ns` and return all timer events that are due.
     /// Timers are consumed once returned.
@@ -119,7 +119,7 @@ pub struct SystemClock {
     #[allow(dead_code)]
     start_ns: u64,
     /// Default handler for orphaned timer events (optional).
-    default_handler: Option<Box<dyn FnMut(TimeEvent)>>,
+    default_handler: Option<Box<dyn FnMut(TimeEvent) + Send + Sync>>,
 }
 
 impl SystemClock {
@@ -134,7 +134,7 @@ impl SystemClock {
     }
 
     /// Set the default handler for timers without a specific callback.
-    pub fn with_default_handler(mut self, handler: impl FnMut(TimeEvent) + 'static) -> Self {
+    pub fn with_default_handler(mut self, handler: impl FnMut(TimeEvent) + Send + Sync + 'static) -> Self {
         self.default_handler = Some(Box::new(handler));
         self
     }
@@ -162,7 +162,7 @@ impl Clock for SystemClock {
         0
     }
 
-    fn set_timer(&mut self, _name: &str, _deadline_ns: u64, _payload: Vec<u8>, _handler: Box<dyn FnMut(TimeEvent)>) {
+    fn set_timer(&mut self, _name: &str, _deadline_ns: u64, _payload: Vec<u8>, _handler: Box<dyn FnMut(TimeEvent) + Send + Sync>) {
         // No-op: SystemClock timers are handled by the external event loop
     }
 
@@ -174,7 +174,7 @@ impl Clock for SystemClock {
         _interval_ns: u64,
         _start_ns: u64,
         _stop_ns: Option<u64>,
-        _handler: Box<dyn FnMut(TimeEvent)>,
+        _handler: Box<dyn FnMut(TimeEvent) + Send + Sync>,
         _fire_immediately: bool,
     ) {
         // No-op
@@ -190,7 +190,7 @@ impl Clock for SystemClock {
         0
     }
 
-    fn register_default_handler(&mut self, handler: Box<dyn FnMut(TimeEvent)>) {
+    fn register_default_handler(&mut self, handler: Box<dyn FnMut(TimeEvent) + Send + Sync>) {
         self.default_handler = Some(handler);
     }
 
@@ -212,7 +212,7 @@ pub struct TestClock {
     /// Active timers: name → TimerData
     timers: BTreeMap<String, TimerData>,
     /// Default handler for timers without a specific callback.
-    default_handler: Option<Box<dyn FnMut(TimeEvent)>>,
+    default_handler: Option<Box<dyn FnMut(TimeEvent) + Send + Sync>>,
 }
 
 /// Internal timer state.
@@ -224,7 +224,7 @@ struct TimerData {
     /// Optional stop deadline (None = never stops).
     stop_ns: Option<u64>,
     /// Callback closure.
-    callback: Option<Box<dyn FnMut(TimeEvent)>>,
+    callback: Option<Box<dyn FnMut(TimeEvent) + Send + Sync>>,
     /// Whether the timer was already cancelled during this advance cycle.
     cancelled: bool,
     /// Payload data passed when timer was set.
@@ -268,7 +268,7 @@ impl Clock for TestClock {
         self.timers.len()
     }
 
-    fn set_timer(&mut self, name: &str, deadline_ns: u64, payload: Vec<u8>, handler: Box<dyn FnMut(TimeEvent)>) {
+    fn set_timer(&mut self, name: &str, deadline_ns: u64, payload: Vec<u8>, handler: Box<dyn FnMut(TimeEvent) + Send + Sync>) {
         self.timers.insert(
             name.to_string(),
             TimerData {
@@ -302,7 +302,7 @@ impl Clock for TestClock {
         interval_ns: u64,
         start_ns: u64,
         stop_ns: Option<u64>,
-        handler: Box<dyn FnMut(TimeEvent)>,
+        handler: Box<dyn FnMut(TimeEvent) + Send + Sync>,
         fire_immediately: bool,
     ) {
         let deadline_ns = if fire_immediately {
@@ -336,7 +336,7 @@ impl Clock for TestClock {
         self.timers.get(name).map(|t| t.deadline_ns).unwrap_or(0)
     }
 
-    fn register_default_handler(&mut self, handler: Box<dyn FnMut(TimeEvent)>) {
+    fn register_default_handler(&mut self, handler: Box<dyn FnMut(TimeEvent) + Send + Sync>) {
         self.default_handler = Some(handler);
     }
 
@@ -1080,7 +1080,7 @@ impl Component {
 /// `RefCell` for interior mutability and is not thread-safe. The backtest engine
 /// is single-threaded so this is acceptable. For multi-threaded use, replace
 /// `RefCell` with `RwLock` in `MessageBus`.
-pub trait Actor {
+pub trait Actor: Send + Sync {
     /// Return the actor's component.
     fn component(&self) -> &Component;
 

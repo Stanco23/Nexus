@@ -578,18 +578,17 @@ impl DataEngine {
         // or Clock::cancel_timers) before DataEngine is dropped, which is the caller's
         // responsibility. The `engine_ptr` is only dereferenced after checking that
         // the timer has not been cancelled.
-        let engine_ptr = self as *mut DataEngine;
+        // Timer callback holds a clone of self_ref so it can call advance_clock safely.
+        // self_ref is set during new() / new_with_components() before any timer is registered.
+        let self_ref = self.self_ref.clone();
         self.clock.set_timer_repeating(
             &timer_name,
             period_ns,
             next_boundary,
             None,
             Box::new(move |event| {
-                // SAFETY: DataEngine must be live for the lifetime of the timer callback.
-                // This is guaranteed when the timer is cancelled before DataEngine is dropped.
-                unsafe {
-                    let engine = &mut *engine_ptr;
-                    engine.advance_clock(event.timestamp_ns);
+                if let Some(ref r) = self_ref {
+                    r.lock().unwrap().advance_clock(event.timestamp_ns);
                 }
             }),
             false, // fire_immediately = false
