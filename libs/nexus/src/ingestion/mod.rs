@@ -1,24 +1,42 @@
-//! Exchange ingestion layer -- WebSocket adapters for market data ingestion.
+//! Exchange ingestion layer — file-based and live market data ingestion.
+//!
+//! # File-based ingestion
+//! Use `BinanceFileIngestor` to download/parse Binance Data Archive CSV files
+//! and write them directly to TVC3 format.
 //!
 //! # Architecture
 //! ```text
-//! BinanceAdapter / BybitAdapter / OKXAdapter
+//! BinanceFileIngestor  /  BinanceHttpIngestor
 //!       |
 //!       v
-//!   Normalized tick stream (TradeTick)
+//!   Parsed BinanceTradeRow
 //!       |
 //!       v
-//!   TvcWriter (with checkpoint every N ticks)
+//!   TradeTick (nano-integer)
+//!       |
+//!       v
+//!   TvcWriter → TVC3 file
 //! ```
 //!
-//! # Usage
+//! # Usage — File-based (offline)
 //! ```ignore
-//! let adapter = BinanceAdapter::new("BTCUSDT", BinanceVenue::Spot);
-//! let writer = TvcWriter::new(path, instrument_id, 1000, 9)?;
-//! adapter.stream(|tick| writer.write_tick(tick))?;
-//! writer.finalize()?;
+//! // Download from Binance Data Archive and convert to TVC3:
+//! cargo run -p nexus --bin ingest -- \
+//!     --exchange binance \
+//!     --symbol BTCUSDT \
+//!     --input ./data \
+//!     --output ./tvc_data \
+//!     --precision 9
 //! ```
+//!
+//! # Usage — Live
+//! See `adapters::BinanceAdapter` for WebSocket streaming ingestion.
 
 pub mod adapters;
+pub mod binance_file;
 
+pub use binance_file::{
+    BinanceFileIngestor, GenericCsvIngestor, BinanceTradeRow, IngestError,
+    IngestResult,
+};
 pub use adapters::{BinanceAdapter, BinanceVenue, NormalizedTick};

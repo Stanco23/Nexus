@@ -193,14 +193,14 @@ Need to:
 
 ## Verified Gaps (2026-04-27 Review)
 
-### Critical — Systematic Fix Queue
-| Gap | File | Description |
-|-----|------|-------------|
-| **H2** | trader.rs | BinanceMarketDataAdapter NOT registered to Trader (orphan impl) |
-| **H4** | actor.rs | `on_order_book_deltas`, `on_order_book_depth`, `on_order_modified` missing in Actor trait |
-| **M2** | engine/risk.rs | No submit/modify throttlers in RiskEngine |
-| **M4** | live/bybit_http_adapter.rs, live/okx_http_adapter.rs | Bybit/OKX don't use rate_limiter from HttpAdapter base |
-| **M16** | buffer/bar_aggregation.rs | Renko/ValueImbalance/ValueRuns fall back to TimeBarAggregator instead of real impl |
+### ✅ All Critical Gaps RESOLVED (2026-04-27)
+| Gap | File | Resolution |
+|-----|------|------------|
+| **H2** | trader.rs | ✅ TradingNode owns `Arc<Mutex<Vec<Box<dyn MarketDataAdapter>>>>` with `add_market_adapter()` |
+| **H4** | actor.rs | ✅ `on_order_book_deltas` + `on_order_modified` added to Actor trait |
+| **M2** | engine/risk.rs | ✅ `Throttler` struct + `try_submit()` / `try_modify()` on RiskEngine |
+| **M4** | bybit_http_adapter.rs, okx_http_adapter.rs | ✅ `RateLimiter` wired into place/cancel/modify order methods |
+| **M16** | buffer/bar_aggregation.rs | ✅ `RenkoBarAggregator` + `ValueImbalanceBarAggregator` + `ValueRunsBarAggregator` all implemented |
 
 ### Stale — Already Resolved
 | Gap | Was | Actual |

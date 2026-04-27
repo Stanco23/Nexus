@@ -244,6 +244,11 @@ impl TickBufferSet {
         &self.instrument_ids
     }
 
+    /// Get the total tick count across all instruments.
+    pub fn total_ticks(&self) -> u64 {
+        self.buffers.values().map(|b| b.num_ticks()).sum()
+    }
+
     /// Get a reference to a specific instrument's TickBuffer.
     pub fn get(&self, instrument_id: &InstrumentId) -> Option<&Arc<TickBuffer>> {
         self.buffers.get(instrument_id)
