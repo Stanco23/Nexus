@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::cache::CacheSnapshot;
 use crate::engine::account::{Account, AccountId, Position};
 use crate::engine::orders::Order;
-use crate::messages::{ClientOrderId, PositionId};
+use crate::messages::{ClientOrderId, PositionId, TraderId};
 
 // =============================================================================
 // DatabaseError
@@ -60,8 +60,8 @@ pub trait Database: Send + Sync {
     fn load_equity_curve(&self) -> Result<Vec<CacheSnapshot>>;
 
     // Heartbeat
-    fn save_heartbeat(&self, ts_ns: u64) -> Result<()>;
-    fn load_heartbeat(&self) -> Result<Option<u64>>;
+    fn save_heartbeat(&self, trader_id: &TraderId, ts_ns: u64) -> Result<()>;
+    fn load_heartbeat(&self, trader_id: &TraderId) -> Result<Option<u64>>;
 
     // Transaction management
     fn flush(&self) -> Result<()>;
@@ -127,7 +127,7 @@ impl SqliteDatabase {
         )?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS heartbeats (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
+                trader_id TEXT PRIMARY KEY,
                 ts_ns INTEGER NOT NULL
             )",
             [],
@@ -262,20 +262,20 @@ impl Database for SqliteDatabase {
         })
     }
 
-    fn save_heartbeat(&self, ts_ns: u64) -> Result<()> {
+    fn save_heartbeat(&self, trader_id: &TraderId, ts_ns: u64) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO heartbeats (id, ts_ns) VALUES (1, ?1)",
-                rusqlite::params![ts_ns as i64],
+                "INSERT OR REPLACE INTO heartbeats (trader_id, ts_ns) VALUES (?1, ?2)",
+                rusqlite::params![trader_id.as_str(), ts_ns as i64],
             )?;
             Ok(())
         })
     }
 
-    fn load_heartbeat(&self) -> Result<Option<u64>> {
+    fn load_heartbeat(&self, trader_id: &TraderId) -> Result<Option<u64>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT ts_ns FROM heartbeats WHERE id = 1")?;
-            let result = stmt.query_row([], |row| {
+            let mut stmt = conn.prepare("SELECT ts_ns FROM heartbeats WHERE trader_id = ?1")?;
+            let result = stmt.query_row(rusqlite::params![trader_id.as_str()], |row| {
                 let ts_ns: i64 = row.get(0)?;
                 Ok(ts_ns as u64)
             });
@@ -313,7 +313,7 @@ pub struct MemoryDatabase {
     positions: Mutex<HashMap<PositionId, Position>>,
     accounts: Mutex<HashMap<AccountId, Account>>,
     equity_curves: Mutex<Vec<CacheSnapshot>>,
-    heartbeat: Mutex<Option<u64>>,
+    heartbeat: Mutex<HashMap<String, u64>>,
 }
 
 impl MemoryDatabase {
@@ -323,7 +323,7 @@ impl MemoryDatabase {
             positions: Mutex::new(HashMap::new()),
             accounts: Mutex::new(HashMap::new()),
             equity_curves: Mutex::new(Vec::new()),
-            heartbeat: Mutex::new(None),
+            heartbeat: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -371,13 +371,13 @@ impl Database for MemoryDatabase {
         Ok(self.equity_curves.lock().unwrap().clone())
     }
 
-    fn save_heartbeat(&self, ts_ns: u64) -> Result<()> {
-        *self.heartbeat.lock().unwrap() = Some(ts_ns);
+    fn save_heartbeat(&self, trader_id: &TraderId, ts_ns: u64) -> Result<()> {
+        self.heartbeat.lock().unwrap().insert(trader_id.0.clone(), ts_ns);
         Ok(())
     }
 
-    fn load_heartbeat(&self) -> Result<Option<u64>> {
-        Ok(*self.heartbeat.lock().unwrap())
+    fn load_heartbeat(&self, trader_id: &TraderId) -> Result<Option<u64>> {
+        Ok(self.heartbeat.lock().unwrap().get(&trader_id.0).copied())
     }
 
     fn flush(&self) -> Result<()> {
@@ -460,8 +460,9 @@ mod tests {
     #[test]
     fn test_save_load_heartbeat() {
         let db = MemoryDatabase::new();
-        db.save_heartbeat(999).unwrap();
-        let loaded = db.load_heartbeat().unwrap();
+        let trader_id = TraderId::new("TRADER-001");
+        db.save_heartbeat(&trader_id, 999).unwrap();
+        let loaded = db.load_heartbeat(&trader_id).unwrap();
         assert_eq!(loaded, Some(999));
     }
 
