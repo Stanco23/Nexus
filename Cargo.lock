@@ -234,6 +234,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde 1.0.228",
  "wasm-bindgen",
  "windows-link",
 ]

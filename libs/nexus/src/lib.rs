@@ -14,6 +14,7 @@ pub mod cache;
 pub mod calibrate;
 pub mod catalog;
 pub mod data;
+pub mod data_manager;
 pub mod database;
 pub mod engine;
 pub mod ingestion;
