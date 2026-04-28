@@ -638,15 +638,25 @@ impl<'a> Iterator for RingIter<'a> {
         {
             match self.buffer.decode_anchor_at(self.current_offset) {
                 Ok(tick) => {
-                    self.last_tick = tick;
-                    self.current_offset += ANCHOR_TICK_SIZE;
-                    self.current_tick_index += 1;
-                    self.anchor_slot += 1;
+                    // Validate: anchors must have side in {0,1} and timestamp must not go backward.
+                    // If the writer placed an OVERFLOW delta at an anchor position (indexed as anchor
+                    // but written as 15-byte delta), the decoded "anchor" will have garbage values.
+                    let side_valid = tick.side <= 1;
+                    let ts_valid = tick.timestamp_ns >= self.last_tick.timestamp_ns;
+                    if side_valid && ts_valid {
+                        self.last_tick = tick;
+                        self.current_offset += ANCHOR_TICK_SIZE;
+                        self.current_tick_index += 1;
+                        self.anchor_slot += 1;
 
-                    if self.last_tick.timestamp_ns > self.end_ns {
-                        return None;
+                        if self.last_tick.timestamp_ns > self.end_ns {
+                            return None;
+                        }
+                        return Some(self.last_tick);
                     }
-                    return Some(self.last_tick);
+                    // Fall through: this position has an OVERFLOW delta but was indexed as anchor.
+                    // Decode it as an overflow delta (15 bytes) and keep anchor_slot unchanged so
+                    // we retry this tick_index at the next anchor_index entry.
                 }
                 Err(_) => return None,
             }

@@ -347,11 +347,12 @@ impl TvcWriter {
 
         self.writer.flush()?;
 
-        // Get the inner file
-        let file = self
+        // Get the inner file and sync to ensure tick data + index reach disk
+        let mut file = self
             .writer
             .into_inner()
             .map_err(|e| WriterError::Io(e.into()))?;
+        file.sync_all()?; // Ensure all data is on disk before we reopen read-only
 
         // Compute SHA256: header (128 bytes) + all tick data + index
         // NOTE: after into_inner(), the original file handle cannot be used for reading.
@@ -377,6 +378,7 @@ impl TvcWriter {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header_bytes)?;
         file.flush()?;
+        file.sync_all()?; // Ensure header hits disk before we close
         drop(file);
 
         // Write digest at end

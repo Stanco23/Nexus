@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::TimeZone;
+use chrono::NaiveDate;
+use chrono::Timelike;
 use nexus::buffer::buffer_set::TickBufferSet;
 use nexus::engine::core::{Signal, PositionSide};
 use nexus::engine::CommissionConfig;
@@ -24,6 +27,10 @@ use nexus::signals::SignalBus;
 #[derive(Clone, Debug)]
 pub struct OrbConfig {
     pub instrument_id: String,
+    /// Trading date (YYYY-MM-DD).
+    pub trading_date: String,
+    /// Parsed trading date for validation.
+    pub trading_naive_date: NaiveDate,
     pub opening_window_minutes: f64,
     pub opening_start_hour: f64,
     pub session_end_hour: f64,
@@ -32,10 +39,14 @@ pub struct OrbConfig {
     pub tick_size: f64,
 }
 
-impl Default for OrbConfig {
-    fn default() -> Self {
+impl OrbConfig {
+    fn from_date(trading_date: &str) -> Self {
+        let naive_date = NaiveDate::parse_from_str(trading_date, "%Y-%m-%d")
+            .expect("invalid trading_date format YYYY-MM-DD");
         Self {
             instrument_id: "BTCUSDT.BINANCE".to_string(),
+            trading_date: trading_date.to_string(),
+            trading_naive_date: naive_date,
             opening_window_minutes: 5.0,
             opening_start_hour: 9.5,
             session_end_hour: 16.0,
@@ -43,6 +54,12 @@ impl Default for OrbConfig {
             position_size: 1.0,
             tick_size: 0.01,
         }
+    }
+}
+
+impl Default for OrbConfig {
+    fn default() -> Self {
+        Self::from_date("2025-01-09")
     }
 }
 
@@ -84,14 +101,28 @@ impl OrbStrategy {
         }
     }
 
-    fn unix_ns_to_est_hour(unix_ns: u64) -> f64 {
-        let unix_sec = unix_ns as f64 / 1_000_000_000.0;
-        let est_sec = (unix_sec + 5.0 * 3600.0) % 86400.0;
-        est_sec / 3600.0
+    /// Converts unix_ns to EST (UTC-5) broken-down datetime.
+    /// Uses FixedOffset to avoid DST complications (EST does not observe DST).
+    fn to_est_datetime(unix_ns: u64) -> chrono::DateTime<chrono::FixedOffset> {
+        // EST = UTC - 5 hours, no DST
+        let est_offset = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+        let utc_dt = chrono::DateTime::from_timestamp(unix_ns as i64 / 1_000_000_000, 0).unwrap();
+        est_offset.from_utc_datetime(&utc_dt.naive_utc())
+    }
+
+    /// Returns EST hour-of-day (0-24) for a timestamp.
+    /// Fixes the % 86400.0 modulo bug by not stripping the calendar date.
+    fn est_hour_of_day(unix_ns: u64) -> f64 {
+        let dt = Self::to_est_datetime(unix_ns);
+        dt.hour() as f64 + dt.minute() as f64 / 60.0 + dt.second() as f64 / 3600.0
     }
 
     fn round_to_tick(&self, price: f64) -> f64 {
         (price / self.config.tick_size).round() * self.config.tick_size
+    }
+
+    fn position_size(&self) -> f64 {
+        self.config.position_size
     }
 
     fn close_position(&mut self) {
@@ -117,11 +148,21 @@ impl PortfolioStrategy for OrbStrategy {
             return Signal::Close;
         }
 
-        let hour = Self::unix_ns_to_est_hour(timestamp_ns);
+        // Validate tick is on the correct trading date (in EST).
+        // This fixes the % 86400.0 modulo bug which was stripping calendar dates
+        // and causing ORB to apply across ALL dates in the data.
+        let est_dt = Self::to_est_datetime(timestamp_ns);
+        if est_dt.date_naive() != self.config.trading_naive_date {
+            // Tick is not on the trading date — reset state and return close
+            self.close_position();
+            return Signal::Close;
+        }
+
+        let hour_of_day = Self::est_hour_of_day(timestamp_ns);
         let opening_end = self.config.opening_end_hour();
 
         // Phase 1: Build opening range
-        if !self.orb_armed && hour < opening_end {
+        if !self.orb_armed && hour_of_day < opening_end {
             if self.orb_high.is_none() || price > self.orb_high.unwrap() {
                 self.orb_high = Some(price);
             }
@@ -132,7 +173,7 @@ impl PortfolioStrategy for OrbStrategy {
         }
 
         // Phase 2: Arm ORB when window closes
-        if !self.orb_armed && hour >= opening_end {
+        if !self.orb_armed && hour_of_day >= opening_end {
             if self.orb_high.is_some() && self.orb_low.is_some() {
                 self.orb_armed = true;
             }
@@ -140,7 +181,7 @@ impl PortfolioStrategy for OrbStrategy {
         }
 
         // Phase 3: Only trade during regular session
-        if hour < opening_end || hour >= self.config.session_end_hour {
+        if hour_of_day < opening_end || hour_of_day >= self.config.session_end_hour {
             return Signal::Close;
         }
 
@@ -225,10 +266,43 @@ fn main() {
         .and_then(|i| args.get(i + 1).cloned())
         .unwrap_or_else(|| "BTCUSDT.BINANCE".to_string());
 
+    // Trading date: try to extract from first matching TVC3 filename (e.g. BTCUSDT_2025-01-01.tvc),
+    // fall back to --date CLI arg, then to default "2025-01-09".
+    let trading_date = std::fs::read_dir(&data_dir)
+        .ok()
+        .and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |e| e == "tvc"))
+                .find(|p| {
+                    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+                    let sym = instrument_id.split('.').next().unwrap_or(&instrument_id);
+                    stem == sym || stem.starts_with(&format!("{}_", sym))
+                })
+        })
+        .and_then(|p| {
+            let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let sym = instrument_id.split('.').next().unwrap_or(&instrument_id);
+            // Extract date suffix: "BTCUSDT_2025-01-01" → "2025-01-01"
+            if stem.starts_with(&format!("{}_", sym)) {
+                Some(stem[sym.len() + 1..].to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            args.iter()
+                .position(|a| a == "--date")
+                .and_then(|i| args.get(i + 1).cloned())
+        })
+        .unwrap_or_else(|| "2025-01-09".to_string());
+
     println!("=== ORB Backtest — Nexus ===");
     println!("Data dir: {:?}", data_dir);
     println!("Output: {}", output_path);
     println!("Instrument: {}", instrument_id);
+    println!("Trading date: {}", trading_date);
 
     // Load TVC files — accepts both "BTCUSDT.tvc" and "BTCUSDT_2025-01-09.tvc"
     let symbol = instrument_id.split('.').next().unwrap_or(&instrument_id);
@@ -263,7 +337,10 @@ fn main() {
     );
 
     // Build portfolio
-    let config = PortfolioConfig::new(100_000.0, CommissionConfig::new(0.0004));
+    // ORB is a signal-based market-order strategy — disable fill engines so the
+    // market-order path handles position updates directly (no double execution).
+    let config = PortfolioConfig::new(100_000.0, CommissionConfig::new(0.0004))
+        .with_fill_engine_disabled();
     let mut portfolio = Portfolio::new(config.initial_equity_per_instrument);
 
     for id in buffer_set.instrument_ids() {
@@ -271,10 +348,9 @@ fn main() {
     }
 
     // Run ORB strategy
-    let strategy = OrbStrategy::new(OrbConfig {
-        instrument_id: instrument_id.clone(),
-        ..Default::default()
-    });
+    let mut orb_config = OrbConfig::from_date(&trading_date);
+    orb_config.instrument_id = instrument_id.clone();
+    let strategy = OrbStrategy::new(orb_config);
 
     let mut cursor = buffer_set.merge_cursor();
     portfolio.run_portfolio::<OrbStrategy>(&mut cursor, &config, || strategy.clone());

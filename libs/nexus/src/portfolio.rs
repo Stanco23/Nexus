@@ -35,6 +35,11 @@ pub struct PortfolioConfig {
     /// MatchingCore requires L2 order book data; use for live simulation or
     /// backtests with synthetic book data. Defaults to false (OrderEmulator).
     pub use_matching_core: bool,
+    /// Whether a fill engine is active (MatchingCore or OrderEmulator).
+    /// When true, fill engine handles position updates — market-order path is disabled.
+    /// When false, market-order path fires on signal changes directly.
+    /// Defaults to true.
+    pub use_fill_engine: bool,
 }
 
 impl PortfolioConfig {
@@ -46,6 +51,7 @@ impl PortfolioConfig {
             take_profit_pct: 5.0,
             trading_days_per_year: 252.0,
             use_matching_core: false,
+            use_fill_engine: true,
         }
     }
 
@@ -66,6 +72,15 @@ impl PortfolioConfig {
 
     pub fn with_matching_core(mut self) -> Self {
         self.use_matching_core = true;
+        self
+    }
+
+    /// Disable the fill engine (MatchingCore / OrderEmulator).
+    /// The market-order path will fire on signal changes directly.
+    /// Use this for strategies that execute purely on signals without
+    /// limit-order fill modeling (e.g. ORB).
+    pub fn with_fill_engine_disabled(mut self) -> Self {
+        self.use_fill_engine = false;
         self
     }
 }
@@ -719,27 +734,35 @@ impl Portfolio {
                 }
             }
 
-            // Market-order position execution (always runs, not gated on signal change)
-            match final_signal {
-                Signal::Buy => {
-                    if current_position <= 0.0 {
-                        if current_position < 0.0 {
+            // Market-order position execution (gated on signal change to avoid over-trading)
+            // ONLY fires when use_fill_engine = false — i.e. neither MatchingCore nor
+            // OrderEmulator is the intended execution path. When a fill engine is active,
+            // position updates are handled exclusively by the fill engine path above
+            // (MatchingCore or OrderEmulator), so this path must be suppressed to avoid
+            // double position updates on the same signal change.
+            let position_size = strategy.position_size();
+            if final_signal != last_sig && !config.use_fill_engine {
+                match final_signal {
+                    Signal::Buy => {
+                        if current_position <= 0.0 {
+                            if current_position < 0.0 {
+                                self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
+                            }
+                            self.open_position(&instrument_id, price, position_size, Signal::Buy, &config.commission, None, None, None);
+                        }
+                    }
+                    Signal::Sell => {
+                        if current_position >= 0.0 {
+                            if current_position > 0.0 {
+                                self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
+                            }
+                            self.open_position(&instrument_id, price, position_size, Signal::Sell, &config.commission, None, None, None);
+                        }
+                    }
+                    Signal::Close => {
+                        if current_position != 0.0 {
                             self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
                         }
-                        self.open_position(&instrument_id, price, size, Signal::Buy, &config.commission, None, None, None);
-                    }
-                }
-                Signal::Sell => {
-                    if current_position >= 0.0 {
-                        if current_position > 0.0 {
-                            self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
-                        }
-                        self.open_position(&instrument_id, price, size, Signal::Sell, &config.commission, None, None, None);
-                    }
-                }
-                Signal::Close => {
-                    if current_position != 0.0 {
-                        self.close_position(&instrument_id, price, &config.commission, event.tick.timestamp_ns);
                     }
                 }
             }
@@ -920,6 +943,12 @@ pub trait PortfolioStrategy {
     /// allowing strategies to set up signal subscriptions.
     /// The default implementation is a no-op.
     fn subscribe_signal(&mut self, _signal_bus: Arc<SignalBus>) {}
+
+    /// Returns the position size for this strategy.
+    /// Subclasses override to specify their configured size.
+    fn position_size(&self) -> f64 {
+        1.0
+    }
 }
 
 #[cfg(test)]
