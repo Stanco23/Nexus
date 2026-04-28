@@ -112,7 +112,7 @@ impl PortfolioStrategy for OrbStrategy {
         _size: f64,
         _portfolio: &mut Portfolio,
     ) -> Signal {
-        let expected_id = InstrumentId::new(&self.config.instrument_id, "BINANCE");
+        let expected_id = InstrumentId::parse(&self.config.instrument_id).expect("invalid instrument ID");
         if instrument_id != expected_id {
             return Signal::Close;
         }
@@ -230,7 +230,7 @@ fn main() {
     println!("Output: {}", output_path);
     println!("Instrument: {}", instrument_id);
 
-    // Load TVC files — only exact "BTCUSDT.tvc" naming (not "BTCUSDT_2025-01-09.tvc" which is TVC0)
+    // Load TVC files — accepts both "BTCUSDT.tvc" and "BTCUSDT_2025-01-09.tvc"
     let symbol = instrument_id.split('.').next().unwrap_or(&instrument_id);
     let files: Vec<(std::path::PathBuf, InstrumentId)> = std::fs::read_dir(&data_dir)
         .expect("Cannot read data directory")
@@ -239,12 +239,18 @@ fn main() {
         .filter(|p| p.extension().map_or(false, |e| e == "tvc"))
         .filter(|p| {
             let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-            // Only accept exact "BTCUSDT.tvc" — reject "BTCUSDT_2025-01-09.tvc" (TVC0 archive files)
-            stem == symbol
+            // Accept "BTCUSDT.tvc" or "BTCUSDT_2025-01-09.tvc" (date-stamped TVC3)
+            stem == symbol || stem.starts_with(&format!("{}_", symbol))
         })
         .map(|p| {
             let stem = p.file_stem().unwrap().to_string_lossy().to_string();
-            let inst_id = InstrumentId::new(&stem, "BINANCE");
+            // Handle both "BTCUSDT.tvc" and "BTCUSDT_2025-01-09.tvc" → symbol = "BTCUSDT"
+            let inst_symbol = if stem.starts_with(&format!("{}_", symbol)) {
+                &stem[..symbol.len()]
+            } else {
+                &stem
+            };
+            let inst_id = InstrumentId::new(inst_symbol, "BINANCE");
             (p, inst_id)
         })
         .collect();

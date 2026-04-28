@@ -4,7 +4,8 @@
 //! ticks to TVC3 format.
 //!
 //! Supports two CSV formats:
-//! 1. **Binance Data Archive** (`id,price,qty,quote_qty,time,is_buyer_maker`)
+//! 1. **Binance Data Archive** (`id,price,qty,quote_qty,time,is_buyer_maker,is_self_trade`)
+//!    — `time` is **nanoseconds**
 //! 2. **Generic trade CSV** (`timestamp,price,quantity,side`)
 
 use std::path::{Path, PathBuf};
@@ -23,8 +24,8 @@ pub struct BinanceTradeRow {
     pub trade_id: u64,
     pub price: f64,
     pub quantity: f64,
-    /// Timestamp in **milliseconds** (Binance format).
-    pub time_ms: u64,
+    /// Timestamp in **microseconds** (Binance Data Archive format).
+    pub time_us: u64,
     /// True if buyer was maker → aggressor is SELL.
     pub is_buyer_maker: bool,
 }
@@ -33,31 +34,36 @@ impl BinanceTradeRow {
     /// Parse a record from Binance Data Archive CSV.
     /// Format: `id,price,qty,quote_qty,time,is_buyer_maker`
     pub fn parse_from_record(record: &csv::StringRecord) -> Option<Self> {
-        if record.len() < 6 {
+        if record.len() < 7 {
             return None;
         }
         let trade_id: u64 = record.get(0)?.parse().ok()?;
         let price: f64 = record.get(1)?.parse().ok()?;
         let quantity: f64 = record.get(2)?.parse().ok()?;
-        let time_ms: u64 = record.get(4)?.parse().ok()?;
-        let is_buyer_maker: bool = record.get(5)?.parse().ok()?;
+        // Column 3 = quote_qty (ignored)
+        let time_us: u64 = record.get(4)?.parse().ok()?;
+        // "True"/"False" from Python CSV — Rust bool::parse needs lowercase
+        let is_buyer_maker: bool = match record.get(5)?.trim() {
+            "True" | "true" => true,
+            "False" | "false" => false,
+            _ => return None,
+        };
         Some(Self {
             trade_id,
             price,
             quantity,
-            time_ms,
+            time_us,
             is_buyer_maker,
         })
     }
 
     /// Convert to a `TradeTick` with nanosecond timestamp and nano-integer fields.
     pub fn to_trade_tick(&self, sequence: u32, precision: u8) -> TradeTick {
-        let ts_ns = self.time_ms * 1_000_000;
+        // Binance Data Archive uses microseconds; convert to nanoseconds for TVC3
         let price_int = (self.price * 10f64.powi(precision as i32)).round() as i64;
         let size_int = (self.quantity * 10f64.powi(precision as i32)).round() as i64;
-        // is_buyer_maker=true → side=1 (SELL), false → side=0 (BUY)
         let side = if self.is_buyer_maker { 1u8 } else { 0u8 };
-        TradeTick::new(ts_ns, price_int, size_int, side, 1, sequence)
+        TradeTick::new(self.time_us * 1000, price_int, size_int, side, 1, sequence)
     }
 }
 
@@ -149,8 +155,7 @@ impl BinanceFileIngestor {
             IngestError::FileOpen(csv_path.display().to_string(), e.to_string())
         })?;
 
-        let _ = rdr.headers();
-
+        // No header row in Binance Data Archive CSVs — first row is data.
         let mut sequence = 0u32;
         let mut count = 0u64;
 
