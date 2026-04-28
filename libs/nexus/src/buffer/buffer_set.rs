@@ -261,7 +261,8 @@ impl TickBufferSet {
 }
 
 /// A tick event from a specific instrument in a multi-instrument context.
-#[derive(Debug, Clone)]
+/// InstrumentId is cloned once per instrument boundary, not per tick.
+#[derive(Debug)]
 pub struct MultiInstrumentEvent<'a> {
     pub instrument_id: InstrumentId,
     pub tick: &'a TradeFlowStats,
@@ -350,6 +351,12 @@ impl<'a> MergeCursor<'a> {
     /// Check if there are more events.
     pub fn has_next(&self) -> bool {
         self.current_event.is_some()
+    }
+
+    /// Resolve an instrument index to the actual InstrumentId.
+    /// The InstrumentId is cloned — only use this at instrument boundaries, not per tick.
+    pub fn instrument_id(&self, idx: usize) -> InstrumentId {
+        self.iterators[idx].instrument_id.clone()
     }
 }
 

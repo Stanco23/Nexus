@@ -10,21 +10,21 @@
 
 **Current Parity:** N/A — misleading metric; engine is broken, parity number is meaningless
 
-**Last Verified:** 2026-04-29 against actual source at `libs/nexus/src/` and `libs/strategy/src/`
+**Last Verified:** 2026-04-29 (fixes committed in `cf136c5` — double-path + ORB modulo bugs resolved)
 
 ---
 
 ## CRITICAL — Active Blockers (stop ship)
 
-| # | Blocker | File | Impact |
+| # | Blocker | File | Impact | Status |
 |---|---------|------|--------|
-| 1 | **Double-path execution bug** — `process_fills` (OrderEmulator) AND market-order path BOTH fire on same signal | `portfolio.rs:542–782` | 80 trades vs 22 expected; over-trading |
-| 2 | **`NoOpStrategyCtx` stub** — all methods return 0/None/empty; signals discarded | `actor_wrapper.rs:237–282` | Live trading completely non-functional |
+| 1 | **Double-path execution bug** — `process_fills` (OrderEmulator) AND market-order path BOTH fire on same signal | `portfolio.rs:542–782` | 80 trades vs 22 expected; over-trading | ✅ FIXED — `use_fill_engine` flag gates market-order path; ORB uses `.with_fill_engine_disabled()` |
+| 2 | **`NoOpStrategyCtx` stub** — all methods return 0/None/empty; signals discarded | `actor_wrapper.rs:237–282` | Live trading completely non-functional | ❌ |
 | 3 | **`add_strategy()` missing** — not defined on `TradingNode` | `trader.rs` | Cannot attach any strategy to live node |
 | 4 | **`BinanceMarketDataAdapter` not wired** — exists but never registered to `TradingNode` | `trader.rs` | No live market data feed |
 | 5 | **`SystemClock::next_time_ns` stub** — returns `0` always | `actor.rs:190` | Clock-driven events won't fire |
 | 6 | **`data/messages.rs` missing serde** — no `Serialize`/`Deserialize` on any struct | `data/messages.rs` | Cross-process messaging broken |
-| 7 | **ORB timestamp modulo bug** — `% 86400.0` strips calendar date | `orb_backtest.rs:89` | ORB range logic applies across ALL dates not just target |
+| 7 | **ORB timestamp modulo bug** — `% 86400.0` strips calendar date | `orb_backtest.rs:89` | ORB fires on every date's 09:30–14:30 window; 80 trades vs 22 | ✅ FIXED — `chrono::FixedOffset` date validation rejects wrong dates; 26 trades vs Python 22 |
 | 8 | **`TimeBarAggregator::bar_type()` panic** — `unimplemented!()` at runtime | `bar_aggregation.rs:660` | Triggered when time-based bars (Minute/Hour/Day) are used in live engine — line 1558 routes to `TimeBarAggregator::with_period_ns` |
 | 9 | **Multi-venue file ingestion missing** — Bybit/OKX/Coinbase cannot produce TVC3 files | `ingestion/` | Only Binance has CSV→TVC3 converter; ring-buffer-once philosophy requires pre-built TVC3 per venue; can't build multi-venue datasets |
 | 11 | **No DataManager** — no structured folder layout, no catalog, no auto-download-on-miss | `data_manager/` | Blocks the entire load-once sweep-many philosophy for any venue other than Binance |
@@ -283,7 +283,7 @@ impl TradingNode {
 | **ORB modulo bug** | `orb_backtest.rs:89` | 🟡 High — wrong date filtering |
 | **LiveStrategyCtx not impl** | `live_strategy.rs` | 🟡 High — Phase 3.7 blocked |
 | **Database no impl** | — | 🟡 High — persistence missing |
-| **7 secondary cache indices** | `cache/` | 🟡 Medium |
+| **Performance bottlenecks (post-correctness)** | `portfolio.rs:541–800` | 🟡 Medium — backtest loop is single-threaded; 1.5M ticks @ ~770K/sec on Ryzen 7 2700. HashMap `contains_key` + `entry().or_insert()` on every tick (wasted probes); `instrument_id.clone()` on every tick (~50MB of copies); integer→float division per tick; `chrono::FixedOffset` date validation per tick; no SIMD; no parallelism (uses 1 of 8 cores) | ❌ Future |
 
 ---
 
