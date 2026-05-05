@@ -6,26 +6,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::book::{OrderEmulator, Side};
 use crate::engine::orders::{Order, OrderSide, OrderType};
-use crate::instrument::InstrumentId;
+use crate::types::InstrumentId;
+use nexus_types::PositionSide;
 #[allow(unused_imports)]
 use crate::messages::{ClientOrderId, StrategyId, Venue};
 use crate::signals::{SignalBus, SignalCallback};
 use crate::strategy_ctx::StrategyCtx;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Signal {
-    Buy,
-    Sell,
-    Close,
-}
-
-/// Position side for an instrument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PositionSide {
-    Long,
-    Short,
-    Flat,
-}
+/// Trading signal for direction: Buy, Sell, or Close (no-op).
+pub use nexus_types::Signal;
 
 #[derive(Debug, Clone)]
 pub struct Trade {
@@ -216,8 +205,49 @@ impl EngineContext {
     }
 
     /// Add a new pending order to the context's order tracking.
-    pub fn add_pending_order(&mut self, order: Order) {
-        self.pending_orders.push(order);
+    pub fn add_pending_order(&mut self, order: nexus_types::Order) {
+        // Convert from nexus_types::Order to internal Order format
+        let venue_str = order.instrument_id.exchange.clone();
+        let internal_order = Order {
+            id: order.id,
+            client_order_id: ClientOrderId::new(&format!("ctx_{}", order.id)),
+            strategy_id: StrategyId::new(""),
+            instrument_id: order.instrument_id,
+            venue: Venue::new(&venue_str),
+            side: match order.side {
+                nexus_types::OrderSide::Buy => OrderSide::Buy,
+                nexus_types::OrderSide::Sell => OrderSide::Sell,
+            },
+            order_type: match order.order_type {
+                nexus_types::OrderType::Market => OrderType::Market,
+                nexus_types::OrderType::Limit => OrderType::Limit,
+                nexus_types::OrderType::Stop => OrderType::Stop,
+                nexus_types::OrderType::StopLimit => OrderType::StopLimit,
+            },
+            price: order.price,
+            size: order.size,
+            sl: if order.sl != 0.0 { Some(order.sl) } else { None },
+            tp: if order.tp != 0.0 { Some(order.tp) } else { None },
+            filled: order.filled,
+            triggered: false,
+            position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+            activation_price: None,
+            is_activated: false,
+            trigger_price: None,
+            limit_offset: None,
+            contingency_type: crate::engine::orders::ContingencyType::None,
+            linked_order_ids: Vec::new(),
+            order_list_id: None,
+            trigger_type: crate::engine::orders::TriggerType::Default,
+            post_only: false,
+            reduce_only: false,
+        };
+        self.pending_orders.push(internal_order);
     }
 
     /// Remove a pending order by ID.
@@ -267,13 +297,13 @@ impl EngineContext {
 impl StrategyCtx for EngineContext {
     /// Current market price for an instrument.
     /// Returns the last known price from the tick loop, or 0.0 if no price seen.
-    fn current_price(&self, instrument_id: &InstrumentId) -> f64 {
+    fn current_price(&self, instrument_id: InstrumentId) -> f64 {
         self.get_price(instrument_id.id)
     }
 
     /// Current position side for an instrument.
     /// Returns Long, Short, or Flat.
-    fn position(&self, instrument_id: &InstrumentId) -> Option<PositionSide> {
+    fn position(&self, instrument_id: InstrumentId) -> Option<PositionSide> {
         let pos = self.position(instrument_id.id);
         if pos > 0.0 {
             Some(PositionSide::Long)
@@ -291,18 +321,37 @@ impl StrategyCtx for EngineContext {
 
     /// Unrealized PnL for an open position on an instrument.
     /// Uses the current market price from the tick loop.
-    fn unrealized_pnl(&self, instrument_id: &InstrumentId) -> f64 {
+    fn unrealized_pnl(&self, instrument_id: InstrumentId) -> f64 {
         let current_price = self.get_price(instrument_id.id);
         self.unrealized_pnl(instrument_id.id, current_price)
     }
 
     /// All pending (unfilled) orders for an instrument.
     /// Returns orders tracked in the context's pending_orders list.
-    fn pending_orders(&self, instrument_id: &InstrumentId) -> Vec<Order> {
+    fn pending_orders(&self, instrument_id: InstrumentId) -> Vec<nexus_types::Order> {
         self.pending_orders
             .iter()
             .filter(|o| o.instrument_id.id == instrument_id.id && !o.filled)
-            .cloned()
+            .map(|o| nexus_types::Order {
+                id: o.id,
+                instrument_id: o.instrument_id.clone(),
+                side: match o.side {
+                    OrderSide::Buy => nexus_types::OrderSide::Buy,
+                    OrderSide::Sell => nexus_types::OrderSide::Sell,
+                },
+                order_type: match o.order_type {
+                    OrderType::Market => nexus_types::OrderType::Market,
+                    OrderType::Limit => nexus_types::OrderType::Limit,
+                    OrderType::Stop => nexus_types::OrderType::Stop,
+                    OrderType::StopLimit => nexus_types::OrderType::StopLimit,
+                    _ => nexus_types::OrderType::Limit, // MarketIfTouched, TrailingStop, etc.
+                },
+                price: o.price,
+                size: o.size,
+                sl: o.sl.unwrap_or(0.0),
+                tp: o.tp.unwrap_or(0.0),
+                filled: o.filled,
+            })
             .collect()
     }
 
@@ -326,14 +375,11 @@ impl StrategyCtx for EngineContext {
 
     /// Submit a limit order.
     /// Returns an order ID (0 if emulator not available).
-    fn submit_limit(
-        &mut self,
-        _instrument_id: &InstrumentId,
-        side: OrderSide,
+    fn submit_limit(&mut self, _instrument_id: InstrumentId, side: nexus_types::OrderSide,
         price: f64,
         size: f64,
     ) -> u64 {
-        let side = if side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+        let side = if side == nexus_types::OrderSide::Buy { Side::Buy } else { Side::Sell };
         let ts = 0; // Will be set by caller
 
         // SAFETY: order_emulator is set to point to BacktestEngine's OrderEmulator which lives
@@ -347,13 +393,10 @@ impl StrategyCtx for EngineContext {
     /// Submit a market order.
     /// In the backtest engine, market orders are executed at the current price
     /// from the signal-driven flow. Returns 0 if emulator not available.
-    fn submit_market(
-        &mut self,
-        _instrument_id: &InstrumentId,
-        side: OrderSide,
+    fn submit_market(&mut self, _instrument_id: InstrumentId, side: nexus_types::OrderSide,
         size: f64,
     ) -> u64 {
-        let side = if side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+        let side = if side == nexus_types::OrderSide::Buy { Side::Buy } else { Side::Sell };
         let ts = 0;
 
         if self.order_emulator.0.is_null() {
@@ -366,11 +409,7 @@ impl StrategyCtx for EngineContext {
     /// Creates a linked SL/TP order that is checked on every tick.
     /// Returns an order ID.
     #[allow(clippy::too_many_arguments)]
-    fn submit_with_sl_tp(
-        &mut self,
-        instrument_id: &InstrumentId,
-        side: OrderSide,
-        order_type: OrderType,
+    fn submit_with_sl_tp(&mut self, instrument_id: InstrumentId, side: nexus_types::OrderSide, order_type: nexus_types::OrderType,
         price: f64,
         size: f64,
         sl: Option<f64>,
@@ -379,7 +418,7 @@ impl StrategyCtx for EngineContext {
         // Generate unique order ID
         let order_id = self.next_order_id();
         let client_order_id = ClientOrderId::new(&format!("sl_tp_{}", order_id));
-        let venue = instrument_id.venue.clone();
+        let venue = instrument_id.exchange.clone();
         let instr = instrument_id.clone();
 
         // Create the main order record for tracking
@@ -387,10 +426,18 @@ impl StrategyCtx for EngineContext {
             id: order_id,
             client_order_id,
             strategy_id: StrategyId::new(""),
-            instrument_id: instr,
-            venue,
-            side,
-            order_type,
+            instrument_id: instr.clone(),
+            venue: Venue::new(&instr.exchange),
+            side: match side {
+                nexus_types::OrderSide::Buy => OrderSide::Buy,
+                nexus_types::OrderSide::Sell => OrderSide::Sell,
+            },
+            order_type: match order_type {
+                nexus_types::OrderType::Market => OrderType::Market,
+                nexus_types::OrderType::Limit => OrderType::Limit,
+                nexus_types::OrderType::Stop => OrderType::Stop,
+                nexus_types::OrderType::StopLimit => OrderType::StopLimit,
+            },
             price,
             size,
             sl,
@@ -417,9 +464,9 @@ impl StrategyCtx for EngineContext {
 
         // Submit to emulator if available
         if !self.order_emulator.0.is_null() {
-            let side = if side == OrderSide::Buy { Side::Buy } else { Side::Sell };
+            let side = if side == nexus_types::OrderSide::Buy { Side::Buy } else { Side::Sell };
             match order_type {
-                OrderType::Market => {
+                nexus_types::OrderType::Market => {
                     unsafe { (*self.order_emulator.0).submit_market(size, side, 0) };
                 }
                 _ => {
@@ -428,80 +475,32 @@ impl StrategyCtx for EngineContext {
             }
         }
 
-        // Track in pending orders
-        self.add_pending_order(order);
+        // Track in pending orders (convert to nexus_types for StrategyCtx trait)
+        self.add_pending_order(nexus_types::Order {
+            id: order.id,
+            instrument_id: order.instrument_id,
+            side: match order.side {
+                OrderSide::Buy => nexus_types::OrderSide::Buy,
+                OrderSide::Sell => nexus_types::OrderSide::Sell,
+            },
+            order_type: match order.order_type {
+                OrderType::Market => nexus_types::OrderType::Market,
+                OrderType::Limit => nexus_types::OrderType::Limit,
+                OrderType::Stop => nexus_types::OrderType::Stop,
+                OrderType::StopLimit => nexus_types::OrderType::StopLimit,
+                _ => nexus_types::OrderType::Limit, // MarketIfTouched, TrailingStop, etc.
+            },
+            price: order.price,
+            size: order.size,
+            sl: order.sl.unwrap_or(0.0),
+            tp: order.tp.unwrap_or(0.0),
+            filled: order.filled,
+        });
         order_id
     }
 
-    /// Submit a generic order (limit, market, stop, etc.).
-    /// Routes to OrderEmulator for fill simulation.
-    fn submit_order(&mut self, order: Order) -> u64 {
-        let _instrument_id = order.instrument_id.id;
-        let order_id = order.id;
 
-        // Clone the order for pending tracking
-        let mut order_for_tracking = order.clone();
-        order_for_tracking.id = order_id;
 
-        // Also submit to OrderEmulator for queue position tracking
-        if !self.order_emulator.0.is_null() {
-            let side = if order.side == OrderSide::Buy { Side::Buy } else { Side::Sell };
-            match order.order_type {
-                OrderType::Market | OrderType::MarketIfTouched => {
-                    unsafe { (*self.order_emulator.0).submit_market(order.size, side, 0) };
-                }
-                _ => {
-                    // For limit, stop, etc., use the order price
-                    unsafe { (*self.order_emulator.0).submit_limit(order.price, order.size, side, 0) };
-                }
-            }
-        }
-
-        self.add_pending_order(order_for_tracking);
-        order_id
-    }
-
-    /// Cancel a pending order by ID.
-    /// Removes from context's pending_orders and from OrderEmulator if available.
-    fn cancel_order(&mut self, order_id: u64) -> bool {
-        // Check if we have a pending order with this ID
-        let has_order = self.pending_orders.iter().any(|o| o.id == order_id);
-
-        if has_order {
-            self.remove_pending_order(order_id);
-        }
-
-        // Also attempt to cancel in the OrderEmulator for queue position tracking
-        if !self.order_emulator.0.is_null() {
-            let result = unsafe { (*self.order_emulator.0).cancel_order(order_id) };
-            return has_order || result;
-        }
-
-        has_order
-    }
-
-    /// Total realized and unrealized PnL for an instrument.
-    /// Combines realized PnL from closed trades with unrealized PnL from open position.
-    fn position_pnl(&self, instrument_id: &InstrumentId) -> f64 {
-        let Some(state) = self.instrument_states.get(&instrument_id.id) else {
-            return 0.0;
-        };
-
-        // Unrealized PnL from open position using current market price
-        let current_price = self.get_price(instrument_id.id);
-        let unrealized = if state.position != 0.0 && state.entry_price != 0.0 {
-            if state.position > 0.0 {
-                (current_price - state.entry_price) * state.position.abs()
-            } else {
-                (state.entry_price - current_price) * state.position.abs()
-            }
-        } else {
-            0.0
-        };
-
-        // Total PnL = realized (from closed trades) + unrealized (from open position)
-        state.realized_pnl + unrealized
-    }
 
     /// Generate a trading signal directly.
     /// Publishes to the SignalBus so other strategies/subscribers receive it.

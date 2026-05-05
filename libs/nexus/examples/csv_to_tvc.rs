@@ -38,11 +38,12 @@ fn main() {
         .unwrap_or("BTCUSDT.BINANCE");
 
     // Precision: TVC3 stores price_int = price × 10^precision
-    // For crypto prices (e.g., BTCUSDT ~50,000 with 8 decimal places), use 9
-    // (so nano-integer representation: 50000.0 → 50_000_000_000)
-    let precision: u8 = 9;
-    // Anchor interval: full anchor written every N ticks (100 is a good default)
-    let anchor_interval: u32 = 100;
+    // precision=6: price × 1e6 (micro-satoshis), supports min-tick=0.000001
+    // For BTC ~50,000: 50_000_000_000 at 1e6 precision (fits in i64)
+    // Delta ±1M dollars * 1e6 = ±1e12 (fits in i64, no overflow)
+    let precision: u8 = 6;
+    // Anchor interval: full anchor written every 1024 ticks (compression ratio target: ~5-7 bytes/tick)
+    let anchor_interval: u32 = 1024;
 
     // Compute FNV-1a hash for instrument_id (same as InstrumentId::new in Nexus)
     let instrument_id = nexus::instrument::fnv1a_hash(symbol.as_bytes());
@@ -64,9 +65,9 @@ fn main() {
         // CSV side: "BUY" = aggressor is buy = 0, "SELL" = 1
         let side: u8 = if row[3].trim() == "BUY" { 0 } else { 1 };
 
-        // Convert floats → nano-integers for TVC3
-        let price_int = (price * 1_000_000_000.0) as i64;
-        let size_int = (qty * 1_000_000_000.0) as i64;
+        // Convert floats → micro-integers for TVC3 (precision=1e6)
+        let price_int = (price * 1_000_000.0) as i64;
+        let size_int = (qty * 1_000_000.0) as i64;
 
         let tick = tvc::TradeTick::new(ts_ns, price_int, size_int, side, 1, count as u32);
         writer.write_tick(&tick).expect("Write error");

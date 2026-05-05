@@ -56,7 +56,8 @@ class OrbStrategy:
     def unix_ns_to_est_hour(unix_ns: int) -> float:
         """Convert Unix nanoseconds to hour-of-day in EST (UTC-5, no DST)."""
         unix_sec = unix_ns / 1_000_000_000.0
-        est_sec = (unix_sec + 5.0 * 3600.0) % 86400.0
+        # FIXED: EST = UTC - 5, so subtract 5 hours (not add)
+        est_sec = (unix_sec - 5.0 * 3600.0) % 86400.0
         return est_sec / 3600.0
 
     def round_to_tick(self, price: float) -> float:
@@ -74,7 +75,7 @@ class OrbStrategy:
         opening_end = self.opening_end_hour()
 
         # Phase 1: Build opening range
-        if not self.orb_armed and hour < opening_end:
+        if not self.orb_armed and hour >= 9.5 and hour < opening_end:
             if self.orb_high is None or price > self.orb_high:
                 self.orb_high = price
             if self.orb_low is None or price < self.orb_low:
@@ -214,22 +215,21 @@ class SimplePortfolio:
 
 def read_binance_trades(csv_path: str):
     """
-    Reads Binance Data Archive CSV.
-    Format: id,price,qty,quote_qty,time,is_buyer_maker,is_self_trade
-    time is in MICROSECONDS (Binance Data Archive standard).
-    Convert to nanoseconds to match Rust BinanceFileIngestor.
+    Reads TVC3 CSV export (timestamp in nanoseconds, already converted).
+    Format: timestamp,price,quantity,side,trade_id
+    timestamp is already in nanoseconds (no conversion needed).
     """
     with open(csv_path, 'r') as f:
         reader = csv.reader(f)
+        header = next(reader)
+        print(f"CSV header: {header}")
         for row in reader:
-            if len(row) < 6:
+            if len(row) < 5:
                 continue
             try:
                 price = float(row[1])
                 qty = float(row[2])
-                time_us = int(row[4])   # microseconds
-                # Convert µs → ns (same conversion as Rust BinanceFileIngestor)
-                timestamp_ns = time_us * 1000
+                timestamp_ns = int(row[0])   # timestamp already in nanoseconds
                 yield timestamp_ns, price, qty
             except (ValueError, IndexError):
                 continue

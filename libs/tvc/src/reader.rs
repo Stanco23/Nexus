@@ -1,5 +1,14 @@
 //! TVC3 reader — memory-mapped reading with random access.
 //!
+//! # Layout
+//! ```text
+//! [128-byte header]
+//! [anchor tick 30B][delta 4B or 8B]...
+//!                                      ^ index at EOF
+//! [index: 4B num_anchors + (16B * num_anchors)]
+//! [32B SHA256 digest]
+//! ```
+//!
 //! # Usage
 //! ```ignore
 //! let reader = TvcReader::open("data.tvc")?;
@@ -13,8 +22,8 @@ use std::path::Path;
 
 use crate::compression::{unpack_anchor_at, unpack_base_delta, unpack_overflow_delta};
 use crate::types::{
-    AnchorIndexEntry, AnchorTick, TradeTick, TvcHeader, HEADER_SIZE, INDEX_ENTRY_SIZE,
-    OVERFLOW_ESCAPE,
+    AnchorIndexEntry, AnchorTick, TradeTick, TvcHeader, BASE_DELTA_SIZE,
+    HEADER_SIZE, INDEX_ENTRY_SIZE, OVERFLOW_DELTA_SIZE, OVERFLOW_ESCAPE,
 };
 use crate::writer::bytes_to_header;
 
@@ -95,7 +104,7 @@ impl TvcReader {
         if header.magic != *b"TVC3" {
             return Err(ReaderError::InvalidMagic(header.magic));
         }
-        if header.version != 1 {
+        if header.version != 2 {
             return Err(ReaderError::UnsupportedVersion(header.version));
         }
 
@@ -224,7 +233,7 @@ impl TvcReader {
         let mut current_offset = entry.byte_offset as usize;
         let mut current_tick_index = entry.tick_index;
 
-        // Decode the anchor to prime `last_tick`
+        // Decode the anchor to get our reference point
         let anchor =
             crate::compression::unpack_anchor_at(&self.mmap, current_offset).map_err(|_| {
                 ReaderError::Io(std::io::Error::new(
@@ -248,22 +257,25 @@ impl TvcReader {
         current_offset += crate::types::ANCHOR_TICK_SIZE;
         current_tick_index += 1;
 
+        // Walk forward decoding deltas until we reach the target tick.
+        // Check break BEFORE processing each tick's delta. This ensures:
+        // - When we break, current_offset points to tick_index's data
+        // - self.last_tick == tick_index (already decoded)
+        // - We DON'T increment past the target
         while current_tick_index < tick_index {
             let data = &self.mmap[current_offset..];
-            if data[0] == crate::types::OVERFLOW_ESCAPE {
-                if data.len() < 15 {
+
+            if data[0] == OVERFLOW_ESCAPE {
+                if data.len() < OVERFLOW_DELTA_SIZE {
                     return Err(ReaderError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "",
+                        "Overflow delta truncated",
                     )));
                 }
-                let mut bytes = [0u8; 15];
-                bytes.copy_from_slice(&data[..15]);
-                let decoded = crate::compression::unpack_overflow_delta(
-                    &bytes,
-                    &self.last_tick,
-                    self.last_tick.sequence + 1,
-                );
+                let mut bytes = [0u8; 12];
+                bytes.copy_from_slice(&data[..12]);
+                let decoded =
+                    unpack_overflow_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
                 self.last_tick = TradeTick {
                     timestamp_ns: decoded.timestamp_ns,
                     price_int: decoded.price_int,
@@ -272,92 +284,14 @@ impl TvcReader {
                     flags: decoded.flags,
                     sequence: decoded.sequence,
                 };
-                current_offset += 15;
+                current_offset += OVERFLOW_DELTA_SIZE;
             } else {
-                if data.len() < 4 {
+                if data.len() < BASE_DELTA_SIZE {
                     return Err(ReaderError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "",
+                        "Base delta truncated",
                     )));
                 }
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&data[..4]);
-                let decoded = crate::compression::unpack_base_delta(
-                    &bytes,
-                    &self.last_tick,
-                    self.last_tick.sequence + 1,
-                );
-                self.last_tick = TradeTick {
-                    timestamp_ns: decoded.timestamp_ns,
-                    price_int: decoded.price_int,
-                    size_int: decoded.size_int,
-                    side: decoded.side,
-                    flags: decoded.flags,
-                    sequence: decoded.sequence,
-                };
-                current_offset += 4;
-            }
-            current_tick_index += 1;
-        }
-
-        Ok(current_offset as u64)
-    }
-
-    /// Decode a tick at the given byte offset.
-    /// Returns the decoded tick and the sequence number.
-    ///
-    /// This auto-detects anchor vs delta: if the position is at an anchor
-    /// (identified by the anchor index), it decodes an anchor; otherwise
-    /// it decodes a delta (4B base or 15B overflow).
-    pub fn decode_tick_at(&mut self, byte_offset: usize) -> Result<TradeTick, ReaderError> {
-        let data = &self.mmap[byte_offset..];
-
-        if data[0] == OVERFLOW_ESCAPE {
-            // 15-byte overflow delta
-            let mut bytes = [0u8; 15];
-            bytes.copy_from_slice(&data[..15]);
-            let decoded =
-                unpack_overflow_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
-            self.last_tick = TradeTick {
-                timestamp_ns: decoded.timestamp_ns,
-                price_int: decoded.price_int,
-                size_int: decoded.size_int,
-                side: decoded.side,
-                flags: decoded.flags,
-                sequence: decoded.sequence,
-            };
-            Ok(self.last_tick)
-        } else {
-            // Could be base delta (4B) or anchor (30B with non-0xFF first byte)
-            // Check if first byte could be a valid timestamp delta - base deltas
-            // always have timestamp_delta <= MAX_TIMESTAMP_DELTA, and anchor
-            // timestamps are typically much larger.
-            // Since we can't easily tell from one value, check against our
-            // known anchor positions.
-            let is_anchor = self
-                .anchor_index
-                .iter()
-                .any(|e| e.byte_offset == byte_offset as u64);
-
-            if is_anchor {
-                // Decode as anchor
-                let anchor = unpack_anchor_at(data, 0).map_err(|_| {
-                    ReaderError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Failed to decode anchor",
-                    ))
-                })?;
-                self.last_tick = TradeTick {
-                    timestamp_ns: anchor.timestamp_ns,
-                    price_int: anchor.price_int,
-                    size_int: anchor.size_int,
-                    side: anchor.side,
-                    flags: anchor.flags,
-                    sequence: anchor.sequence,
-                };
-                Ok(self.last_tick)
-            } else {
-                // 4-byte base delta
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&data[..4]);
                 let decoded =
@@ -370,8 +304,73 @@ impl TvcReader {
                     flags: decoded.flags,
                     sequence: decoded.sequence,
                 };
-                Ok(self.last_tick)
+                current_offset += BASE_DELTA_SIZE;
             }
+            current_tick_index += 1;
+        }
+
+        // current_tick_index == tick_index, last_tick == tick_index (decoded)
+        // Return offset of tick_index's data (offset already points past processed deltas)
+        Ok(current_offset as u64)
+    }
+
+    /// Decode a tick at the given byte offset.
+    ///
+    /// Auto-detects anchor vs delta based on anchor_index.
+    pub fn decode_tick_at(&mut self, byte_offset: usize) -> Result<TradeTick, ReaderError> {
+        // Check if this is an anchor position
+        let is_anchor = self
+            .anchor_index
+            .iter()
+            .any(|e| e.byte_offset == byte_offset as u64);
+
+        let data = &self.mmap[byte_offset..];
+
+        if is_anchor {
+            // Decode anchor (30 bytes)
+            let anchor = unpack_anchor_at(data, 0).map_err(|_| {
+                ReaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Failed to decode anchor",
+                ))
+            })?;
+            self.last_tick = TradeTick {
+                timestamp_ns: anchor.timestamp_ns,
+                price_int: anchor.price_int,
+                size_int: anchor.size_int,
+                side: anchor.side,
+                flags: anchor.flags,
+                sequence: anchor.sequence,
+            };
+            Ok(self.last_tick)
+        } else if data[0] == OVERFLOW_ESCAPE {
+            // 12-byte overflow delta
+            let mut bytes = [0u8; 12];
+            bytes.copy_from_slice(&data[..12]);
+            let decoded = unpack_overflow_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
+            self.last_tick = TradeTick {
+                timestamp_ns: decoded.timestamp_ns,
+                price_int: decoded.price_int,
+                size_int: decoded.size_int,
+                side: decoded.side,
+                flags: decoded.flags,
+                sequence: decoded.sequence,
+            };
+            Ok(self.last_tick)
+        } else {
+            // 4-byte base delta
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&data[..4]);
+            let decoded = unpack_base_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
+            self.last_tick = TradeTick {
+                timestamp_ns: decoded.timestamp_ns,
+                price_int: decoded.price_int,
+                size_int: decoded.size_int,
+                side: decoded.side,
+                flags: decoded.flags,
+                sequence: decoded.sequence,
+            };
+            Ok(self.last_tick)
         }
     }
 
@@ -395,16 +394,15 @@ impl TvcReader {
 mod tests {
     use super::*;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_open_invalid_magic() {
-        use tempfile::NamedTempFile;
-
         let mut file = NamedTempFile::new().unwrap();
         // Write a header with wrong magic
         let mut header = [0u8; HEADER_SIZE];
         header[0..4].copy_from_slice(b"XXXX"); // wrong magic
-        header[4] = 1; // version
+        header[4] = 2; // version
         header[5] = 9; // precision
         file.write_all(&header).unwrap();
 

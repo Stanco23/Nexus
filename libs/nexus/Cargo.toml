@@ -7,6 +7,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+nexus-types = { path = "../types" }
+nexus-strategy = { path = "../strategy" }
 tvc.path = "../tvc"
 memmap2 = "0.9"
 libc = "0.2"

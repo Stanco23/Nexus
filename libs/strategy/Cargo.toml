@@ -7,6 +7,10 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-nexus = { path = "../nexus" }
+nexus-types = { path = "../types" }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
+
+[features]
+default = []
+live = []

@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod data;
 pub mod data_manager;
 pub mod database;
+pub mod backtest;
 pub mod engine;
 pub mod ingestion;
 pub mod instrument;
@@ -28,8 +29,20 @@ pub mod portfolio;
 pub mod signals;
 pub mod slippage;
 pub mod strategy_ctx;
-pub use strategy_ctx::StrategyCtx;
 pub mod sweep;
 pub mod trader;
 
+/// Re-exports from nexus-types (shared types with nexus-strategy).
+pub mod types {
+    pub use nexus_types::{Bar, InstrumentId, Order, OrderSide, OrderType, PositionSide, Signal, Tick};
+}
+
+// Re-exports from nexus-strategy for strategy authoring
+pub use nexus_strategy::{Strategy, StrategyCtx};
+
 pub use database::{Database, DatabaseError, SqliteDatabase, MemoryDatabase};
+pub use engine::core::Signal;
+pub use nexus_types::{OrderSide, OrderType, PositionSide};
+
+// Re-export BacktestEngine and BacktestResult from backtest engine module
+pub use backtest::engine::{BacktestEngine, BacktestError, BacktestResult};

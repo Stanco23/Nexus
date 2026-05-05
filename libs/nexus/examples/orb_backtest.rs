@@ -1,383 +1,233 @@
-//! ORB Backtest Runner — Nexus Rust
-//! ==================================
-//! Standalone binary. Run with:
-//!   cargo run -p nexus --example orb_backtest -- --data ./data --output results_orb_nexus.csv
+//! ORB backtest using BacktestEngine (clean builder pattern API).
 //!
-//! Data: TVC files in --data directory (one per instrument).
-//! Output: CSV with date,instrument,entry_price,exit_price,side,pnl,trade_count
+//! Data file names say "Jan 1-5" but actual tick timestamps are Jan 1-5 EST.
+//! RingBuffer header has wall-clock timestamps (wrong), tick data has correct timestamps.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
-
-use chrono::TimeZone;
+use nexus::backtest::BacktestEngine;
 use chrono::NaiveDate;
-use chrono::Timelike;
-use nexus::buffer::buffer_set::TickBufferSet;
-use nexus::engine::core::{Signal, PositionSide};
-use nexus::engine::CommissionConfig;
-use nexus::instrument::InstrumentId;
-use nexus::portfolio::{Portfolio, PortfolioConfig, PortfolioStrategy};
-use nexus::signals::SignalBus;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ORB Config
-// ─────────────────────────────────────────────────────────────────────────────
+fn main() {
+    let instrument = "BTCUSDT";
+    let exchange = "BINANCE";
+    // Actual data range: Jan 1-5 EST based on tick timestamps (not RingBuffer headers)
+    let start_date = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(); // Jan 2 EST trading day
+    let end_date = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+    let data_dir = std::path::PathBuf::from("/home/shadowarch/Nexus/data");
 
-#[derive(Clone, Debug)]
-pub struct OrbConfig {
-    pub instrument_id: String,
-    /// Trading date (YYYY-MM-DD).
-    pub trading_date: String,
-    /// Parsed trading date for validation.
-    pub trading_naive_date: NaiveDate,
-    pub opening_window_minutes: f64,
-    pub opening_start_hour: f64,
-    pub session_end_hour: f64,
-    pub atr_multiplier: f64,
-    pub position_size: f64,
-    pub tick_size: f64,
+    println!("Running ORB backtest for {} {} on {}", instrument, exchange, start_date);
+    println!("Data dir: {:?}", data_dir);
+    println!("Note: RingBuffer headers show wrong timestamps (wall-clock at creation).");
+    println!("      Actual tick timestamps confirm Jan 1-5 EST data.\n");
+
+    let result = BacktestEngine::new()
+        .with_instrument(instrument, exchange).expect("invalid instrument")
+        .with_date_range(start_date, end_date).expect("invalid date range")
+        .with_data_dir(data_dir).expect("data dir not found")
+        .with_initial_equity(100_000.0)
+        .with_commission_bps(0.5)
+        .run(|| OrbStrategy::new())
+        .expect("backtest failed");
+
+    println!("\n=== Backtest Results ===");
+    println!("PnL:              ${:.2}", result.pnl);
+    println!("Max Drawdown:     ${:.2} ({:.2}%)", result.max_drawdown, result.max_drawdown_pct);
+    println!("Trades:           {}", result.num_trades);
+    println!("Ticks:            {}", result.num_ticks);
+    println!("Win Rate:         {:.1}%", result.win_rate * 100.0);
+    println!("Sharpe Ratio:     {:.3}", result.sharpe_ratio);
+    println!("Avg Trade PnL:    ${:.2}", result.avg_trade_pnl);
+    println!("Duration:          {:.1}s", result.duration_secs);
+    println!("Start:            {}", ts_to_date(result.start_ts_ns));
+    println!("End:              {}", ts_to_date(result.end_ts_ns));
 }
 
-impl OrbConfig {
-    fn from_date(trading_date: &str) -> Self {
-        let naive_date = NaiveDate::parse_from_str(trading_date, "%Y-%m-%d")
-            .expect("invalid trading_date format YYYY-MM-DD");
-        Self {
-            instrument_id: "BTCUSDT.BINANCE".to_string(),
-            trading_date: trading_date.to_string(),
-            trading_naive_date: naive_date,
-            opening_window_minutes: 5.0,
-            opening_start_hour: 9.5,
-            session_end_hour: 16.0,
-            atr_multiplier: 1.5,
-            position_size: 1.0,
-            tick_size: 0.01,
-        }
-    }
+fn ts_to_date(ns: u64) -> String {
+    use chrono::DateTime;
+    if ns == 0 { return "N/A".to_string(); }
+    let dt = DateTime::from_timestamp_nanos(ns as i64);
+    dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 
-impl Default for OrbConfig {
-    fn default() -> Self {
-        Self::from_date("2025-01-09")
-    }
-}
-
-impl OrbConfig {
-    fn opening_end_hour(&self) -> f64 {
-        self.opening_start_hour + self.opening_window_minutes / 60.0
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // ORB Strategy
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 
-#[derive(Clone, Debug)]
-pub struct OrbStrategy {
-    config: OrbConfig,
+use nexus::StrategyCtx;
+use nexus_types::{InstrumentId, Signal, Tick};
+
+/// Opening Range Breakout strategy.
+/// - Tracks high/low during first 5 minutes after 9:30 AM EST market open
+/// - At 9:35 EST: arms breakout — longs if price > HH, shorts if price < LL
+/// - 1% stop loss, EOD close at 4:00 PM EST
+#[derive(Clone)]
+struct OrbStrategy {
+    /// High of the opening range (set during 9:30-9:35 EST)
     orb_high: Option<f64>,
+    /// Low of the opening range (set during 9:30-9:35 EST)
     orb_low: Option<f64>,
-    orb_armed: bool,
+    /// Whether position is currently open
     position_open: bool,
-    entry_price: Option<f64>,
-    stop_price: Option<f64>,
-    take_profit: Option<f64>,
-    position_side: PositionSide,
+    /// Direction: 1=long, -1=short, 0=none
+    position_dir: i8,
+    /// Upper band (HH at arming)
+    hh: f64,
+    /// Lower band (LL at arming)
+    ll: f64,
+    /// Entry price when position opened
+    entry_price: f64,
+    /// Stop loss price
+    stop_price: f64,
 }
 
 impl OrbStrategy {
-    fn new(config: OrbConfig) -> Self {
+    fn new() -> Self {
         Self {
-            config,
             orb_high: None,
             orb_low: None,
-            orb_armed: false,
             position_open: false,
-            entry_price: None,
-            stop_price: None,
-            take_profit: None,
-            position_side: PositionSide::Flat,
+            position_dir: 0,
+            hh: 0.0,
+            ll: 0.0,
+            entry_price: 0.0,
+            stop_price: 0.0,
         }
     }
 
-    /// Converts unix_ns to EST (UTC-5) broken-down datetime.
-    /// Uses FixedOffset to avoid DST complications (EST does not observe DST).
-    fn to_est_datetime(unix_ns: u64) -> chrono::DateTime<chrono::FixedOffset> {
-        // EST = UTC - 5 hours, no DST
-        let est_offset = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
-        let utc_dt = chrono::DateTime::from_timestamp(unix_ns as i64 / 1_000_000_000, 0).unwrap();
-        est_offset.from_utc_datetime(&utc_dt.naive_utc())
-    }
-
-    /// Returns EST hour-of-day (0-24) for a timestamp.
-    /// Fixes the % 86400.0 modulo bug by not stripping the calendar date.
-    fn est_hour_of_day(unix_ns: u64) -> f64 {
-        let dt = Self::to_est_datetime(unix_ns);
-        dt.hour() as f64 + dt.minute() as f64 / 60.0 + dt.second() as f64 / 3600.0
-    }
-
-    fn round_to_tick(&self, price: f64) -> f64 {
-        (price / self.config.tick_size).round() * self.config.tick_size
-    }
-
-    fn position_size(&self) -> f64 {
-        self.config.position_size
-    }
-
-    fn close_position(&mut self) {
+    fn reset(&mut self) {
+        self.orb_high = None;
+        self.orb_low = None;
         self.position_open = false;
-        self.entry_price = None;
-        self.stop_price = None;
-        self.take_profit = None;
-        self.position_side = PositionSide::Flat;
+        self.position_dir = 0;
+        self.hh = 0.0;
+        self.ll = 0.0;
+        self.entry_price = 0.0;
+        self.stop_price = 0.0;
     }
 }
 
-impl PortfolioStrategy for OrbStrategy {
+impl nexus_strategy::Strategy for OrbStrategy {
+    fn name(&self) -> &str { "ORB" }
+
+    fn mode(&self) -> nexus_types::BacktestMode {
+        nexus_types::BacktestMode::Tick
+    }
+
+    fn subscribed_instruments(&self) -> Vec<InstrumentId> {
+        vec![InstrumentId::new("BTCUSDT", "BINANCE")]
+    }
+
+    fn parameters(&self) -> Vec<nexus_types::ParameterSchema> {
+        vec![]
+    }
+
+    fn clone_box(&self) -> Box<dyn nexus_strategy::Strategy> {
+        Box::new(self.clone())
+    }
+
+    fn on_reset(&mut self) {
+        self.reset();
+    }
+
     fn on_trade(
         &mut self,
-        instrument_id: InstrumentId,
-        timestamp_ns: u64,
-        price: f64,
-        _size: f64,
-        _portfolio: &mut Portfolio,
-    ) -> Signal {
-        let expected_id = InstrumentId::parse(&self.config.instrument_id).expect("invalid instrument ID");
-        if instrument_id != expected_id {
-            return Signal::Close;
-        }
+        _instrument_id: InstrumentId,
+        tick: &Tick,
+        _ctx: &mut dyn StrategyCtx,
+    ) -> Option<Signal> {
+        let price = tick.price;
+        let ts = tick.timestamp_ns;
 
-        // Validate tick is on the correct trading date (in EST).
-        // This fixes the % 86400.0 modulo bug which was stripping calendar dates
-        // and causing ORB to apply across ALL dates in the data.
-        let est_dt = Self::to_est_datetime(timestamp_ns);
-        if est_dt.date_naive() != self.config.trading_naive_date {
-            // Tick is not on the trading date — reset state and return close
-            self.close_position();
-            return Signal::Close;
-        }
+        // Compute EST minute-of-day from UTC timestamp
+        let utc_h = ((ts / 3_600_000_000_000u64) % 24) as u32;
+        let utc_m = ((ts / 60_000_000_000u64) % 60) as u32;
+        let est_h = if utc_h >= 5 { utc_h - 5 } else { utc_h + 19 };
+        let est_min = est_h * 60 + utc_m;
 
-        let hour_of_day = Self::est_hour_of_day(timestamp_ns);
-        let opening_end = self.config.opening_end_hour();
+        // Key EST minutes:
+        // - 570 = 9:30 AM (market open)
+        // - 575 = 9:35 AM (ORB end + breakout start)
+        // - 960 = 4:00 PM (EOD close)
+        const MARKET_OPEN_MIN: u32 = 570;
+        const ORB_END_MIN: u32 = 575;
+        const EOD_CLOSE_MIN: u32 = 960;
 
-        // Phase 1: Build opening range
-        if !self.orb_armed && hour_of_day < opening_end {
-            if self.orb_high.is_none() || price > self.orb_high.unwrap() {
+        // ── ORB Range Tracking (9:30-9:35 EST, minutes 570-574) ──
+        let in_orb = est_min >= MARKET_OPEN_MIN && est_min < ORB_END_MIN;
+        if in_orb {
+            if self.orb_high.is_none() {
                 self.orb_high = Some(price);
-            }
-            if self.orb_low.is_none() || price < self.orb_low.unwrap() {
                 self.orb_low = Some(price);
+            } else {
+                self.orb_high = Some(self.orb_high.unwrap().max(price));
+                self.orb_low = Some(self.orb_low.unwrap().min(price));
             }
-            return Signal::Close;
         }
 
-        // Phase 2: Arm ORB when window closes
-        if !self.orb_armed && hour_of_day >= opening_end {
-            if self.orb_high.is_some() && self.orb_low.is_some() {
-                self.orb_armed = true;
-            }
-            return Signal::Close;
+        // ── Arming: set HH/LL on first tick at or after minute 575 (9:35 EST) ──
+        // Note: est_min >= 575 (not ==) because ticks arrive ~60s apart, so we may
+        // never hit exactly minute 575. The first tick with est_min >= 575 arms ORB.
+        if est_min >= ORB_END_MIN && self.hh == 0.0 && self.orb_high.is_some() {
+            self.hh = self.orb_high.unwrap();
+            self.ll = self.orb_low.unwrap();
         }
 
-        // Phase 3: Only trade during regular session
-        if hour_of_day < opening_end || hour_of_day >= self.config.session_end_hour {
-            return Signal::Close;
-        }
-
-        // Phase 4: Entry
-        if !self.position_open {
-            let range_width = self.orb_high.unwrap() - self.orb_low.unwrap();
-            let tick = self.config.tick_size;
-
-            if price > self.orb_high.unwrap() {
-                self.entry_price = Some(price);
-                self.stop_price = Some(self.orb_low.unwrap() - tick);
-                self.take_profit = Some(self.round_to_tick(price + range_width * self.config.atr_multiplier));
+        // ── Breakout Entry (every tick once armed) ──
+        if !self.position_open && self.hh > 0.0 {
+            if price > self.hh {
                 self.position_open = true;
-                self.position_side = PositionSide::Long;
-                return Signal::Buy;
-            }
-            if price < self.orb_low.unwrap() {
-                self.entry_price = Some(price);
-                self.stop_price = Some(self.orb_high.unwrap() + tick);
-                self.take_profit = Some(self.round_to_tick(price - range_width * self.config.atr_multiplier));
+                self.position_dir = 1;
+                self.entry_price = price;
+                self.stop_price = self.ll - 0.01 * price;
+                return Some(Signal::Buy);
+            } else if price < self.ll {
                 self.position_open = true;
-                self.position_side = PositionSide::Short;
-                return Signal::Sell;
+                self.position_dir = -1;
+                self.entry_price = price;
+                self.stop_price = self.hh + 0.01 * price;
+                return Some(Signal::Sell);
             }
-            return Signal::Close;
         }
 
-        // Phase 5: Exit
-        if self.position_open {
-            let Some(_entry) = self.entry_price else {
-                return Signal::Close;
+        // ── Stop Loss Check ──
+        if self.position_open && self.position_dir != 0 {
+            let stopped = match self.position_dir {
+                1 => price < self.stop_price,
+                -1 => price > self.stop_price,
+                _ => false,
             };
 
-            let direction = if self.position_side == PositionSide::Long { 1.0 } else { -1.0 };
-            let pnl_ticks = direction * (price - _entry) / self.config.tick_size;
-
-            // Stop loss — 1 tick
-            if pnl_ticks <= -1.0 {
-                self.close_position();
-                return Signal::Close;
+            if stopped {
+                self.position_open = false;
+                self.position_dir = 0;
+                self.hh = 0.0;
+                self.ll = 0.0;
+                self.orb_high = None;
+                self.orb_low = None;
+                return Some(Signal::Close);
             }
 
-            // Take profit — 1.5× range width
-            let tp_ticks = (self.take_profit.unwrap() - _entry) / self.config.tick_size * direction;
-            if pnl_ticks >= tp_ticks {
-                self.close_position();
-                return Signal::Close;
+            // ── EOD Close at or after 4:00 PM EST ──
+            if est_min >= EOD_CLOSE_MIN {
+                self.position_open = false;
+                self.position_open = false;
+                self.position_dir = 0;
+                self.hh = 0.0;
+                self.ll = 0.0;
+                self.orb_high = None;
+                self.orb_low = None;
+                return Some(Signal::Close);
             }
         }
 
-        Signal::Close
+        None
     }
 
-    fn subscribe_signal(&mut self, _signal_bus: Arc<SignalBus>) {}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn main() {
-    let start = Instant::now();
-
-    // Parse args
-    let args: Vec<String> = std::env::args().collect();
-    let data_dir = args
-        .iter()
-        .position(|a| a == "--data")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./data"));
-
-    let output_path = args
-        .iter()
-        .position(|a| a == "--output")
-        .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| "results_orb_nexus.csv".to_string());
-
-    let instrument_id = args
-        .iter()
-        .position(|a| a == "--instrument")
-        .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| "BTCUSDT.BINANCE".to_string());
-
-    // Trading date: try to extract from first matching TVC3 filename (e.g. BTCUSDT_2025-01-01.tvc),
-    // fall back to --date CLI arg, then to default "2025-01-09".
-    let trading_date = std::fs::read_dir(&data_dir)
-        .ok()
-        .and_then(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().map_or(false, |e| e == "tvc"))
-                .find(|p| {
-                    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-                    let sym = instrument_id.split('.').next().unwrap_or(&instrument_id);
-                    stem == sym || stem.starts_with(&format!("{}_", sym))
-                })
-        })
-        .and_then(|p| {
-            let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            let sym = instrument_id.split('.').next().unwrap_or(&instrument_id);
-            // Extract date suffix: "BTCUSDT_2025-01-01" → "2025-01-01"
-            if stem.starts_with(&format!("{}_", sym)) {
-                Some(stem[sym.len() + 1..].to_string())
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            args.iter()
-                .position(|a| a == "--date")
-                .and_then(|i| args.get(i + 1).cloned())
-        })
-        .unwrap_or_else(|| "2025-01-09".to_string());
-
-    println!("=== ORB Backtest — Nexus ===");
-    println!("Data dir: {:?}", data_dir);
-    println!("Output: {}", output_path);
-    println!("Instrument: {}", instrument_id);
-    println!("Trading date: {}", trading_date);
-
-    // Load TVC files — accepts both "BTCUSDT.tvc" and "BTCUSDT_2025-01-09.tvc"
-    let symbol = instrument_id.split('.').next().unwrap_or(&instrument_id);
-    let files: Vec<(std::path::PathBuf, InstrumentId)> = std::fs::read_dir(&data_dir)
-        .expect("Cannot read data directory")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "tvc"))
-        .filter(|p| {
-            let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-            // Accept "BTCUSDT.tvc" or "BTCUSDT_2025-01-09.tvc" (date-stamped TVC3)
-            stem == symbol || stem.starts_with(&format!("{}_", symbol))
-        })
-        .map(|p| {
-            let stem = p.file_stem().unwrap().to_string_lossy().to_string();
-            // Handle both "BTCUSDT.tvc" and "BTCUSDT_2025-01-09.tvc" → symbol = "BTCUSDT"
-            let inst_symbol = if stem.starts_with(&format!("{}_", symbol)) {
-                &stem[..symbol.len()]
-            } else {
-                &stem
-            };
-            let inst_id = InstrumentId::new(inst_symbol, "BINANCE");
-            (p, inst_id)
-        })
-        .collect();
-
-    let buffer_set = TickBufferSet::from_files(files).expect("Failed to load TVC files");
-    println!(
-        "Loaded {} instruments, {} total ticks",
-        buffer_set.num_instruments(),
-        buffer_set.total_ticks()
-    );
-
-    // Build portfolio
-    // ORB is a signal-based market-order strategy — disable fill engines so the
-    // market-order path handles position updates directly (no double execution).
-    let config = PortfolioConfig::new(100_000.0, CommissionConfig::new(0.0004))
-        .with_fill_engine_disabled();
-    let mut portfolio = Portfolio::new(config.initial_equity_per_instrument);
-
-    for id in buffer_set.instrument_ids() {
-        portfolio.register_instrument(id.clone());
+    fn on_bar(
+        &mut self,
+        _instrument_id: InstrumentId,
+        _bar: &nexus_types::Bar,
+        _ctx: &mut dyn StrategyCtx,
+    ) -> Option<Signal> {
+        None // ORB uses tick mode
     }
-
-    // Run ORB strategy
-    let mut orb_config = OrbConfig::from_date(&trading_date);
-    orb_config.instrument_id = instrument_id.clone();
-    let strategy = OrbStrategy::new(orb_config);
-
-    let mut cursor = buffer_set.merge_cursor();
-    portfolio.run_portfolio::<OrbStrategy>(&mut cursor, &config, || strategy.clone());
-
-    // Collect results
-    let pnl = portfolio.portfolio_equity() - config.initial_equity_per_instrument;
-    let max_dd = portfolio.portfolio_max_drawdown();
-    let num_trades = portfolio.total_trades();
-
-    println!("\n=== Results ===");
-    println!("Total PnL:       ${:.2}", pnl);
-    println!("Max Drawdown:     ${:.2}", max_dd);
-    println!("Total Trades:     {}", num_trades);
-    println!("Runtime:          {:?}", start.elapsed());
-
-    // Write CSV
-    let mut wtr = csv::Writer::from_path(&output_path).expect("Cannot open output CSV");
-    wtr.write_record(&["metric", "value"]).ok();
-    wtr.write_record(&["instrument", &instrument_id]).ok();
-    wtr.write_record(&["pnl", &format!("{:.2}", pnl)]).ok();
-    wtr.write_record(&["max_drawdown", &format!("{:.2}", max_dd)]).ok();
-    wtr.write_record(&["num_trades", &num_trades.to_string()]).ok();
-    wtr.flush().ok();
-
-    println!("\nResults written to {}", output_path);
 }
-
-// Add csv dependency to Cargo.toml example metadata at top of file
-// ─────────────────────────────────────────────────────────────────────────────
-// Add to libs/nexus/Cargo.toml:

@@ -26,8 +26,12 @@ pub mod types;
 
 pub use enums::{AssetClass, InstrumentClass, OptionKind};
 pub use expressions::{CompiledExpression, EvalError, ParseExpressionError};
-pub use instrument_id::{InstrumentId, Symbol, Venue, fnv1a_hash};
+pub use instrument_id::{Symbol, Venue}; // InstrumentId from nexus_types
+pub use instrument_id::fnv1a_hash; // kept for compat (internal use)
 pub use registry::InstrumentRegistry;
 pub use synthetic::{parse_formula as parse_synthetic_formula, Formula, SyntheticInstrument};
 pub use tick_scheme::{FixedTickScheme, TieredTickScheme, TickScheme, TickTier};
 pub use types::Instrument;
+
+// InstrumentId lives in nexus_types (shared with nexus-strategy)
+pub use nexus_types::InstrumentId;

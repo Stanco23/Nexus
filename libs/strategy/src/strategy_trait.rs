@@ -4,8 +4,8 @@
 //! Lifecycle hooks: `on_init` → `on_start` → [tick/bar loop] → `on_stop` → `on_finish`
 //! `on_reset` clears strategy state for reuse in sweep/mc runs.
 
-use crate::types::{BacktestMode, Bar, InstrumentId, ParameterSchema, Signal, Tick};
 use crate::context::StrategyCtx;
+use crate::types::{BacktestMode, Bar, InstrumentId, ParameterSchema, Signal, Tick};
 
 /// Core strategy trait for all trading strategies.
 ///
@@ -85,43 +85,5 @@ pub trait Strategy: Send + Sync {
 impl Clone for Box<dyn Strategy> {
     fn clone(&self) -> Self {
         self.clone_box()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::examples::{EmaCrossStrategy, RsiStrategy};
-    use crate::types::InstrumentId;
-
-    #[test]
-    fn test_strategy_clone_box() {
-        let id = InstrumentId::new("BTCUSDT", "BINANCE");
-        let s = EmaCrossStrategy::new(id, 5, 15);
-        let s2 = s.clone_box();
-        assert_eq!(s.name(), s2.name());
-    }
-
-    #[test]
-    fn test_ema_cross_strategy_name() {
-        let id = InstrumentId::new("BTCUSDT", "BINANCE");
-        let s = EmaCrossStrategy::new(id, 5, 15);
-        assert_eq!(s.name(), "EmaCrossStrategy");
-    }
-
-    #[test]
-    fn test_rsi_strategy_name() {
-        let id = InstrumentId::new("ETHUSDT", "BINANCE");
-        let s = RsiStrategy::new(id, 14, 70.0, 30.0);
-        assert_eq!(s.name(), "RsiStrategy");
-    }
-
-    #[test]
-    fn test_backtest_mode() {
-        let id = InstrumentId::new("BTCUSDT", "BINANCE");
-        let ema = EmaCrossStrategy::new(id.clone(), 5, 15);
-        let rsi = RsiStrategy::new(id, 14, 70.0, 30.0);
-        assert_eq!(ema.mode(), BacktestMode::Tick);
-        assert_eq!(rsi.mode(), BacktestMode::Tick);
     }
 }

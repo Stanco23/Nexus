@@ -1501,6 +1501,8 @@ dependencies = [
  "libc",
  "memmap2",
  "nalgebra",
+ "nexus-strategy",
+ "nexus-types",
  "once_cell",
  "parking_lot",
  "rand 0.8.5",
@@ -1536,7 +1538,15 @@ dependencies = [
 name = "nexus-strategy"
 version = "0.1.0"
 dependencies = [
- "nexus",
+ "nexus-types",
+ "serde 1.0.228",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "nexus-types"
+version = "0.1.0"
+dependencies = [
  "serde 1.0.228",
  "thiserror 1.0.69",
 ]

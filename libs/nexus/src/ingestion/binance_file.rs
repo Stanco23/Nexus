@@ -126,7 +126,7 @@ impl BinanceFileIngestor {
     pub fn new(symbol: &str) -> Self {
         Self {
             symbol: symbol.to_uppercase(),
-            precision: 9,
+            precision: 16,
             anchor_interval: 100,
         }
     }

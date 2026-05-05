@@ -17,6 +17,8 @@ use std::fmt;
 
 pub const HEADER_SIZE: usize = 128;
 pub const ANCHOR_TICK_SIZE: usize = 30;
+pub const BASE_DELTA_SIZE: usize = 4;        // 4-byte base delta
+pub const OVERFLOW_DELTA_SIZE: usize = 12;  // 12-byte overflow: [0xFF][2B ts][8B price_extra i64][1B size]
 pub const INDEX_ENTRY_SIZE: usize = 16;
 pub const OVERFLOW_ESCAPE: u8 = 0xFF;
 
@@ -30,7 +32,7 @@ pub const SIDE_SHIFT: u32 = 38;
 pub const FLAGS_SHIFT: u32 = 39;
 
 // Timestamp overflow: 15 bits extra at bit 20
-pub const TIMESTAMP_EXTRA_SHIFT: u32 = 20;
+pub const TIMESTAMP_EXTRA_SHIFT: u32 = 21;
 
 // FIXED_SCALAR for standard precision
 pub const FIXED_SCALAR: i64 = 1_000_000_000;
@@ -78,7 +80,7 @@ const_assert!(std::mem::size_of::<TvcHeader>() == HEADER_SIZE);
 impl TvcHeader {
     /// TVC3 magic bytes: b"TVC3"
     pub const MAGIC: [u8; 4] = *b"TVC3";
-    pub const SUPPORTED_VERSION: u8 = 1;
+    pub const SUPPORTED_VERSION: u8 = 2;
 
     /// Create a new header with default values.
     pub fn new(instrument_id: u32, anchor_interval: u32, decimal_precision: u8) -> Self {
@@ -371,7 +373,7 @@ mod tests {
     fn test_header_magic() {
         let h = TvcHeader::new(0, 1000, 9);
         assert_eq!(h.magic, *b"TVC3");
-        assert_eq!(h.version, 1);
+        assert_eq!(h.version, 2);
     }
 
     #[test]

@@ -20,7 +20,8 @@
 
 use std::collections::HashMap;
 
-use nexus::engine::core::{Signal, PositionSide};
+use nexus::engine::core::Signal;
+use nexus::PositionSide;
 use nexus::instrument::InstrumentId;
 use nexus::portfolio::Portfolio;
 use nexus::signals::SignalBus;

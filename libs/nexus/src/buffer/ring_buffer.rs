@@ -103,7 +103,7 @@ impl RingBuffer {
         if header.magic != *b"TVC3" {
             return Err(RingBufferError::InvalidHeader("Invalid TVC magic".into()));
         }
-        if header.version != 1 {
+        if header.version != 2 {
             return Err(RingBufferError::InvalidHeader("Unsupported version".into()));
         }
 
@@ -302,11 +302,15 @@ impl RingBuffer {
                 break;
             }
 
-            // Check if next tick is an anchor slot
-            let next_anchor_tick = ((tick_index / self.anchor_interval as u64) + 1) * self.anchor_interval as u64;
+            // Check if current tick_index is an anchor (look ahead in anchor_index)
+            let is_anchor = if start_slot + 1 < self.anchor_index.len() {
+                tick_index == self.anchor_index[start_slot + 1].tick_index
+            } else {
+                false
+            };
 
-            if tick_index + 1 == next_anchor_tick && start_slot + 1 < self.anchor_index.len() {
-                // Next tick is an anchor — advance to it
+            if is_anchor {
+                // This tick is an anchor — advance to it
                 start_slot += 1;
                 offset = self.anchor_index[start_slot].byte_offset as usize;
                 last_tick = self.decode_anchor_at(offset)?;
@@ -407,8 +411,9 @@ impl RingBuffer {
         let first_byte = self.mmap[byte_offset];
 
         if first_byte == 0xFF {
-            // 15-byte overflow delta
-            if byte_offset + 15 > self.mmap.len() {
+            // 12-byte overflow delta
+            // Layout: [0xFF][2B ts_extra][8B price_extra i64][1B size+side]
+            if byte_offset + 12 > self.mmap.len() {
                 return Err(RingBufferError::SeekFailed(
                     "Overflow delta beyond bounds".into(),
                 ));
@@ -416,38 +421,36 @@ impl RingBuffer {
 
             let ts_extra_raw =
                 u16::from_le_bytes([self.mmap[byte_offset + 1], self.mmap[byte_offset + 2]]);
-            let price_extra = i32::from_le_bytes([
+            let price_extra = i64::from_le_bytes([
                 self.mmap[byte_offset + 3],
                 self.mmap[byte_offset + 4],
                 self.mmap[byte_offset + 5],
                 self.mmap[byte_offset + 6],
-            ]);
-            let size_extra = i32::from_le_bytes([
                 self.mmap[byte_offset + 7],
                 self.mmap[byte_offset + 8],
                 self.mmap[byte_offset + 9],
                 self.mmap[byte_offset + 10],
             ]);
+            let size_byte = self.mmap[byte_offset + 11];
 
-            const TIMESTAMP_EXTRA_SHIFT: u32 = 20;
-            const OVERFLOW_SIDE_SHIFT: u32 = 20;
-            const OVERFLOW_FLAGS_SHIFT: u32 = 21;
-            const TIMESTAMP_DELTA_MASK: u32 = 0xFFFFF; // 20 bits, matches types.rs
+            // ts_extra encoding:
+            // - marker=0 (bit 15 = 0): ts_extra = ts_extra_raw >> 1 (direct small delta)
+            // - marker=1 (bit 15 = 1): ts_extra = (ts_extra_raw & 0x7FFF) << TIMESTAMP_EXTRA_SHIFT
+            const TIMESTAMP_EXTRA_SHIFT: u32 = 21;
+            let ts_extra = if (ts_extra_raw & 0x8000) == 0 {
+                (ts_extra_raw >> 1) as u64
+            } else {
+                ((ts_extra_raw & 0x7FFF) as u64) << TIMESTAMP_EXTRA_SHIFT
+            };
 
-            let extra_bits = (((ts_extra_raw >> 1) & 0x7FFF) as u64) << TIMESTAMP_EXTRA_SHIFT;
-            let base_packed = u32::from_le_bytes([
-                self.mmap[byte_offset + 11],
-                self.mmap[byte_offset + 12],
-                self.mmap[byte_offset + 13],
-                self.mmap[byte_offset + 14],
-            ]);
-            let ts_base = (base_packed & TIMESTAMP_DELTA_MASK) as u64;
-
-            let timestamp_ns = prev_tick.timestamp_ns + extra_bits + ts_base;
+            let timestamp_ns = prev_tick.timestamp_ns + ts_extra;
             let price_int = prev_tick.price_int + price_extra as i64;
-            let size_int = prev_tick.size_int + size_extra as i64;
-            let side = ((base_packed >> OVERFLOW_SIDE_SHIFT) & 1) as u8;
-            let flags = ((base_packed >> OVERFLOW_FLAGS_SHIFT) & 1) as u8;
+
+            // size_extra: bit 7 = side, bits 0-6 = size sign-magnitude
+            let side = (size_byte >> 7) as u8;
+            let size_sign = if (size_byte & 0x40) != 0 { -1 } else { 1 };
+            let size_magnitude = (size_byte & 0x3F) as i32;
+            let size_int = prev_tick.size_int + (size_sign * size_magnitude) as i64;
 
             Ok((
                 TradeTick {
@@ -455,10 +458,10 @@ impl RingBuffer {
                     price_int,
                     size_int,
                     side,
-                    flags,
+                    flags: prev_tick.flags,
                     sequence: prev_tick.sequence + 1,
                 },
-                15,
+                12,
             ))
         } else {
             // 4-byte base delta
@@ -521,6 +524,13 @@ impl RingBuffer {
     pub fn iter_range(&self, start_ns: u64, end_ns: u64) -> RingIter<'_> {
         RingIter::range(self, start_ns, end_ns)
     }
+
+    /// Create an iterator starting from a specific anchor position.
+    /// Takes decoded first_tick so we don't re-decode it.
+    /// anchor_slot is the index into anchor_index for the current anchor (for iteration state).
+    pub fn iter_from(&self, byte_offset: usize, tick_index: u64, first_tick: TradeTick, anchor_slot: usize) -> RingIter<'_> {
+        RingIter::from_position(self, byte_offset, tick_index, first_tick, anchor_slot)
+    }
 }
 
 // =============================================================================
@@ -582,6 +592,24 @@ impl<'a> RingIter<'a> {
             started: false,
             next_anchor_tick,
             anchor_slot: current_anchor_index as usize + 1,
+        }
+    }
+
+    /// Create an iterator starting from a specific anchor position (for sequential iteration).
+    fn from_position(buffer: &'a RingBuffer, byte_offset: usize, tick_index: u64, first_tick: TradeTick, anchor_slot: usize) -> Self {
+        let anchor_interval = buffer.anchor_interval() as u64;
+        let current_anchor_index = tick_index / anchor_interval;
+        let next_anchor_tick = (current_anchor_index + 1) * anchor_interval;
+
+        Self {
+            buffer,
+            current_offset: byte_offset,
+            current_tick_index: tick_index,
+            last_tick: first_tick,
+            end_ns: u64::MAX,
+            started: false,
+            next_anchor_tick,
+            anchor_slot,
         }
     }
 

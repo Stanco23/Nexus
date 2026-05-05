@@ -13,8 +13,9 @@ pub mod risk;
 pub mod sizing;
 
 pub use core::{
-    CommissionConfig, EngineContext, InstrumentState, PositionSide, Signal, Trade,
+    CommissionConfig, EngineContext, InstrumentState, Signal, Trade,
 };
+pub use nexus_types::PositionSide;
 pub use crate::strategy_ctx::StrategyCtx;
 pub use orders::{Order, OrderManager, OrderSide, OrderType, check_pending_orders, check_sl_tp};
 pub use account::{Account, AccountEvent, AccountId, Balance, Currency, OmsType, Position};

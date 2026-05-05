@@ -137,6 +137,10 @@ pub struct InstrumentState {
     pub realized_pnl: f64,
     pub commissions: f64,
     pub num_trades: usize,
+    /// Number of closed trades with positive PnL.
+    pub num_wins: usize,
+    /// Number of closed trades with negative PnL.
+    pub num_losses: usize,
     pub peak_equity: f64,
     pub max_drawdown: f64,
     /// Stop-loss price for this position (from submit_with_sl_tp).
@@ -161,6 +165,8 @@ impl InstrumentState {
             realized_pnl: 0.0,
             commissions: 0.0,
             num_trades: 0,
+            num_wins: 0,
+            num_losses: 0,
             peak_equity: initial_equity,
             max_drawdown: 0.0,
             sl_price: None,
@@ -215,6 +221,11 @@ pub struct Portfolio {
     matching_cores: HashMap<InstrumentId, MatchingCore>,
     /// Per-instrument order books built from tick stream.
     order_books: HashMap<InstrumentId, OrderBook>,
+    /// Equity curve time series for Sharpe / performance analysis.
+    /// Recorded at each tick with non-zero position change or daily.
+    equity_curve: Vec<f64>,
+    /// Running equity at last record point (for equity_curve tracking).
+    last_equity_record: f64,
 }
 
 impl Portfolio {
@@ -226,6 +237,8 @@ impl Portfolio {
             order_emulator: OrderEmulator::new(),
             matching_cores: HashMap::new(),
             order_books: HashMap::new(),
+            equity_curve: Vec::new(),
+            last_equity_record: initial_equity_per_instrument,
         }
     }
 
@@ -387,6 +400,11 @@ impl Portfolio {
         state.trailing_stop = None;
         state.last_close_ns = ts_init;
         state.last_close_price = Some(price);
+        if pnl > 0.0 {
+            state.num_wins += 1;
+        } else if pnl < 0.0 {
+            state.num_losses += 1;
+        }
         state.num_trades += 1;
 
         pnl
@@ -460,6 +478,59 @@ impl Portfolio {
     /// Total number of trades across all instruments.
     pub fn total_trades(&self) -> usize {
         self.states.values().map(|s| s.num_trades).sum()
+    }
+
+    /// Win rate across all instruments: wins / (wins + losses).
+    /// Returns 0.0 if no closed trades yet.
+    pub fn win_rate(&self) -> f64 {
+        let total_wins: usize = self.states.values().map(|s| s.num_wins).sum();
+        let total_losses: usize = self.states.values().map(|s| s.num_losses).sum();
+        let total_closed = total_wins + total_losses;
+        if total_closed == 0 {
+            return 0.0;
+        }
+        total_wins as f64 / total_closed as f64
+    }
+
+    /// Total number of winning trades across all instruments.
+    pub fn total_wins(&self) -> usize {
+        self.states.values().map(|s| s.num_wins).sum()
+    }
+
+    /// Total number of losing trades across all instruments.
+    pub fn total_losses(&self) -> usize {
+        self.states.values().map(|s| s.num_losses).sum()
+    }
+
+    /// Daily returns derived from equity_curve.
+    /// Each return is (equity[i] - equity[i-1]) / equity[i-1].
+    /// Returns empty if < 2 points recorded.
+    pub fn returns(&self) -> Vec<f64> {
+        if self.equity_curve.len() < 2 {
+            return Vec::new();
+        }
+        let mut rets = Vec::with_capacity(self.equity_curve.len() - 1);
+        for i in 1..self.equity_curve.len() {
+            let prev = self.equity_curve[i - 1];
+            let curr = self.equity_curve[i];
+            if prev > 0.0 {
+                rets.push((curr - prev) / prev);
+            }
+        }
+        rets
+    }
+
+    /// Record current portfolio equity into the equity curve.
+    /// Call this at each tick or bar boundary.
+    pub fn record_equity(&mut self) {
+        let total = self.portfolio_equity();
+        self.last_equity_record = total;
+        self.equity_curve.push(total);
+    }
+
+    /// Returns a view into the equity curve for iteration.
+    pub fn equity_curve(&self) -> &[f64] {
+        &self.equity_curve
     }
 
     /// Set stop-loss and take-profit prices for an existing position.
@@ -640,7 +711,7 @@ impl Portfolio {
                     Signal::Close => 0.0,
                 };
                 // Publish with instrument-specific name for targeted subscriptions
-                let signal_name = format!("{}.{}", instrument_id.symbol.code, instrument_id.venue.code);
+                let signal_name = format!("{}.{}", instrument_id.symbol, instrument_id.exchange);
                 signal_bus.publish(&signal_name, signal_value, event.tick.timestamp_ns);
                 // Also publish a generic "market_signal" for any subscribers interested in all market signals
                 signal_bus.publish("market_signal", signal_value, event.tick.timestamp_ns);

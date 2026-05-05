@@ -25,7 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::compression::pack_delta;
 use crate::types::{
-    AnchorIndexEntry, AnchorTick, TradeTick, TvcHeader, ANCHOR_TICK_SIZE, HEADER_SIZE,
+    AnchorIndexEntry, AnchorTick, TradeTick, TvcHeader, BASE_DELTA_SIZE,
+    OVERFLOW_DELTA_SIZE, ANCHOR_TICK_SIZE, HEADER_SIZE,
 };
 
 /// Errors that can occur during writing.
@@ -242,11 +243,11 @@ impl TvcWriter {
         match packed {
             crate::compression::PackedDelta::Base(bytes) => {
                 self.writer.write_all(&bytes)?;
-                self.current_byte_offset += 4;
+                self.current_byte_offset += BASE_DELTA_SIZE as u64;
             }
             crate::compression::PackedDelta::Overflow(bytes) => {
                 self.writer.write_all(&bytes)?;
-                self.current_byte_offset += 15;
+                self.current_byte_offset += OVERFLOW_DELTA_SIZE as u64;
             }
         }
 
