@@ -272,8 +272,8 @@ impl TvcReader {
                         "Overflow delta truncated",
                     )));
                 }
-                let mut bytes = [0u8; 12];
-                bytes.copy_from_slice(&data[..12]);
+                let mut bytes = [0u8; 14];
+                bytes.copy_from_slice(&data[..14]);
                 let decoded =
                     unpack_overflow_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
                 self.last_tick = TradeTick {
@@ -292,8 +292,8 @@ impl TvcReader {
                         "Base delta truncated",
                     )));
                 }
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&data[..4]);
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&data[..BASE_DELTA_SIZE]);
                 let decoded =
                     unpack_base_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
                 self.last_tick = TradeTick {
@@ -344,9 +344,9 @@ impl TvcReader {
             };
             Ok(self.last_tick)
         } else if data[0] == OVERFLOW_ESCAPE {
-            // 12-byte overflow delta
-            let mut bytes = [0u8; 12];
-            bytes.copy_from_slice(&data[..12]);
+            // 14-byte overflow delta
+            let mut bytes = [0u8; 14];
+            bytes.copy_from_slice(&data[..14]);
             let decoded = unpack_overflow_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
             self.last_tick = TradeTick {
                 timestamp_ns: decoded.timestamp_ns,
@@ -358,9 +358,9 @@ impl TvcReader {
             };
             Ok(self.last_tick)
         } else {
-            // 4-byte base delta
-            let mut bytes = [0u8; 4];
-            bytes.copy_from_slice(&data[..4]);
+            // 8-byte base delta
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&data[..BASE_DELTA_SIZE]);
             let decoded = unpack_base_delta(&bytes, &self.last_tick, self.last_tick.sequence + 1);
             self.last_tick = TradeTick {
                 timestamp_ns: decoded.timestamp_ns,

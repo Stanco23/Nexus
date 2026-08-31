@@ -17,22 +17,22 @@ use std::fmt;
 
 pub const HEADER_SIZE: usize = 128;
 pub const ANCHOR_TICK_SIZE: usize = 30;
-pub const BASE_DELTA_SIZE: usize = 4;        // 4-byte base delta
-pub const OVERFLOW_DELTA_SIZE: usize = 12;  // 12-byte overflow: [0xFF][2B ts][8B price_extra i64][1B size]
+pub const BASE_DELTA_SIZE: usize = 8;        // 8-byte base delta (64 bits: 17 ts_us + 18 price + 27 size + 2 side/flags)
+pub const OVERFLOW_DELTA_SIZE: usize = 14;  // 14-byte overflow: [0xFF][4B ts_i32 µs][4B price_i32][4B size_i32][1B side+flags]
 pub const INDEX_ENTRY_SIZE: usize = 16;
 pub const OVERFLOW_ESCAPE: u8 = 0xFF;
 
-// Bit field positions in 4-byte base delta
-pub const TIMESTAMP_DELTA_BITS: u32 = 20;
-pub const TIMESTAMP_DELTA_MASK: u32 = 0xFFFFF; // bits 0-19
+// Bit field positions in 8-byte base delta
+pub const TIMESTAMP_DELTA_BITS: u32 = 17;       // ts_delta in 1µs units, max 131 milliseconds
+pub const TIMESTAMP_DELTA_MASK: u32 = 0x1FFFF;  // 17 bits, bits 0-16
 pub const PRICE_ZIGZAG_BITS: u32 = 18;
-pub const PRICE_ZIGZAG_MASK: u32 = 0x7FFFF; // bits 0-17 of the field
-pub const PRICE_ZIGZAG_SHIFT: u32 = 20;
-pub const SIDE_SHIFT: u32 = 38;
-pub const FLAGS_SHIFT: u32 = 39;
-
-// Timestamp overflow: 15 bits extra at bit 20
-pub const TIMESTAMP_EXTRA_SHIFT: u32 = 21;
+pub const PRICE_ZIGZAG_MASK: u32 = 0x3FFFF;     // bits 17-34 (18 bits)
+pub const PRICE_ZIGZAG_SHIFT: u32 = 17;
+pub const SIZE_ZIGZAG_BITS: u32 = 27;
+pub const SIZE_ZIGZAG_MASK: u32 = 0x7FFFFFF;   // bits 35-61 (27 bits), ±67M nano-BTC = ±$6,300 at BTC=94k
+pub const SIZE_ZIGZAG_SHIFT: u32 = 35;
+pub const SIDE_SHIFT: u32 = 62;
+pub const FLAGS_SHIFT: u32 = 63;
 
 // FIXED_SCALAR for standard precision
 pub const FIXED_SCALAR: i64 = 1_000_000_000;

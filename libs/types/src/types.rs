@@ -189,6 +189,7 @@ pub enum OrderType {
     Limit,
     Stop,
     StopLimit,
+    TrailingStop,
 }
 
 /// Order type for OMS (Market, Limit, etc.).
@@ -287,7 +288,7 @@ pub enum ParameterType {
     String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ParameterValue {
     Float(f64),
     Int(i64),

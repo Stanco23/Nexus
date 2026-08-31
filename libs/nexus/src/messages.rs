@@ -323,6 +323,8 @@ impl SubmitOrder {
     }
 }
 
+impl crate::actor::Message for SubmitOrder {}
+
 /// Cancel an order command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelOrder {

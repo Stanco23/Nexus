@@ -6,8 +6,10 @@
 //! - `DataIndex`: Maps instruments to TVC files with timestamp ranges for sweep-aware loading
 //! - `Strategy`: Pure signal logic — on_tick() returns Signal, knows nothing about data loading
 
+pub mod capital;
 pub mod engine;
 pub mod data_index;
 
 pub use data_index::DataIndex;
 pub use engine::{BacktestEngine, BacktestError, BacktestResult};
+pub use capital::{CapitalSpread, CapitalSpreadError};

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-pub use crate::buffer::BarType;
+pub use crate::cache::BarType;
 use crate::buffer::tick_buffer::TradeFlowStats;
 use crate::cache::{Bar as CacheBar, OrderBook, QuoteTick};
 use crate::instrument::InstrumentId;

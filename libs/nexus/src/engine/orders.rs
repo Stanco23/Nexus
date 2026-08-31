@@ -460,7 +460,7 @@ pub fn check_pending_orders_with_market(
     }
 
     if fill_signals.len() == 1 {
-        Some(fill_signals[0])
+        Some(fill_signals[0].clone())
     } else if fill_signals.len() > 1 {
         Some(Signal::Close)
     } else {

@@ -3,6 +3,8 @@
 //! This module provides the live execution pipeline:
 //! Strategy -> MsgBus SubmitOrder -> ExecutionClient -> Binance REST/WS -> Fill -> Cache
 
+pub mod actor_wrapper;
+pub mod live_strategy;
 pub mod exchange;
 pub mod execution_client;
 pub mod http_adapter;
@@ -19,6 +21,8 @@ pub mod matching_core;
 pub mod exchange_router;
 pub mod coinbase_http_adapter;
 
+pub use actor_wrapper::StrategyAsActor;
+pub use live_strategy::LiveStrategy;
 pub use exchange::{
     AccountInfoResponse, AssetBalance, BinanceExecutionReport, BybitExecutionReport,
     Exchange, ExchangeError, ExchangeType, ExchangeWs, MarketDataAdapter, MarketDataMessage,

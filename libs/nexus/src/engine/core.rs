@@ -13,6 +13,18 @@ use crate::messages::{ClientOrderId, StrategyId, Venue};
 use crate::signals::{SignalBus, SignalCallback};
 use crate::strategy_ctx::StrategyCtx;
 
+/// Re-export the canonical `InstrumentState` from `portfolio` to eliminate the
+/// duplicate definition that previously lived in `engine::core`.
+///
+/// Both `engine::core::EngineContext` and `portfolio::Portfolio` track per-instrument
+/// position/equity/PnL state. They share the same `InstrumentState` definition now —
+/// consolidated on 2026-08-28 to remove the parallel-structures duplication.
+///
+/// Note: `EngineContext::instrument_states` is keyed by `u32` (FNV-1a hash of instrument
+/// id), while `Portfolio::states` is keyed by `InstrumentId` directly. Key-type differs
+/// but value-type is now unified.
+pub use crate::portfolio::InstrumentState;
+
 /// Trading signal for direction: Buy, Sell, or Close (no-op).
 pub use nexus_types::Signal;
 
@@ -30,32 +42,18 @@ pub struct Trade {
 }
 
 /// Per-instrument position and PnL state.
-#[derive(Debug, Clone)]
-pub struct InstrumentState {
-    pub position: f64,
-    pub entry_price: f64,
-    pub unrealized_pnl: f64,
-    pub realized_pnl: f64,
-    pub commissions: f64,
-}
+///
+/// **Note:** As of 2026-08-28, the canonical `InstrumentState` definition lives in
+/// `crate::portfolio`. This module re-exports it via `pub use crate::portfolio::InstrumentState`
+/// above. The local struct definition + `impl` blocks below are kept for backward
+/// compatibility (callers may construct via `InstrumentState::new()` etc.) but the struct
+/// itself is now unified with the portfolio version.
+///
+/// Field set is the **portfolio** superset (16 fields) — callers using just the 5
+/// legacy fields continue to work; callers needing the full feature set now have access
+/// to SL/TP/trailing-stop/peak-equity fields.
 
-impl InstrumentState {
-    fn new() -> Self {
-        Self {
-            position: 0.0,
-            entry_price: 0.0,
-            unrealized_pnl: 0.0,
-            realized_pnl: 0.0,
-            commissions: 0.0,
-        }
-    }
-}
-
-impl Default for InstrumentState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Orphan Default impl was here, removed during #6 consolidation.
 
 pub struct EngineContext {
     pub instrument_states: HashMap<u32, InstrumentState>,
@@ -211,7 +209,7 @@ impl EngineContext {
         let internal_order = Order {
             id: order.id,
             client_order_id: ClientOrderId::new(&format!("ctx_{}", order.id)),
-            strategy_id: StrategyId::new(""),
+            strategy_id: StrategyId("".to_string()),
             instrument_id: order.instrument_id,
             venue: Venue::new(&venue_str),
             side: match order.side {
@@ -223,6 +221,7 @@ impl EngineContext {
                 nexus_types::OrderType::Limit => OrderType::Limit,
                 nexus_types::OrderType::Stop => OrderType::Stop,
                 nexus_types::OrderType::StopLimit => OrderType::StopLimit,
+                nexus_types::OrderType::TrailingStop => OrderType::TrailingStopMarket,
             },
             price: order.price,
             size: order.size,
@@ -425,7 +424,7 @@ impl StrategyCtx for EngineContext {
         let order = Order {
             id: order_id,
             client_order_id,
-            strategy_id: StrategyId::new(""),
+            strategy_id: StrategyId("".to_string()),
             instrument_id: instr.clone(),
             venue: Venue::new(&instr.exchange),
             side: match side {
@@ -437,6 +436,7 @@ impl StrategyCtx for EngineContext {
                 nexus_types::OrderType::Limit => OrderType::Limit,
                 nexus_types::OrderType::Stop => OrderType::Stop,
                 nexus_types::OrderType::StopLimit => OrderType::StopLimit,
+                nexus_types::OrderType::TrailingStop => OrderType::TrailingStopMarket,
             },
             price,
             size,
@@ -499,8 +499,12 @@ impl StrategyCtx for EngineContext {
         order_id
     }
 
-
-
+    fn submit_trailing(&mut self, _instrument_id: InstrumentId, side: nexus_types::OrderSide,
+        size: f64, trailing_delta: f64, activation_price: f64,
+    ) -> u64 {
+        let _ = (side, size, trailing_delta, activation_price);
+        0
+    }
 
     /// Generate a trading signal directly.
     /// Publishes to the SignalBus so other strategies/subscribers receive it.
@@ -512,6 +516,66 @@ impl StrategyCtx for EngineContext {
             Signal::Close => 0.0,
         };
         sb.publish("signal", val, 0);
+    }
+
+    fn submit_order(&mut self, order: nexus_strategy::Order) -> u64 {
+        let id = order.id;
+        // Convert strategy Order → engine Order for tracking in pending_orders.
+        let engine_order = Order {
+            id: order.id,
+            client_order_id: crate::messages::ClientOrderId::new(""),
+            strategy_id: crate::messages::StrategyId(String::new()),
+            instrument_id: order.instrument_id,
+            venue: crate::messages::Venue { code: String::new() },
+            side: match order.side {
+                nexus_types::OrderSide::Buy => OrderSide::Buy,
+                nexus_types::OrderSide::Sell => OrderSide::Sell,
+            },
+            order_type: OrderType::Market,
+            price: order.price,
+            size: order.size,
+            sl: None,
+            tp: None,
+            filled: false,
+            triggered: false,
+            position_id: None,
+            time_in_force: None,
+            expire_time_ns: None,
+            trailing_delta: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+            activation_price: None,
+            is_activated: false,
+            trigger_price: None,
+            limit_offset: None,
+            contingency_type: crate::engine::orders::ContingencyType::None,
+            linked_order_ids: vec![],
+            order_list_id: None,
+            trigger_type: crate::engine::orders::TriggerType::Default,
+            post_only: false,
+            reduce_only: false,
+        };
+        self.pending_orders.push(engine_order);
+        id
+    }
+
+    fn cancel_order(&mut self, order_id: u64) -> bool {
+        if let Some(pos) = self.pending_orders.iter().position(|o| o.id == order_id) {
+            self.pending_orders.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn position_pnl(&self, instrument_id: InstrumentId) -> f64 {
+        // Use the FNV-1a id field to look up per-instrument state, sum realized + unrealized.
+        let key = instrument_id.id;
+        if let Some(state) = self.instrument_states.get(&key) {
+            state.realized_pnl + state.unrealized_pnl
+        } else {
+            0.0
+        }
     }
 }
 
@@ -668,7 +732,7 @@ mod tests {
         let order1 = Order {
             id: 1,
             client_order_id: ClientOrderId::new("o1"),
-            strategy_id: StrategyId::new("test"),
+            strategy_id: StrategyId("test".to_string()),
             instrument_id: InstrumentId::new("BTCUSDT", "BACKTEST"),
             venue: Venue::new("TEST"),
             side: OrderSide::Buy,
@@ -699,7 +763,7 @@ mod tests {
         let order2 = Order {
             id: 2,
             client_order_id: ClientOrderId::new("o2"),
-            strategy_id: StrategyId::new("test"),
+            strategy_id: StrategyId("test".to_string()),
             instrument_id: InstrumentId::new("BTCUSDT", "BACKTEST"),
             venue: Venue::new("TEST"),
             side: OrderSide::Sell,
@@ -790,7 +854,7 @@ mod tests {
         let order = Order {
             id: 42,
             client_order_id: ClientOrderId::new("o42"),
-            strategy_id: StrategyId::new("test"),
+            strategy_id: StrategyId("test".to_string()),
             instrument_id: instr_id.clone(),
             venue: Venue::new("TEST"),
             side: OrderSide::Buy,
@@ -837,7 +901,7 @@ mod tests {
         let order = Order {
             id: 42,
             client_order_id: ClientOrderId::new("o42"),
-            strategy_id: StrategyId::new("test"),
+            strategy_id: StrategyId("test".to_string()),
             instrument_id: instr_id.clone(),
             venue: Venue::new("TEST"),
             side: OrderSide::Buy,

@@ -102,6 +102,7 @@ fn date_to_ts_utc(date: NaiveDate) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::naive_date_iso;
 
     #[test]
     fn test_files_for_range() {
@@ -132,14 +133,14 @@ mod tests {
             },
         );
 
-        let files = index.files_for_range("BTCUSDT", naive_date!(2025-01-02), naive_date!(2025-01-02));
+        let files = index.files_for_range("BTCUSDT", naive_date_iso!("2025-01-02"), naive_date_iso!("2025-01-02"));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], "BTCUSDT_2025-01-02.tvc");
 
-        let files = index.files_for_range("BTCUSDT", naive_date!(2025-01-01), naive_date!(2025-01-03));
+        let files = index.files_for_range("BTCUSDT", naive_date_iso!("2025-01-01"), naive_date_iso!("2025-01-03"));
         assert_eq!(files.len(), 2);
 
-        let files = index.files_for_range("BTCUSDT", naive_date!(2025-01-05), naive_date!(2025-01-10));
+        let files = index.files_for_range("BTCUSDT", naive_date_iso!("2025-01-05"), naive_date_iso!("2025-01-10"));
         assert!(files.is_empty());
     }
 }

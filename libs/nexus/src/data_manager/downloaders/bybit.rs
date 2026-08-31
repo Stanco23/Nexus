@@ -26,6 +26,7 @@ use chrono::NaiveDate;
 use flate2::read::GzDecoder;
 
 use crate::data_manager::downloader::{DownloadSource, DownloadError, RawTradeData};
+use crate::data_manager::downloaders::parsers::{parse_price_to_int, parse_qty_to_int};
 use crate::data_manager::types::{Exchange, Venue};
 
 pub struct BybitDownloader {
@@ -102,7 +103,7 @@ impl BybitDownloader {
             let price_int = parse_price_to_int(price_str, self.precision);
             let size_int = parse_qty_to_int(size_str, self.precision);
 
-            trades.push((timestamp_ns, price_int, size_int));
+            trades.push((timestamp_ns, price_int, size_int, 0));
         }
 
         Ok(RawTradeData {
@@ -168,7 +169,7 @@ impl BybitDownloader {
             let price_int = parse_price_to_int(price_str, self.precision);
             let size_int = parse_qty_to_int(size_str, self.precision);
 
-            trades.push((timestamp_ns, price_int, size_int));
+            trades.push((timestamp_ns, price_int, size_int, 0));
         }
 
         Ok(RawTradeData {
@@ -202,51 +203,9 @@ impl DownloadSource for BybitDownloader {
     }
 }
 
-/// Parse a decimal price string to a nano-integer with target precision.
-///
-/// This handles variable decimal lengths correctly. For example:
-/// - "93530.00" (2 decimals) with precision 9 → 93530000000
-/// - "0.003" (3 decimals) with precision 9 → 3000000
-fn parse_price_to_int(s: &str, precision: u8) -> i64 {
-    let parts: Vec<&str> = s.split('.').collect();
-    let int_part: i64 = parts.get(0).unwrap_or(&"0").parse().unwrap_or(0);
-    let dec_str = parts.get(1).unwrap_or(&"0");
-    let dec_len = dec_str.len() as i32;
-
-    // Combined digits: "93530" (for "93530.00")
-    let mut combined = String::new();
-    combined.push_str(parts.get(0).unwrap_or(&"0"));
-    combined.push_str(dec_str);
-    let combined_int: i64 = combined.parse().unwrap_or(0);
-
-    let diff = precision as i32 - dec_len;
-    if diff >= 0 {
-        combined_int * 10_i64.pow(diff as u32)
-    } else {
-        combined_int / 10_i64.pow((-diff) as u32)
-    }
-}
-
-/// Parse a decimal qty string to a nano-integer.
-fn parse_qty_to_int(s: &str, precision: u8) -> i64 {
-    parse_price_to_int(s, precision)
-}
+// `parse_price_to_int` and `parse_qty_to_int` are imported from `parsers` module.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_price_to_int() {
-        // "93530.00" has 2 decimals, precision 9: combined=9353000, diff=7 → 9353000 * 10^7 = 93530000000000
-        let p = parse_price_to_int("93530.00", 9);
-        assert_eq!(p, 93530000000000);
-    }
-
-    #[test]
-    fn test_parse_small_qty() {
-        // "0.003" has 3 decimals, precision 9: combined=3, diff=6 → 3 * 10^6 = 3000000
-        let q = parse_qty_to_int("0.003", 9);
-        assert_eq!(q, 3000000);
-    }
+    // parse_price/parse_qty tests moved to `parsers` module.
 }

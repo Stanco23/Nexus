@@ -44,6 +44,9 @@ use crate::instrument::Venue;
 use crate::live::MarketDataAdapter;
 use crate::messages::{OrderFilled, SubmitOrder, TraderId};
 use crate::paper::PaperExecution;
+use crate::live::actor_wrapper::StrategyAsActor;
+use crate::types::OmsType;
+use nexus_strategy::StrategyId as NexusStrategyId;
 
 // =============================================================================
 // TraderError
@@ -223,6 +226,8 @@ pub struct Trader {
     database: Option<Arc<dyn Database>>,
     paper_execution: Option<Arc<std::sync::Mutex<dyn PaperExecution>>>,
     started: bool,
+    /// Strategy name → count for generating unique StrategyIds.
+    strategy_counter: std::collections::HashMap<String, usize>,
 }
 
 impl Trader {
@@ -285,6 +290,7 @@ impl Trader {
             database,
             paper_execution: None,
             started: false,
+            strategy_counter: std::collections::HashMap::new(),
         }
     }
 
@@ -319,6 +325,28 @@ impl Trader {
     /// Actors are started in registration order when `start()` is called.
     pub fn add_actor(&mut self, actor: Box<dyn Actor>) {
         self.actors.push(actor);
+    }
+
+    /// Add a strategy to the trader, wrapping it as a `StrategyAsActor`.
+    ///
+    /// Generates a `StrategyId` from the strategy name and a unique counter.
+    /// The actor is registered with DataEngine and RiskEngine via msgbus.
+    pub fn add_strategy(&mut self, strategy: Box<dyn nexus_strategy::Strategy>) {
+        let name = strategy.name();
+        let count = self.strategy_counter.entry(name.to_string()).or_insert(0);
+        *count += 1;
+        let strategy_id = NexusStrategyId(format!("{} #{}", name, *count));
+
+        let actor = StrategyAsActor::new(
+            strategy,
+            strategy_id,
+            OmsType::Full,
+            self.trader_id.clone(),
+            crate::actor::SystemClock::new_boxed(),
+            (*self.msgbus).clone(),
+            Some(Arc::clone(&self.cache)),
+        );
+        self.add_actor(Box::new(actor));
     }
 
     /// Start all actors and core components.

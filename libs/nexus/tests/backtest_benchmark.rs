@@ -48,7 +48,7 @@ impl PortfolioStrategy for MomentumStrategy {
     ) -> Signal {
         if self.last_price == 0.0 {
             self.last_price = price;
-            return Signal::Close;
+            return Signal::close();
         }
 
         let delta = (price - self.last_price) / self.last_price * 100.0;
@@ -57,16 +57,16 @@ impl PortfolioStrategy for MomentumStrategy {
         if delta > self.threshold {
             if !self.position_open {
                 self.position_open = true;
-                return Signal::Buy;
+                return Signal::buy_market();
             }
         } else if delta < -self.threshold {
             if self.position_open {
                 self.position_open = false;
-                return Signal::Sell;
+                return Signal::sell_market();
             }
         }
 
-        Signal::Close
+        Signal::close()
     }
 }
 

@@ -29,6 +29,16 @@ pub enum BuildError {
     InvalidData(String),
 }
 
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::Io(e) => write!(f, "IO error: {}", e),
+            BuildError::TvcWrite(msg) => write!(f, "TVC write error: {}", msg),
+            BuildError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
+        }
+    }
+}
+
 impl From<std::io::Error> for BuildError {
     fn from(e: std::io::Error) -> Self { BuildError::Io(e) }
 }
@@ -45,8 +55,8 @@ impl TvcBuilder {
     pub fn new(output_dir: PathBuf) -> Self {
         Self {
             output_dir,
-            anchor_interval: 100, // default: full tick every 100
-            decimal_precision: 9, // default: 9 decimal places (nano-integer)
+            anchor_interval: 1024, // TBC3 standard: full anchor every 1,024 ticks
+            decimal_precision: 9,   // default: 9 decimal places (nano-integer)
         }
     }
 
@@ -80,23 +90,20 @@ impl TvcBuilder {
         let instrument_id = InstrumentId::new(&data.symbol, data.exchange.as_str());
         let id_hash = fnv1a_hash(instrument_id.to_string().as_bytes());
 
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
-
-        let mut writer = BufWriter::new(file);
+        // TvcWriter opens the file internally and handles its own write buffer.
+        // We do NOT create a separate file handle + BufWriter here — that caused
+        // a double-open bug where File::create in TvcWriter would truncate the file
+        // before the BufWriter ever flushed anything, writing zeros in the header.
         let mut tvc = TvcWriter::new(&path, id_hash, self.anchor_interval, self.decimal_precision)
             .map_err(|e| BuildError::TvcWrite(e.to_string()))?;
 
-        for (i, (timestamp_ns, price_int, size_int)) in data.trades.iter().enumerate() {
+        for (i, (timestamp_ns, price_int, size_int, side)) in data.trades.iter().enumerate() {
             let tick = TradeTick {
                 timestamp_ns: *timestamp_ns,
                 price_int: *price_int,
                 size_int: *size_int,
-                side: 0,         // 0=buy (aggressor), unknown in raw data
-                flags: 1,        // 1=trade
+                side: *side,    // aggressor side (0=buy, 1=sell) — was hardcoded to 0
+                flags: 1,       // 1=trade
                 sequence: i as u32,
             };
             tvc.write_tick(&tick)
@@ -105,8 +112,6 @@ impl TvcBuilder {
 
         tvc.finalize()
             .map_err(|e| BuildError::TvcWrite(e.to_string()))?;
-
-        drop(writer);
 
         let num_trades = data.trades.len();
         let size_bytes = path.metadata()?.len();
@@ -121,7 +126,7 @@ impl TvcBuilder {
         venue: Venue,
         symbol: &str,
         date: NaiveDate,
-        trades: Vec<(u64, i64, i64)>,
+        trades: Vec<(u64, i64, i64, u8)>,
     ) -> Result<BuildResult, BuildError> {
         let data = RawTradeData {
             exchange,

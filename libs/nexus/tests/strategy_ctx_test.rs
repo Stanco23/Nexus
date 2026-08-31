@@ -125,9 +125,9 @@ fn test_strategy_ctx_signal_emission() {
     }));
 
     // Emit signals
-    ctx.emit_signal(Signal::Buy);
-    ctx.emit_signal(Signal::Sell);
-    ctx.emit_signal(Signal::Close);
+    ctx.emit_signal(Signal::buy_market());
+    ctx.emit_signal(Signal::sell_market());
+    ctx.emit_signal(Signal::close());
 
     let r = received.lock().unwrap();
     assert_eq!(r.len(), 3);
@@ -303,7 +303,7 @@ fn test_engine_context_record_trade() {
     let trade = nexus::engine::Trade {
         timestamp_ns: 1000,
         instrument_id: 1,
-        side: Signal::Buy,
+        side: Signal::buy_market(),
         price: 100.0,
         size: 1.0,
         commission: 0.1,

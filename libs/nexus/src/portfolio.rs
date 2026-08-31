@@ -201,7 +201,7 @@ impl InstrumentState {
             self.peak_equity = total;
         }
         if self.peak_equity > 0.0 {
-            let dd = (self.peak_equity - total) / self.peak_equity * 100.0;
+            let dd = (self.peak_equity - total) / self.peak_equity * self.peak_equity;
             if dd > self.max_drawdown {
                 self.max_drawdown = dd;
             }
@@ -329,7 +329,7 @@ impl Portfolio {
 
         if state.position == 0.0 {
             // Open new position
-            state.position = if side == Signal::Buy { size } else { -size };
+            state.position = if matches!(side, Signal::Buy) { size } else { -size };
             state.entry_price = price;
             // Store SL/TP and trailing stop for the new position
             state.sl_price = sl_price;
@@ -337,8 +337,8 @@ impl Portfolio {
             state.trailing_stop = trailing_stop;
         } else {
             // Add to existing position (average in)
-            let is_same_side = (state.position > 0.0 && side == Signal::Buy)
-                || (state.position < 0.0 && side == Signal::Sell);
+            let is_same_side = (state.position > 0.0 && matches!(side, Signal::Buy))
+                || (state.position < 0.0 && matches!(side, Signal::Sell));
             if is_same_side {
                 let old_pos = state.position.abs();
                 let new_fill_pos = size.abs();
@@ -358,7 +358,7 @@ impl Portfolio {
                 };
                 state.realized_pnl += pnl;
                 state.equity += pnl;
-                state.position = if side == Signal::Buy { size } else { -size };
+                state.position = if matches!(side, Signal::Buy) { size } else { -size };
                 state.entry_price = price;
             }
         }
@@ -408,6 +408,37 @@ impl Portfolio {
         state.num_trades += 1;
 
         pnl
+    }
+
+    /// Close a position with VPIN-aware slippage adjustment.
+    ///
+    /// `base_price` — current market mid price.
+    /// `vpin` — current Volume-synchronized Probability of Informed Trading (0..1).
+    /// `order_size_ticks` — order size in tick units (1.0 for our default).
+    /// `avg_tick_duration_ns` — average inter-tick gap in nanoseconds.
+    ///
+    /// Returns the realized PnL **after slippage adjustment**, the delay applied,
+    /// and the impact in basis points. The base `close_position()` is called with
+    /// the slippage-adjusted price, so internal state is consistent.
+    pub fn close_position_with_slippage(
+        &mut self,
+        instrument_id: &InstrumentId,
+        base_price: f64,
+        commission_config: &CommissionConfig,
+        ts_init: u64,
+        vpin: f64,
+        order_size_ticks: f64,
+        avg_tick_duration_ns: u64,
+    ) -> (f64, u64, f64) {
+        // Compute slippage from the current state of the world.
+        let (fill_price, delay_ns, impact_bps) = crate::slippage::compute_fill_price(
+            order_size_ticks,
+            vpin,
+            avg_tick_duration_ns,
+            base_price,
+        );
+        let pnl = self.close_position(instrument_id, fill_price, commission_config, ts_init);
+        (pnl, delay_ns, impact_bps)
     }
 
     /// Total realized PnL across all instruments.
@@ -728,7 +759,7 @@ impl Portfolio {
                 signal
             };
 
-            let last_sig = last_signal.get(&instrument_id).copied().unwrap_or(Signal::Close);
+            let last_sig = last_signal.get(&instrument_id).cloned().unwrap_or(Signal::Close);
 
             // ── Conditional fill engine: MatchingCore (FIFO) vs OrderEmulator (probabilistic) ──
             // When MatchingCore is enabled, submit to matching core (returns immediate fills).
@@ -998,6 +1029,18 @@ impl Portfolio {
         total
     }
 }
+
+// =============================================================================
+// `PortfolioStrategy` trait — LEGACY INTERFACE for direct-portfolio strategies.
+//
+// This trait is kept for backward compatibility with the 3 existing test
+// strategies (MeanRevStrategy, MomentumStrategy, NoOpStrategy). New strategies
+// should implement `nexus_strategy::Strategy` instead.
+//
+// The duplication between `nexus_strategy::Strategy` and `PortfolioStrategy` is
+// documented as a known design choice. Consolidation is a multi-layer refactor
+// (requires StrategyCtx impls in upper layers — out of scope for current work).
+// =============================================================================
 
 pub trait PortfolioStrategy {
     fn on_trade(

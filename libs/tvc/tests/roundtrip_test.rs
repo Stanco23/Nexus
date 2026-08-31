@@ -19,7 +19,7 @@ fn test_roundtrip_1m_ticks_anchor_1000() {
     let start_size = 1_000_000i64;
 
     for i in 0..count {
-        let ts = start_ts + (i as u64) * 100;
+        let ts = start_ts + (i as u64) * 1_000; // 1 µs intervals (matches our base encoding)
         let price = start_price + (i as i64) * 100;
         let size = start_size;
 
@@ -63,13 +63,13 @@ fn test_roundtrip_1m_ticks_anchor_1000() {
     let offset_1000 = reader.seek_to_tick(1000).unwrap();
     let tick_1000 = reader.decode_tick_at(offset_1000 as usize).unwrap();
     assert_eq!(tick_1000.sequence, 1000);
-    assert_eq!(tick_1000.timestamp_ns, start_ts + 1000 * 100);
+    assert_eq!(tick_1000.timestamp_ns, start_ts + 1000 * 1_000); // 1 µs intervals
 
     // Seek to tick 999999
     let offset_end = reader.seek_to_tick(999999).unwrap();
     let tick_end = reader.decode_tick_at(offset_end as usize).unwrap();
     assert_eq!(tick_end.sequence, 999999);
-    assert_eq!(tick_end.timestamp_ns, start_ts + 999999 * 100);
+    assert_eq!(tick_end.timestamp_ns, start_ts + 999999 * 1_000);
 
     // Clean up
     let _ = std::fs::remove_file(path);
@@ -186,6 +186,56 @@ fn test_overflow_ticks() {
     let offset_50 = reader.seek_to_tick(50).unwrap();
     let tick_50 = reader.decode_tick_at(offset_50 as usize).unwrap();
     assert_eq!(tick_50.sequence, 50);
+}
+
+#[test]
+fn test_size_int_roundtrip_on_overflow() {
+    // Size deltas should round-trip correctly even when overflow is triggered
+    // by a large price move (not by side change, which now uses the base path).
+    // Regression test for the bug where size deltas >63 were clamped/truncated
+    // in the original 6-bit magnitude overflow field. Now overflow uses i32 zigzag.
+    let path = "/tmp/tvc_test_size_overflow.tvc";
+    let _ = std::fs::remove_file(path);
+
+    let mut writer = TvcWriter::new(std::path::Path::new(path), 33333, 50, 9).unwrap();
+
+    let start_ts = 1_000_000_000u64;
+    let start_size: i64 = 1_000_000;
+    let count = 50;
+
+    for i in 0..count {
+        // Each tick has size delta = +100 and a large price jump to force overflow.
+        // (Side stays constant so we use overflow path, not base path.)
+        let big_price_delta: i64 = 200_000; // exceeds 18-bit zigzag range
+        let tick = TradeTick::new(
+            start_ts + (i as u64) * 1_000, // 1 µs intervals
+            100_000_000_000 + (i as i64) * big_price_delta,
+            start_size + (i as i64) * 100,
+            0,  // constant side
+            1,
+            i as u32,
+        );
+        writer.write_tick(&tick).unwrap();
+    }
+
+    writer.finalize().unwrap();
+
+    let mut reader = TvcReader::open(std::path::Path::new(path)).unwrap();
+    assert_eq!(reader.num_ticks(), count as u64);
+
+    // Verify size_int round-trips exactly for every tick.
+    for i in 0..count {
+        let offset = reader.seek_to_tick(i as u64).unwrap();
+        let tick = reader.decode_tick_at(offset as usize).unwrap();
+        let expected_size = start_size + (i as i64) * 100;
+        assert_eq!(
+            tick.size_int, expected_size,
+            "tick {} size_int mismatch: got {} expected {}",
+            i, tick.size_int, expected_size
+        );
+    }
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

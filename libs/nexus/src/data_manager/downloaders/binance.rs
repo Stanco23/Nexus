@@ -17,6 +17,7 @@ use chrono::NaiveDate;
 use zip::ZipArchive;
 
 use crate::data_manager::downloader::{DownloadSource, DownloadError, RawTradeData};
+use crate::data_manager::downloaders::parsers::{parse_price_to_int, parse_qty_to_int};
 use crate::data_manager::types::Exchange;
 
 const BASE_URL: &str = "https://data.binance.vision/data/spot/daily/trades";
@@ -98,6 +99,12 @@ impl BinanceDownloader {
             let price_str = fields[1].trim();
             let qty_str = fields[2].trim();
             let time_str = fields[4].trim();
+            // isBuyerMaker: true = the buyer was the maker (so the taker sold) → side=1
+            //               false = the buyer was the taker → side=0
+            let is_buyer_maker_str = fields[5].trim();
+            let is_buyer_maker: bool = is_buyer_maker_str.parse()
+                .map_err(|_| DownloadError::Parse(format!("Invalid isBuyerMaker at line {}: {}", i + 2, is_buyer_maker_str)))?;
+            let side: u8 = if is_buyer_maker { 1 } else { 0 };
 
             // Parse timestamp — microseconds (from 2025-01-01) or nanoseconds
             let raw_ts: u64 = time_str.parse()
@@ -107,7 +114,7 @@ impl BinanceDownloader {
             let price_int = parse_price_to_int(price_str, self.precision);
             let size_int = parse_qty_to_int(qty_str, self.precision);
 
-            trades.push((timestamp_ns, price_int, size_int));
+            trades.push((timestamp_ns, price_int, size_int, side));
         }
 
         Ok(RawTradeData {
@@ -165,38 +172,7 @@ fn normalize_timestamp_ns(ts: u64) -> u64 {
     }
 }
 
-/// Parse a decimal price string to a nano-integer with target precision.
-///
-/// This handles variable decimal lengths correctly. For example:
-/// - "93576.00000000" (8 decimals) with precision 9 → 93576000000
-/// - "50000.12345678" (8 decimals) with precision 9 → 50000123456780
-/// - "0.003" (3 decimals) with precision 9 → 3000000
-fn parse_price_to_int(s: &str, precision: u8) -> i64 {
-    let parts: Vec<&str> = s.split('.').collect();
-    let int_part: i64 = parts.get(0).unwrap_or(&"0").parse().unwrap_or(0);
-    let dec_str = parts.get(1).unwrap_or(&"0");
-    let dec_len = dec_str.len() as i32;
-
-    // Combined digits: "9357600000000" (for "93576.00000000")
-    let mut combined = String::new();
-    combined.push_str(parts.get(0).unwrap_or(&"0"));
-    combined.push_str(dec_str);
-    let combined_int: i64 = combined.parse().unwrap_or(0);
-
-    // diff > 0: need more decimals (multiply)
-    // diff < 0: need fewer decimals (divide)
-    let diff = precision as i32 - dec_len;
-    if diff >= 0 {
-        combined_int * 10_i64.pow(diff as u32)
-    } else {
-        combined_int / 10_i64.pow((-diff) as u32)
-    }
-}
-
-/// Parse a decimal qty string to a nano-integer.
-fn parse_qty_to_int(s: &str, precision: u8) -> i64 {
-    parse_price_to_int(s, precision)
-}
+// `parse_price_to_int` and `parse_qty_to_int` are imported from `parsers` module.
 
 #[cfg(test)]
 mod tests {
@@ -206,33 +182,14 @@ mod tests {
     fn test_normalize_timestamp_ns() {
         // Microsecond timestamp for 2025-01-01 (16 digits)
         // 1735689600010866 μs → 1735689600010866000 ns
-        assert_eq!(normalize_timestamp_ns(1735689600010866_u64), 1735689600010866000_u64);
+        assert_eq!(
+            normalize_timestamp_ns(1735689600010866_u64),
+            1735689600010866000_u64
+        );
         // Nanosecond timestamp (19 digits) - stays unchanged
-        assert_eq!(normalize_timestamp_ns(1640995200000000000_u64), 1640995200000000000_u64);
-    }
-
-    #[test]
-    fn test_parse_price_to_int() {
-        // "93576.00000000" has 8 decimals, with precision 9 (diff = +1) → multiply by 10
-        // Combined: 9357600000000, result: 93576000000000
-        let p = parse_price_to_int("93576.00000000", 9);
-        assert_eq!(p, 93576000000000);
-
-        // "50000.12345678" has 8 decimals, with precision 9 (diff = +1) → multiply by 10
-        // Combined: 5000012345678, result: 50000123456780
-        let p2 = parse_price_to_int("50000.12345678", 9);
-        assert_eq!(p2, 50000123456780);
-    }
-
-    #[test]
-    fn test_parse_qty_to_int() {
-        // "0.00136000" has 8 decimals, with precision 9 (diff = +1) → multiply by 10
-        // Combined: 136000, result: 1360000
-        let q = parse_qty_to_int("0.00136000", 9);
-        assert_eq!(q, 1360000);
-
-        // "0.003" has 3 decimals, with precision 9 (diff = +6) → multiply by 10^6
-        let q2 = parse_qty_to_int("0.003", 9);
-        assert_eq!(q2, 3000000);
+        assert_eq!(
+            normalize_timestamp_ns(1640995200000000000_u64),
+            1640995200000000000_u64
+        );
     }
 }

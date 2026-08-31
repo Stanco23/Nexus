@@ -4,7 +4,11 @@
 //! Lifecycle hooks: `on_init` → `on_start` → [tick/bar loop] → `on_stop` → `on_finish`
 //! `on_reset` clears strategy state for reuse in sweep/mc runs.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::context::StrategyCtx;
+use crate::signals::SignalBus;
 use crate::types::{BacktestMode, Bar, InstrumentId, ParameterSchema, Signal, Tick};
 
 /// Core strategy trait for all trading strategies.
@@ -34,6 +38,24 @@ pub trait Strategy: Send + Sync {
     fn parameters(&self) -> Vec<ParameterSchema>;
 
     fn clone_box(&self) -> Box<dyn Strategy>;
+
+    /// Returns the bar timeframe for this strategy.
+    ///
+    /// - `None` = tick mode (`on_trade` called per tick)
+    /// - `Some(Duration)` = bar mode (`on_bar` called when bar period completes)
+    ///
+    /// The backtest engine creates a `BarAggregator` with the configured period
+    /// and routes ticks through it, calling `on_bar` when each bar closes.
+    /// For bar-mode strategies, `on_trade` is NOT called.
+    fn timeframe(&self) -> Option<Duration> { None }
+
+    /// Subscribe to a named signal bus.
+    /// Strategies call this to register interest in specific signal events.
+    fn subscribe_signal(&mut self, _signal_bus: Arc<SignalBus>) {}
+
+    /// Returns the position size (number of contracts/units) for this strategy.
+    /// Default: 1.0 (one unit).
+    fn position_size(&self) -> f64 { 1.0 }
 
     /// Called once before the backtest run starts.
     /// Use for parameter validation and one-time setup.
@@ -86,4 +108,30 @@ impl Clone for Box<dyn Strategy> {
     fn clone(&self) -> Self {
         self.clone_box()
     }
+}
+
+/// Blanket impl so `Box<dyn Strategy>` is usable as the concrete `S` in
+/// `BacktestEngine::run`. This bridges the gap when `strategy_factory: impl Fn() -> Box<dyn Strategy>`
+/// is used as the argument — the compiler needs `Box<dyn Strategy>: Strategy`.
+impl Strategy for Box<dyn Strategy> {
+    fn name(&self) -> &str { (**self).name() }
+    fn mode(&self) -> BacktestMode { (**self).mode() }
+    fn subscribed_instruments(&self) -> Vec<InstrumentId> { (**self).subscribed_instruments() }
+    fn parameters(&self) -> Vec<ParameterSchema> { (**self).parameters() }
+    fn clone_box(&self) -> Box<dyn Strategy> { (**self).clone_box() }
+    fn timeframe(&self) -> Option<Duration> { (**self).timeframe() }
+    fn subscribe_signal(&mut self, sb: Arc<SignalBus>) { (**self).subscribe_signal(sb) }
+    fn position_size(&self) -> f64 { (**self).position_size() }
+    fn on_init(&mut self) { (**self).on_init() }
+    fn on_start(&mut self) { (**self).on_start() }
+    fn on_stop(&mut self) { (**self).on_stop() }
+    fn on_finish(&mut self) { (**self).on_finish() }
+    fn on_reset(&mut self) { (**self).on_reset() }
+    fn on_trade(&mut self, i: InstrumentId, t: &Tick, c: &mut dyn StrategyCtx) -> Option<Signal> {
+        (**self).on_trade(i, t, c)
+    }
+    fn on_bar(&mut self, i: InstrumentId, b: &Bar, c: &mut dyn StrategyCtx) -> Option<Signal> {
+        (**self).on_bar(i, b, c)
+    }
+    fn on_signal(&mut self, n: &str, v: f64, ts: u64) { (**self).on_signal(n, v, ts) }
 }

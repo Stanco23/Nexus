@@ -20,19 +20,47 @@
 //! Anchor interval: 1024 ticks
 
 use crate::types::{
-    AnchorTick, DecodedTick, TradeTick, ANCHOR_TICK_SIZE, BASE_DELTA_SIZE,
-    OVERFLOW_DELTA_SIZE, OVERFLOW_ESCAPE, TIMESTAMP_DELTA_MASK, TIMESTAMP_EXTRA_SHIFT,
+    AnchorTick, DecodedTick, TradeTick, ANCHOR_TICK_SIZE, BASE_DELTA_SIZE, OVERFLOW_DELTA_SIZE,
+    OVERFLOW_ESCAPE, TIMESTAMP_DELTA_MASK,
 };
-use crate::types::{PRICE_ZIGZAG_MASK, PRICE_ZIGZAG_SHIFT};
+use crate::types::{
+    PRICE_ZIGZAG_MASK, PRICE_ZIGZAG_SHIFT, SIZE_ZIGZAG_MASK, SIZE_ZIGZAG_SHIFT,
+};
 
-/// Maximum timestamp delta that fits in 20 bits.
-pub const MAX_TIMESTAMP_DELTA: u32 = TIMESTAMP_DELTA_MASK; // 0xFFFFF = 1,048,575
+/// Maximum timestamp delta that fits in the base-path µs field.
+/// 17 bits in 1µs units = 131,071 µs ≈ 131 milliseconds.
+pub const MAX_TIMESTAMP_DELTA_US: u32 = TIMESTAMP_DELTA_MASK; // 0x1FFFF = 131,071 µs
+
+/// 18-bit signed zigzag range.
+pub const PRICE_ZIGZAG_MIN: i32 = -(131_072);
+pub const PRICE_ZIGZAG_MAX: i32 = 131_071;
+
+/// 27-bit signed zigzag range for size delta.
+pub const SIZE_ZIGZAG_MIN: i32 = -(1 << 26);
+pub const SIZE_ZIGZAG_MAX: i32 = (1 << 26) - 1;
 
 // =============================================================================
 // Zigzag encoding
 // =============================================================================
 
-/// Encode a signed i32 into an unsigned zigzag u32.
+/// Encode a signed i64 as zigzag into u64.
+///
+/// Use this for the overflow path where ts_delta can exceed i32 range (up to ±2.1s
+/// before saturation). For ts_delta in the ±i32 range, prefer the u32 version which
+/// is identical.
+#[inline]
+pub fn zigzag_encode_i64(n: i64) -> u64 {
+    ((n << 1) ^ (n >> 63)) as u64
+}
+
+/// Decode a zigzag u64 back to signed i64.
+#[inline]
+pub fn zigzag_decode_i64(n: u64) -> i64 {
+    let n = n as i64;
+    (n >> 1) ^ -(n & 1)
+}
+
+/// Encode a signed i32 as zigzag u32.
 #[inline]
 pub fn zigzag_encode(n: i32) -> u32 {
     ((n << 1) ^ (n >> 31)) as u32
@@ -54,32 +82,28 @@ pub fn zigzag_decode(n: u32) -> i32 {
 /// Overflow needed when:
 /// - timestamp_delta > 20 bits (MAX_TIMESTAMP_DELTA)
 /// - price_delta doesn't fit in 18-bit signed range [-131072, 131071]
-/// - side changed from previous
-/// - flags changed from previous
+/// Returns true if the encoder should use the overflow path:
+/// - timestamp delta > 131 seconds
+/// - price delta out of 18-bit zigzag range
+/// - size delta out of 27-bit zigzag range
+/// (side and flags no longer trigger overflow; they fit in base bits 62-63.)
 #[inline]
 pub fn needs_overflow(
-    prev_side: u8,
-    prev_flags: u8,
-    ts_delta: u32,
+    ts_delta_us: u32,
     price_delta: i32,
-    new_side: u8,
-    new_flags: u8,
+    size_delta: i32,
 ) -> bool {
-    if ts_delta > MAX_TIMESTAMP_DELTA {
+    if ts_delta_us > MAX_TIMESTAMP_DELTA_US {
         return true;
     }
-    if !(-(131_072)..=131_071).contains(&price_delta) {
+    if !(PRICE_ZIGZAG_MIN..=PRICE_ZIGZAG_MAX).contains(&price_delta) {
         return true;
     }
-    if new_side != prev_side || new_flags != prev_flags {
+    if !(SIZE_ZIGZAG_MIN..=SIZE_ZIGZAG_MAX).contains(&size_delta) {
         return true;
     }
     false
 }
-
-/// The 18-bit signed zigzag range.
-pub const PRICE_ZIGZAG_MIN: i32 = -(131_072);
-pub const PRICE_ZIGZAG_MAX: i32 = 131_071;
 
 // =============================================================================
 // Pack delta (tick -> bytes)
@@ -88,78 +112,72 @@ pub const PRICE_ZIGZAG_MAX: i32 = 131_071;
 /// Result of packing a delta between two ticks.
 #[derive(Debug, Clone)]
 pub enum PackedDelta {
-    /// 4-byte base delta record.
-    Base([u8; 4]),
-    /// 12-byte overflow delta record: [0xFF][2B ts_extra][8B i64 price_extra][1B size+side]
-    Overflow([u8; 12]),
+    /// 8-byte base delta record (64 bits packed): 17 ts_ms + 18 price + 27 size + 2 side/flags.
+    Base([u8; 8]),
+    /// 14-byte overflow delta record: [0xFF][4B ts_i32][4B price_i32][4B size_i32][1B side+flags]
+    Overflow([u8; 14]),
 }
 
 /// Pack a delta between the previous tick and the next tick.
 ///
-/// Returns `PackedDelta::Base` (4 bytes) or `PackedDelta::Overflow` (8 bytes).
+/// Returns `PackedDelta::Base` (8 bytes) or `PackedDelta::Overflow` (14 bytes).
+/// Base path covers ts_delta up to 131 seconds (17 bits in 1ms units) and
+/// stores full size, price, side, and flags. Overflow is reserved for ticks where
+/// ts_delta exceeds 131s, or price/size deltas exceed 18/27-bit zigzag range.
 pub fn pack_delta(prev_tick: &TradeTick, next_tick: &TradeTick) -> PackedDelta {
-    let full_ts_delta = next_tick.timestamp_ns - prev_tick.timestamp_ns;
-    let price_delta = next_tick.price_int - prev_tick.price_int; // i64 for overflow
-    let price_delta_i32 = price_delta as i32; // for base encoding check
-    let ts_delta = full_ts_delta as u32;
+    let full_ts_delta_ns = next_tick.timestamp_ns.saturating_sub(prev_tick.timestamp_ns);
+    let ts_delta_us = (full_ts_delta_ns / 1_000) as u32;
+    let price_delta = next_tick.price_int - prev_tick.price_int;
+    let price_delta_i32 = price_delta as i32;
+    let size_delta = next_tick.size_int - prev_tick.size_int;
+    let size_delta_i32 = size_delta as i32;
 
-    let needs_overflow = prev_tick.side != next_tick.side
-        || prev_tick.flags != next_tick.flags
-        || full_ts_delta > MAX_TIMESTAMP_DELTA as u64
-        || !(PRICE_ZIGZAG_MIN..=PRICE_ZIGZAG_MAX).contains(&price_delta_i32);
+    let needs_overflow = ts_delta_us > MAX_TIMESTAMP_DELTA_US
+        || !(PRICE_ZIGZAG_MIN..=PRICE_ZIGZAG_MAX).contains(&price_delta_i32)
+        || !(SIZE_ZIGZAG_MIN..=SIZE_ZIGZAG_MAX).contains(&size_delta_i32);
 
     if needs_overflow {
-        // Overflow encoding splits timestamp delta:
-        // - If ts_delta < 2^15 (32768): store full delta in ts_extra (marker=0)
-        // - If ts_delta >= 2^15: store upper bits in ts_extra (marker=1)
-        // This preserves small deltas when overflow is triggered by side/price change.
-        let ts_delta_u64 = full_ts_delta;
-        let ts_delta_u32 = ts_delta_u64 as u32; // safe since MAX_TIMESTAMP_DELTA < u32::MAX
+        // 14-byte overflow layout:
+        //   byte 0:    0xFF escape marker
+        //   bytes 1-4: ts_extra u32 zigzag in MICROSECONDS (covers ±2147s range)
+        //   bytes 5-8: price_extra i32 zigzag (full ns precision nano-units)
+        //   bytes 9-12: size_extra i32 zigzag (full ns precision nano-units)
+        //   byte 13:   side (bit 0) | flags (bits 1-7)
+        //
+        // ts in microseconds (not nanoseconds) because the 4-byte u32 field can
+        // only hold ±2.1s in ns but ±2147s in µs. This is lossless for any
+        // realistic market data gap. Sub-µs precision is invisible to strategies.
+        let ts_delta_us = full_ts_delta_ns / 1_000;
+        let ts_extra = zigzag_encode(ts_delta_us as i32);
+        let price_extra = zigzag_encode(price_delta_i32);
+        let size_extra = zigzag_encode(size_delta_i32);
 
-        let ts_extra_raw: u16;
-        if ts_delta_u32 < 0x8000 {
-            // Small delta: store directly with marker=0
-            ts_extra_raw = (ts_delta_u32 << 1) as u16; // marker bit 0
-        } else {
-            // Large delta: store upper bits with marker=1
-            // Encode: ts_extra_raw = (extra_bits & 0x7FFF) | 0x8000
-            // Decode: ts_extra = (ts_extra_raw & 0x7FFF) << TIMESTAMP_EXTRA_SHIFT
-            let extra_bits = (ts_delta_u64 >> TIMESTAMP_EXTRA_SHIFT) as u32;
-            ts_extra_raw = ((extra_bits & 0x7FFF) as u16) | 0x8000_u16;
-        }
-
-        // price_extra: 64-bit signed delta (i64 to support ±1M delta at 1e6 precision)
-        let price_extra = price_delta;
-
-        // size_extra: 1-byte with sign-magnitude encoding:
-        // bit 7 = side (0 or 1)
-        // bit 6 = size sign (1 = negative, 0 = positive)
-        // bits 0-5 = size magnitude (0-63)
-        // Range: -127 to +63 (clamp beyond)
-        let size_delta = (next_tick.size_int - prev_tick.size_int) as i32;
-        let size_clamped = size_delta.clamp(-127, 63) as i8;
-        let size_sign = if size_clamped < 0 { 1u8 } else { 0u8 };
-        let size_magnitude = (size_clamped.abs() as u8) & 0x3F; // 6 bits for magnitude
-        let size_byte = (((next_tick.side & 1) as u8) << 7)
-            | (size_sign << 6)
-            | size_magnitude;
-
-        // Pack into 12 bytes: [0xFF][ts_extra 2B][price_extra i64][size_byte]
-        let mut bytes = [0u8; 12];
+        let mut bytes = [0u8; 14];
         bytes[0] = OVERFLOW_ESCAPE;
-        bytes[1] = (ts_extra_raw & 0xFF) as u8;
-        bytes[2] = ((ts_extra_raw >> 8) & 0xFF) as u8;
-        bytes[3..11].copy_from_slice(&price_extra.to_le_bytes()[..]);
-        bytes[11] = size_byte;
+        bytes[1..5].copy_from_slice(&ts_extra.to_le_bytes()[..]);
+        bytes[5..9].copy_from_slice(&price_extra.to_le_bytes()[..]);
+        bytes[9..13].copy_from_slice(&size_extra.to_le_bytes()[..]);
+        bytes[13] = (next_tick.side & 1) | ((next_tick.flags & 0x7F) << 1);
 
         PackedDelta::Overflow(bytes)
     } else {
-        // Base: 4 bytes
+        // Base: 8 bytes (64 bits packed)
+        // bits 0-16:   ts_delta in 1ms units (17 bits, max 131 seconds)
+        // bits 17-34:  price_zigzag (18 bits, zigzag i32, ±131k)
+        // bits 35-61:  size_zigzag (27 bits, zigzag i32, ±67M nano-BTC = ±$6,300 at BTC=94k)
+        // bit 62:      side (1 bit)
+        // bit 63:      flags (1 bit)
         let price_zigzag = zigzag_encode(price_delta_i32) & PRICE_ZIGZAG_MASK;
-        let packed = ts_delta | (price_zigzag << PRICE_ZIGZAG_SHIFT);
-
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(&packed.to_le_bytes());
+        let size_zigzag = zigzag_encode(size_delta_i32) & SIZE_ZIGZAG_MASK;
+        let side_bit = (next_tick.side as u64) & 1;
+        let flags_bit = (next_tick.flags as u64) & 1;
+        let packed = (ts_delta_us as u64)
+            | ((price_zigzag as u64) << PRICE_ZIGZAG_SHIFT)
+            | ((size_zigzag as u64) << SIZE_ZIGZAG_SHIFT)
+            | (side_bit << 62)
+            | (flags_bit << 63);
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&packed.to_le_bytes()[..8]);
         PackedDelta::Base(buf)
     }
 }
@@ -168,74 +186,79 @@ pub fn pack_delta(prev_tick: &TradeTick, next_tick: &TradeTick) -> PackedDelta {
 // Unpack delta (bytes -> tick)
 // =============================================================================
 
-/// Decode a base (4-byte) delta record.
+/// Decode a base (8-byte) delta record.
+///
+/// Bit layout (matching the encoder):
+///   bits 0-16:   ts_delta in 1ms units (17 bits, max 131 seconds)
+///   bits 17-34:  price_zigzag (18 bits)
+///   bits 35-61:  size_zigzag (27 bits)
+///   bit 62:      side (1 bit)
+///   bit 63:      flags (1 bit)
 #[inline]
-pub fn unpack_base_delta(bytes: &[u8; 4], prev_tick: &TradeTick, sequence: u32) -> DecodedTick {
-    let packed = u32::from_le_bytes(*bytes);
+pub fn unpack_base_delta(bytes: &[u8; 8], prev_tick: &TradeTick, sequence: u32) -> DecodedTick {
+    let packed = u64::from_le_bytes(*bytes);
 
-    let ts_delta = packed & TIMESTAMP_DELTA_MASK;
-    let price_zigzag_raw = (packed >> PRICE_ZIGZAG_SHIFT) & PRICE_ZIGZAG_MASK;
+    let ts_delta_us = (packed & TIMESTAMP_DELTA_MASK as u64) as u32;
+    let price_zigzag_raw = (packed >> PRICE_ZIGZAG_SHIFT) & (PRICE_ZIGZAG_MASK as u64);
+    let size_zigzag_raw = (packed >> SIZE_ZIGZAG_SHIFT) & (SIZE_ZIGZAG_MASK as u64);
 
-    // Sign-extend from 18 bits to i32 for proper zigzag decode
+    // Sign-extend 18-bit price_zigzag to i32 for zigzag decode
     let price_zigzag = if price_zigzag_raw & (1 << 17) != 0 {
         (price_zigzag_raw as i64 | 0xFFFFFC0000_i64) as i32
     } else {
         price_zigzag_raw as i32
     };
+    // Sign-extend 27-bit size_zigzag to i32 for zigzag decode
+    let size_zigzag = if size_zigzag_raw & (1 << 26) != 0 {
+        (size_zigzag_raw as i64 | 0xFFFFFFFFF8000000_u64 as i64) as i32
+    } else {
+        size_zigzag_raw as i32
+    };
 
     let price_delta = zigzag_decode(price_zigzag as u32);
+    let size_delta = zigzag_decode(size_zigzag as u32);
+
+    // Decode side (bit 62) and flags (bit 63) from packed
+    let side = ((packed >> 62) & 1) as u8;
+    let flags = ((packed >> 63) & 1) as u8;
 
     DecodedTick {
-        timestamp_ns: prev_tick.timestamp_ns + ts_delta as u64,
+        timestamp_ns: prev_tick.timestamp_ns + (ts_delta_us as u64) * 1_000,
         price_int: prev_tick.price_int + price_delta as i64,
-        size_int: prev_tick.size_int, // base delta carries no size change
-        side: prev_tick.side,         // base delta preserves side from prev
-        flags: prev_tick.flags,       // base delta preserves flags from prev
+        size_int: prev_tick.size_int + size_delta as i64,
+        side,
+        flags,
         sequence,
         bytes_consumed: BASE_DELTA_SIZE,
     }
 }
 
-/// Decode an overflow (12-byte) delta record.
+/// Decode an overflow (14-byte) delta record.
 #[inline]
 pub fn unpack_overflow_delta(
-    bytes: &[u8; 12],
+    bytes: &[u8; 14],
     prev_tick: &TradeTick,
     sequence: u32,
 ) -> DecodedTick {
     // byte 0 = 0xFF already verified by caller
-    // Layout: [0xFF][2B ts_extra][8B price_extra i64][1B size+side]
-    let ts_extra_raw = u16::from_le_bytes([bytes[1], bytes[2]]);
-    let price_extra = i64::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10]]);
-    let size_byte = bytes[11];
+    // Layout: [0xFF][4B ts_u32 zigzag µs][4B price_i32 zigzag][4B size_i32 zigzag][1B side+flags]
+    let mut ts_buf = [0u8; 8];
+    ts_buf[..4].copy_from_slice(&bytes[1..5]);
+    let ts_delta_raw = u64::from_le_bytes(ts_buf);
+    let price_extra_raw = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+    let size_extra_raw = i32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
 
-    // ts_extra encoding:
-    // - marker=0 (bit 15 = 0): ts_extra = ts_extra_raw >> 1 (direct small delta, < 32768)
-    // - marker=1 (bit 15 = 1): ts_extra = (ts_extra_raw & 0x7FFF) << TIMESTAMP_EXTRA_SHIFT
-    let ts_extra_raw = u16::from_le_bytes([bytes[1], bytes[2]]);
-    let ts_extra = if (ts_extra_raw & 0x8000) == 0 {
-        // Small delta stored directly
-        (ts_extra_raw >> 1) as u64
-    } else {
-        // Upper bits of large delta:
-        // Encode: ts_extra_raw = (extra_bits & 0x7FFF) | 0x8000
-        // Decode: extract lower 15 bits and shift up
-        //         ts_extra = (ts_extra_raw & 0x7FFF) << TIMESTAMP_EXTRA_SHIFT
-        ((ts_extra_raw & 0x7FFF) as u64) << TIMESTAMP_EXTRA_SHIFT
-    };
+    // ts is stored as zigzag(i32) microseconds. Decode and convert to nanoseconds.
+    let ts_delta_us = zigzag_decode(ts_delta_raw as u32);
+    let timestamp_ns = (prev_tick.timestamp_ns as i64)
+        .wrapping_add((ts_delta_us as i64) * 1_000)
+        as u64;
+    let price_int = prev_tick.price_int + zigzag_decode(price_extra_raw as u32) as i64;
+    let size_int = prev_tick.size_int + zigzag_decode(size_extra_raw as u32) as i64;
 
-    let timestamp_ns = prev_tick.timestamp_ns + ts_extra;
-    let price_int = prev_tick.price_int + price_extra as i64;
-
-    // Decode side from bit 7
-    let side = (size_byte >> 7) as u8;
-    // Decode size from bits 6 (sign) and 0-5 (magnitude)
-    // size_sign = bit 6, size_mag = bits 0-5
-    let size_sign = if (size_byte & 0x40) != 0 { -1 } else { 1 };
-    let size_magnitude = (size_byte & 0x3F) as i32;
-    let size_int = prev_tick.size_int + (size_sign * size_magnitude) as i64;
-
-    let flags = prev_tick.flags; // overflow preserves flags from prev
+    // Decode side (bit 0) and flags (bits 1-7) from final byte
+    let side = bytes[13] & 1;
+    let flags = (bytes[13] >> 1) & 0x7F;
 
     DecodedTick {
         timestamp_ns,
@@ -259,15 +282,15 @@ pub fn unpack_delta_at(
         if data.len() < pos + OVERFLOW_DELTA_SIZE {
             return Err(CompressionError::UnexpectedEndOfFile);
         }
-        let mut bytes = [0u8; 12];
-        bytes.copy_from_slice(&data[pos..pos + 12]);
+        let mut bytes = [0u8; 14];
+        bytes.copy_from_slice(&data[pos..pos + 14]);
         Ok(unpack_overflow_delta(&bytes, prev_tick, sequence))
     } else {
         if data.len() < pos + BASE_DELTA_SIZE {
             return Err(CompressionError::UnexpectedEndOfFile);
         }
-        let mut bytes = [0u8; 4];
-        bytes.copy_from_slice(&data[pos..pos + 4]);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&data[pos..pos + BASE_DELTA_SIZE]);
         Ok(unpack_base_delta(&bytes, prev_tick, sequence))
     }
 }
@@ -353,20 +376,21 @@ mod tests {
 
     #[test]
     fn test_overflow_detection() {
-        // Within 20-bit timestamp, 18-bit price, same side → no overflow
-        assert!(!needs_overflow(0, 1, 1000, 100, 0, 1));
-        // Timestamp exceeds 20 bits
-        assert!(needs_overflow(0, 1, 2_000_000, 100, 0, 1));
-        // Price exceeds 18-bit signed
-        assert!(needs_overflow(0, 1, 1000, 200_000, 0, 1));
-        // Side changed
-        assert!(needs_overflow(0, 1, 1000, 100, 1, 1));
+        // Within limits: no overflow
+        assert!(!needs_overflow(1_000, 100, 100)); // ts=1ms, small price/size
+        // Timestamp exceeds 17-bit µs range (max 131071 µs = 131ms)
+        assert!(needs_overflow(200_000, 100, 100));
+        // Price exceeds 18-bit signed zigzag
+        assert!(needs_overflow(1_000, 200_000, 100));
+        // Size exceeds 27-bit signed zigzag
+        assert!(needs_overflow(1_000, 100, 200_000_000));
     }
 
     #[test]
     fn test_pack_unpack_base_delta() {
-        let prev = TradeTick::new(1_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
-        let next = TradeTick::new(1_000_000_100, 100_000_000_100i64, 1_000_000i64, 0, 1, 1);
+        // ts_delta = 1ms = 1_000_000 ns (small enough for 17-bit ms encoding)
+        let prev = TradeTick::new(1_700_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
+        let next = TradeTick::new(1_700_001_000_000, 100_000_000_100i64, 1_000_100i64, 0, 1, 1);
 
         let packed = pack_delta(&prev, &next);
         match packed {
@@ -374,7 +398,10 @@ mod tests {
                 let decoded = unpack_base_delta(&bytes, &prev, 1);
                 assert_eq!(decoded.timestamp_ns, next.timestamp_ns);
                 assert_eq!(decoded.price_int, next.price_int);
-                assert_eq!(decoded.bytes_consumed, 4);
+                assert_eq!(decoded.size_int, next.size_int);
+                assert_eq!(decoded.bytes_consumed, 8);
+                assert_eq!(decoded.side, next.side);
+                assert_eq!(decoded.flags, next.flags);
             }
             PackedDelta::Overflow(_) => panic!("Expected base delta, got overflow"),
         }
@@ -382,56 +409,63 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_overflow_delta() {
-        // Large timestamp jump (> 20 bits)
-        let prev = TradeTick::new(1_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
-        let next = TradeTick::new(3_000_000_000u64, 100_000_000_000i64, 1_000_000i64, 0, 1, 1);
+        // Overflow path is for ts_delta > 131 seconds (base limit).
+        // Use 200-second gap to ensure overflow triggers.
+        // 200_000_000_000 ns = 200_000 ms > 131_071 ms.
+        let prev = TradeTick::new(1_700_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
+        // 200s = 200_000_000_000 ns added.
+        let next = TradeTick::new(1_900_000_000_000u64, 100_000_000_500i64, 1_000_500i64, 1, 0, 1);
 
         let packed = pack_delta(&prev, &next);
         match packed {
             PackedDelta::Overflow(bytes) => {
                 assert_eq!(bytes[0], OVERFLOW_ESCAPE);
-                assert_eq!(bytes.len(), 12);
+                assert_eq!(bytes.len(), 14);
                 let decoded = unpack_overflow_delta(&bytes, &prev, 1);
-                // With 21-bit shift quantization, error per overflow is at most ~2^21 = 2.1M ns
-                // For 2B delta with 21-bit shift: extra_bits=953, decoded=953<<21=1998585856
-                // error = 2B - 1998585856 = 1,414,144 ns
-                let ts_diff = (decoded.timestamp_ns as i64 - next.timestamp_ns as i64).abs();
-                assert!(ts_diff < 5_000_000, "ts_diff = {} (expected < 5M)", ts_diff);
+                assert_eq!(decoded.timestamp_ns, next.timestamp_ns);
                 assert_eq!(decoded.price_int, next.price_int);
-                assert_eq!(decoded.bytes_consumed, 12);
+                assert_eq!(decoded.size_int, next.size_int);
+                assert_eq!(decoded.side, next.side);
+                assert_eq!(decoded.flags, next.flags);
+                assert_eq!(decoded.bytes_consumed, 14);
             }
             PackedDelta::Base(_) => panic!("Expected overflow delta, got base"),
         }
     }
 
     #[test]
-    fn test_side_change_overflow() {
-        let prev = TradeTick::new(1_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
-        let next = TradeTick::new(1_000_000_100, 100_000_000_100i64, 1_000_000i64, 1, 1, 1);
+    fn test_base_path_carries_side_and_flags() {
+        // Regression: base path encodes side+flags at bits 62-63.
+        let prev = TradeTick::new(1_700_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
+        let next = TradeTick::new(1_700_001_000_000, 100_000_000_100i64, 1_000_100i64, 1, 0, 1);
 
         let packed = pack_delta(&prev, &next);
         match packed {
-            PackedDelta::Overflow(_) => {}
-            PackedDelta::Base(_) => panic!("Side change should trigger overflow"),
+            PackedDelta::Base(bytes) => {
+                let decoded = unpack_base_delta(&bytes, &prev, 1);
+                assert_eq!(decoded.side, 1, "side=1 should round-trip through base path");
+                assert_eq!(decoded.flags, 0, "flags=0 should round-trip through base path");
+                assert_eq!(decoded.size_int, next.size_int);
+            }
+            PackedDelta::Overflow(_) => panic!("Side/flags change should use base path, not overflow"),
         }
     }
 
     #[test]
-    fn test_60_second_interval_overflow() {
-        // 60 seconds = 60_000_000_000 ns
-        // This should trigger overflow since it exceeds 20-bit max (~1ms)
-        let prev = TradeTick::new(1_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
-        let next = TradeTick::new(61_000_000_000u64, 100_000_000_000i64, 1_000_000i64, 0, 1, 1);
+    fn test_200_second_interval_overflow() {
+        // 200 seconds = 200_000 ms > 131_071 ms (17-bit limit) — triggers overflow.
+        let prev = TradeTick::new(1_700_000_000_000, 100_000_000_000i64, 1_000_000i64, 0, 1, 0);
+        let next = TradeTick::new(1_900_000_000_000u64, 100_000_000_000i64, 1_000_000i64, 0, 1, 1);
 
         let packed = pack_delta(&prev, &next);
         match packed {
             PackedDelta::Overflow(bytes) => {
-                assert_eq!(bytes.len(), 12);
-                // Verify ts_extra encoding
-                let ts_extra_raw = u16::from_le_bytes([bytes[1], bytes[2]]);
-                assert!(ts_extra_raw & 0x8000 != 0); // marker bit set
+                assert_eq!(bytes.len(), 14);
+                let decoded = unpack_overflow_delta(&bytes, &prev, 1);
+                assert_eq!(decoded.timestamp_ns, next.timestamp_ns);
+                assert_eq!(decoded.price_int, next.price_int);
             }
-            PackedDelta::Base(_) => panic!("60s interval should overflow"),
+            PackedDelta::Base(_) => panic!("200s interval should overflow"),
         }
     }
 }

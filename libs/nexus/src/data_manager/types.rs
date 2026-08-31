@@ -1,6 +1,7 @@
 //! Core types for the data manager.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 /// Supported exchanges.
@@ -19,6 +20,19 @@ impl Exchange {
             Exchange::Bybit => "bybit",
             Exchange::Okx => "okx",
             Exchange::Coinbase => "coinbase",
+        }
+    }
+}
+
+impl FromStr for Exchange {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "binance" => Ok(Exchange::Binance),
+            "bybit" => Ok(Exchange::Bybit),
+            "okx" | "okex" => Ok(Exchange::Okx),
+            "coinbase" => Ok(Exchange::Coinbase),
+            other => Err(format!("unknown exchange: {}", other)),
         }
     }
 }

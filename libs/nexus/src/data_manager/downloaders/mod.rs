@@ -5,9 +5,11 @@
 
 pub mod binance;
 pub mod bybit;
+pub mod parsers;
 
 #[cfg(test)]
 pub mod test_integration;
 
 pub use binance::BinanceDownloader;
 pub use bybit::BybitDownloader;
+pub use parsers::{parse_price_to_int, parse_qty_to_int};

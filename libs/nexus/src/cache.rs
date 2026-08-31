@@ -14,7 +14,125 @@ use serde::{Deserialize, Serialize};
 use crate::database::{Database, DatabaseError, SqliteDatabase};
 use crate::engine::account::{Account, AccountId, Position};
 use crate::engine::orders::Order;
-pub use crate::buffer::BarType;
+/// BarType — identifies a bar stream by instrument + aggregation spec.
+///
+/// Format examples:
+///   `BTCUSDT.BINANCE-1-MINUTE-LAST`
+///   `ETHUSDT.BINANCE-5-MINUTE-MID` (not yet supported, LAST only)
+///
+/// Nautilus-compatible: `<symbol>.<venue>-<n>-<unit>-<source>`
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BarType {
+    pub instrument_id: InstrumentId,
+    pub spec: BarAggregationSpec,
+    pub source: BarSource,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BarSource {
+    Last,
+    Mid,
+    Bid,
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BarAggregationSpec {
+    pub step: u32,
+    pub unit: BarUnit,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BarUnit {
+    Second,
+    Minute,
+    Hour,
+    Day,
+}
+
+impl BarType {
+    /// Parse a string like `"BTCUSDT.BINANCE-1-MINUTE-LAST"` into a BarType.
+    pub fn parse_bar_type(s: &str) -> Result<Self, BarTypeParseError> {
+        // Format: `<symbol>.<venue>-<n>-<unit>-<source>`
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 4 {
+            return Err(BarTypeParseError::WrongShape(s.to_string()));
+        }
+        let head: Vec<&str> = parts[0].split('.').collect();
+        if head.len() != 2 {
+            return Err(BarTypeParseError::WrongShape(s.to_string()));
+        }
+        let symbol = head[0].to_string();
+        let venue = head[1].to_string();
+        let step: u32 = parts[1].parse().map_err(|_| BarTypeParseError::BadStep(parts[1].to_string()))?;
+        let unit = match parts[2] {
+            "SECOND" => BarUnit::Second,
+            "MINUTE" => BarUnit::Minute,
+            "HOUR" => BarUnit::Hour,
+            "DAY" => BarUnit::Day,
+            other => return Err(BarTypeParseError::BadUnit(other.to_string())),
+        };
+        let source = match parts[3] {
+            "LAST" => BarSource::Last,
+            "MID" => BarSource::Mid,
+            "BID" => BarSource::Bid,
+            "ASK" => BarSource::Ask,
+            other => return Err(BarTypeParseError::BadSource(other.to_string())),
+        };
+        // InstrumentId fields are `id, symbol, exchange` (id is FNV-1a hash).
+        // Format string uses venue = exchange.
+        Ok(BarType {
+            instrument_id: InstrumentId::new(&symbol, &venue),
+            spec: BarAggregationSpec { step, unit },
+            source,
+        })
+    }
+
+    /// Format back to canonical string form.
+    pub fn format_bar_type(&self) -> String {
+        let unit = match self.spec.unit {
+            BarUnit::Second => "SECOND",
+            BarUnit::Minute => "MINUTE",
+            BarUnit::Hour => "HOUR",
+            BarUnit::Day => "DAY",
+        };
+        let source = match self.source {
+            BarSource::Last => "LAST",
+            BarSource::Mid => "MID",
+            BarSource::Bid => "BID",
+            BarSource::Ask => "ASK",
+        };
+        format!(
+            "{}.{}-{}-{}-{}",
+            self.instrument_id.symbol,
+            self.instrument_id.exchange,
+            self.spec.step,
+            unit,
+            source
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BarTypeParseError {
+    WrongShape(String),
+    BadStep(String),
+    BadUnit(String),
+    BadSource(String),
+}
+
+impl std::fmt::Display for BarTypeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongShape(s) => write!(f, "invalid bar_type shape: {}", s),
+            Self::BadStep(s) => write!(f, "invalid bar_type step: {}", s),
+            Self::BadUnit(s) => write!(f, "invalid bar_type unit: {}", s),
+            Self::BadSource(s) => write!(f, "invalid bar_type source: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for BarTypeParseError {}
 use crate::instrument::{InstrumentId, Venue};
 use crate::instrument::registry::InstrumentRegistry;
 use crate::instrument::Instrument as InstrumentDef;
@@ -172,10 +290,13 @@ pub struct Cache {
     // Synthetic instruments index — maps underlying symbol to synthetic IDs
     index_synthetics_underlying: HashMap<String, Vec<InstrumentId>>,
 
-    // ─── US-LT-04: Missing critical index maps (live trading) ─────────────────
+    // ─── Live trading index maps ─────────────────────────────────────────────
     /// All orders (open + closed) — superset of index_orders_open and index_orders_closed
     #[allow(dead_code)]
     index_orders: HashSet<ClientOrderId>,
+    /// Maps strategy_id → primary venue for that strategy.
+    /// Used by LiveStrategyCtx to resolve account_equity without a per-call venue arg.
+    index_strategy_venue: HashMap<StrategyId, Venue>,
     /// Orders submitted but not yet accepted by the venue
     index_orders_inflight: HashSet<ClientOrderId>,
     /// Orders awaiting cancel confirmation from the venue
@@ -247,6 +368,7 @@ impl Cache {
             index_orders: HashSet::new(),
             index_orders_inflight: HashSet::new(),
             index_orders_pending_cancel: HashSet::new(),
+            index_strategy_venue: HashMap::new(),
             mark_prices: HashMap::new(),
             funding_rates: HashMap::new(),
             index_venue_order_ids: HashMap::new(),
@@ -301,6 +423,7 @@ impl Cache {
             index_orders: HashSet::new(),
             index_orders_inflight: HashSet::new(),
             index_orders_pending_cancel: HashSet::new(),
+            index_strategy_venue: HashMap::new(),
             mark_prices: HashMap::new(),
             funding_rates: HashMap::new(),
             index_venue_order_ids: HashMap::new(),
@@ -464,6 +587,31 @@ impl Cache {
             .and_then(|acc_id| self.accounts.get(acc_id))
             .map(|acc| acc.equity())
             .unwrap_or(0.0)
+    }
+
+    /// Get equity for a strategy's primary venue.
+    /// Falls back to 0.0 if no venue is registered for the strategy.
+    pub fn get_equity_for_strategy(&self, strategy_id: &StrategyId) -> f64 {
+        self.index_strategy_venue
+            .get(strategy_id)
+            .map(|v| self.get_equity_for_venue(v))
+            .unwrap_or(0.0)
+    }
+
+    /// Get the last trade price for an instrument.
+    /// Returns the most recent TradeTick price from the deque, or None if no ticks.
+    pub fn get_last_price(&self, instrument_id: &InstrumentId) -> Option<f64> {
+        self.trade_ticks
+            .get(instrument_id)
+            .and_then(|deque| deque.front().map(|tick| tick.price))
+    }
+
+    /// Set the primary venue for a strategy.
+    /// Called when a strategy's first order is submitted to a venue.
+    pub fn set_strategy_venue(&mut self, strategy_id: StrategyId, venue: Venue) {
+        self.index_strategy_venue
+            .entry(strategy_id)
+            .or_insert(venue);
     }
 
     // =============================================================================

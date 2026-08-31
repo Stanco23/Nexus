@@ -152,7 +152,7 @@ impl nexus::portfolio::PortfolioStrategy for OrbStrategy {
         // Only trade our instrument
         let expected_id = InstrumentId::new(self.config.instrument_id, "AMEX");
         if instrument_id != expected_id {
-            return Signal::Close;
+            return Signal::close();
         }
 
         let hour = Self::unix_ns_to_est_hour(timestamp_ns);
@@ -171,7 +171,7 @@ impl nexus::portfolio::PortfolioStrategy for OrbStrategy {
                 _ => {}
             }
             // Stay in building phase
-            return Signal::Close;
+            return Signal::close();
         }
 
         // ── Phase 2: Arm ORB when window closes ─────────────────────────────
@@ -193,12 +193,12 @@ impl nexus::portfolio::PortfolioStrategy for OrbStrategy {
             } else {
                 println!("[ORB] Window closed — no range data, skipping day");
             }
-            return Signal::Close;
+            return Signal::close();
         }
 
         // ── Phase 3: Only trade during regular session ───────────────────────
         if hour < opening_end || hour >= self.config.session_end_hour {
-            return Signal::Close;
+            return Signal::close();
         }
 
         // ── Phase 4: Entry logic ─────────────────────────────────────────────
@@ -220,7 +220,7 @@ impl nexus::portfolio::PortfolioStrategy for OrbStrategy {
                     self.stop_price.unwrap(),
                     self.take_profit.unwrap()
                 );
-                return Signal::Buy;
+                return Signal::buy_market();
             }
 
             // Short breakout — price closes below ORB low
@@ -237,16 +237,16 @@ impl nexus::portfolio::PortfolioStrategy for OrbStrategy {
                     self.stop_price.unwrap(),
                     self.take_profit.unwrap()
                 );
-                return Signal::Sell;
+                return Signal::sell_market();
             }
 
-            return Signal::Close;
+            return Signal::close();
         }
 
         // ── Phase 5: Exit logic ──────────────────────────────────────────────
         if self.position_open {
             let Some(entry) = self.entry_price else {
-                return Signal::Close;
+                return Signal::close();
             };
 
             let direction = if self.position_side == PositionSide::Long { 1.0 } else { -1.0 };
@@ -262,7 +262,7 @@ impl nexus::portfolio::PortfolioStrategy for OrbStrategy {
                 };
                 println!("[ORB] {} @ {:.2}", reason, price);
                 self.close_position();
-                return Signal::Close;
+                return Signal::close();
             }
 
             // Take profit (1.5× range_width in ticks)
@@ -275,7 +275,7 @@ impl nexus::portfolio::PortfolioStrategy for OrbStrategy {
                 };
                 println!("[ORB] {} @ {:.2}", reason, price);
                 self.close_position();
-                return Signal::Close;
+                return Signal::close();
             }
         }
 

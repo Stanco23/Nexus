@@ -29,39 +29,63 @@ impl Catalog {
 
         for exchange_entry in std::fs::read_dir(&root)? {
             let exchange_entry = exchange_entry?;
+
+            // Skip non-directories (flat TVC files, CSV files, etc.)
+            if !exchange_entry.file_type()?.is_dir() {
+                continue;
+            }
+
             let exchange_name = exchange_entry.file_name().to_string_lossy().to_lowercase();
-            let exchange = match_exchange(&exchange_name)
-                .ok_or_else(|| std::io::Error::other("invalid exchange dir"))?;
-            if exchange_entry.file_type()?.is_dir() {
-                for venue_entry in std::fs::read_dir(exchange_entry.path())? {
-                    let venue_entry = venue_entry?;
-                    let venue_name = venue_entry.file_name().to_string_lossy().to_lowercase();
-                    let venue = match_venue(&venue_name)
-                        .ok_or_else(|| std::io::Error::other("invalid venue dir"))?;
-                    if venue_entry.file_type()?.is_dir() {
-                        for symbol_entry in std::fs::read_dir(venue_entry.path())? {
-                            let symbol_entry = symbol_entry?;
-                            let symbol = symbol_entry.file_name().to_string_lossy().to_string();
-                            if symbol_entry.file_type()?.is_dir() {
-                                for date_entry in std::fs::read_dir(symbol_entry.path())? {
-                                    let date_entry = date_entry?;
-                                    let path = date_entry.path();
-                                    if path.extension().map_or(false, |e| e == "tvc") {
-                                        let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                                        if let Some(date) = parse_date_from_stem(&stem) {
-                                            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                                            let tvc_file = TvcFile {
-                                                exchange,
-                                                venue,
-                                                symbol: symbol.clone(),
-                                                date,
-                                                path: path.clone(),
-                                                size_bytes: size,
-                                            };
-                                            index.insert((exchange, venue, symbol.clone(), date), tvc_file);
-                                        }
-                                    }
-                                }
+            let Some(exchange) = match_exchange(&exchange_name) else {
+                // Skip unknown exchange dirs (e.g. TVCB flat structure: btcusdt/15m/)
+                continue;
+            };
+
+            for venue_entry in std::fs::read_dir(exchange_entry.path())? {
+                let venue_entry = venue_entry?;
+
+                if !venue_entry.file_type()?.is_dir() {
+                    continue;
+                }
+
+                let venue_name = venue_entry.file_name().to_string_lossy().to_lowercase();
+                let venue = match_venue(&venue_name)
+                    .ok_or_else(|| std::io::Error::other("invalid venue dir"))?;
+
+                for symbol_entry in std::fs::read_dir(venue_entry.path())? {
+                    let symbol_entry = symbol_entry?;
+
+                    if !symbol_entry.file_type()?.is_dir() {
+                        continue;
+                    }
+
+                    // Normalize to UPPERCASE — exchanges standardize on uppercase tickers,
+                    // and writers may use different casings (e.g. bar_ingester lowercases,
+                    // tvc_builder preserves caller's case). Catalog stores uppercase to
+                    // make lookups consistent regardless of on-disk casing.
+                    let symbol = symbol_entry.file_name().to_string_lossy().to_uppercase();
+                    for date_entry in std::fs::read_dir(symbol_entry.path())? {
+                        let date_entry = date_entry?;
+                        let path = date_entry.path();
+                        if path.extension().map_or(false, |e| e == "tvc") {
+                            // Skip files that don't have the TVC3 magic — these are
+                            // corrupt/zero-header files (typically from a writer bug)
+                            // and would just waste time on read attempts.
+                            if !is_valid_tvc_magic(&path) {
+                                continue;
+                            }
+                            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                            if let Some(date) = parse_date_from_stem(&stem) {
+                                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                let tvc_file = TvcFile {
+                                    exchange,
+                                    venue,
+                                    symbol: symbol.clone(),
+                                    date,
+                                    path: path.clone(),
+                                    size_bytes: size,
+                                };
+                                index.insert((exchange, venue, symbol.clone(), date), tvc_file);
                             }
                         }
                     }
@@ -73,24 +97,26 @@ impl Catalog {
     }
 
     /// Check if a specific (exchange, venue, symbol, date) file exists.
+    /// Symbol is normalized to UPPERCASE for consistent lookup.
     pub fn contains(&self, exchange: Exchange, venue: Venue, symbol: &str, date: NaiveDate) -> bool {
-        self.index.contains_key(&(exchange, venue, symbol.to_string(), date))
+        self.index.contains_key(&(exchange, venue, symbol.to_uppercase(), date))
     }
 
-    /// Get a specific file entry.
+    /// Get a specific file entry. Symbol is normalized to UPPERCASE.
     pub fn get(&self, exchange: Exchange, venue: Venue, symbol: &str, date: NaiveDate) -> Option<&TvcFile> {
-        self.index.get(&(exchange, venue, symbol.to_string(), date))
+        self.index.get(&(exchange, venue, symbol.to_uppercase(), date))
     }
 
-    /// List all files for a given (exchange, venue, symbol).
+    /// List all files for a given (exchange, venue, symbol). Symbol is normalized to UPPERCASE.
     pub fn files_for(&self, exchange: Exchange, venue: Venue, symbol: &str) -> Vec<&TvcFile> {
+        let symbol_upper = symbol.to_uppercase();
         self.index
             .values()
-            .filter(|f| f.exchange == exchange && f.venue == venue && f.symbol == symbol)
+            .filter(|f| f.exchange == exchange && f.venue == venue && f.symbol == symbol_upper)
             .collect()
     }
 
-    /// List all files for a given (exchange, venue, symbol, date_range).
+    /// List all files for a given (exchange, venue, symbol, date_range). Symbol normalized to UPPERCASE.
     pub fn files_in_range(
         &self,
         exchange: Exchange,
@@ -99,10 +125,15 @@ impl Catalog {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Vec<&TvcFile> {
+        let symbol_upper = symbol.to_uppercase();
         self.index
             .values()
             .filter(|f| {
-                f.exchange == exchange && f.venue == venue && f.symbol == symbol && f.date >= start && f.date <= end
+                f.exchange == exchange
+                    && f.venue == venue
+                    && f.symbol == symbol_upper
+                    && f.date >= start
+                    && f.date <= end
             })
             .collect()
     }
@@ -159,4 +190,20 @@ fn parse_date_from_stem(stem: &str) -> Option<NaiveDate> {
         }
     }
     None
+}
+
+/// Check whether the first 4 bytes of a TVC file are the TVC3 magic.
+/// Used by the catalog to skip corrupt/zero-header files that would
+/// just fail later at read time.
+fn is_valid_tvc_magic(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 4];
+    match file.read(&mut buf) {
+        Ok(4) => &buf == b"TVC3",
+        _ => false,
+    }
 }

@@ -173,7 +173,11 @@ impl SweepRunner {
     }
 }
 
-/// Run a sweep tick loop over a RingBufferSet using merged anchor iteration.
+/// Run a sweep tick loop over a RingBufferSet using anchor_iter().
+///
+/// Uses AnchorIter to stream all ticks from all instruments in time-order.
+/// One entry per anchor (anchor_interval=1024), sequential mmap reads,
+/// no binary search per tick, no 365M iteration loop.
 fn run_sweep_tick_loop<S: nexus_strategy::Strategy>(
     buffer_set: &RingBufferSet,
     portfolio: &mut Portfolio,
@@ -181,145 +185,138 @@ fn run_sweep_tick_loop<S: nexus_strategy::Strategy>(
     config: &PortfolioConfig,
 ) {
     use crate::engine::Signal as EngineSignal;
-    use nexus_strategy::{Strategy, StrategyCtx};
+    use nexus_strategy::StrategyCtx;
     use crate::buffer::buffer_set::RingBufferSet;
     use crate::engine::core::EngineContext;
     use std::collections::HashMap;
 
-    let total_ticks = buffer_set.total_ticks();
-    let instrument_ids = buffer_set.instrument_ids();
     let mut last_prices: HashMap<u32, f64> = HashMap::new();
+    let initial_equity = config.initial_equity_per_instrument;
 
-    for global_tick in 0..total_ticks {
-        let Some((buffer, offset, tick_idx, anchor_slot)) =
-            buffer_set.iter_state_from_global_tick(global_tick)
-        else {
-            continue;
-        };
+    // Iterate one anchor at a time, streaming all ticks via RingIter.
+    // AnchorIter yields (buffer, byte_offset, local_tick_index, anchor_slot, instrument_id, ring_iter)
+    for (_buffer, byte_offset, local_tick_index, anchor_slot, instrument_id, mut ring_iter) in buffer_set.anchor_iter() {
+        // ring_iter starts past the anchor tick — first next() yields tick at local_tick_index + 1
+        while let Some(tick) = ring_iter.next() {
+            let ts = tick.timestamp_ns;
+            let price = tick.price_int as f64 / 1e9;
+            let size = tick.size_int as f64 / 1e9;
 
-        let Ok(tick) = buffer.decode_anchor_at(offset) else {
-            continue;
-        };
+            // Get instrument id from buffer (buffer's own instrument_id, not from merged_anchors)
+            let inst_id = instrument_id.clone();
+            let inst_key = inst_id.id;
 
-        let ts = tick.timestamp_ns;
-        let price = tick.price_int as f64 / 1e9;
-        let size = tick.size_int as f64 / 1e9;
+            // Update last price
+            last_prices.insert(inst_key, price);
 
-        // Get instrument id from tick (buffer_idx -> instrument from RingBufferSet)
-        let anchor = &buffer_set.merged_anchors()[global_tick as usize];
-        let instrument_id = instrument_ids.get(anchor.buffer_idx).cloned()
-            .unwrap_or_else(|| instrument_ids.first().cloned().unwrap());
+            // Update unrealized PnL
+            if let Some(state) = portfolio.state_mut(&inst_id) {
+                state.update_unrealized_pnl(price);
+            }
 
-        // Update last price
-        last_prices.insert(instrument_id.id, price);
+            // Record equity
+            portfolio.record_equity();
 
-        // Update unrealized PnL
-        if let Some(state) = portfolio.state_mut(&instrument_id) {
-            state.update_unrealized_pnl(price);
-        }
+            // Build context
+            let mut ctx = EngineContext::new(
+                initial_equity,
+                std::sync::Arc::new(std::sync::Mutex::new(crate::signals::SignalBus::new())),
+                std::ptr::null_mut(),
+            );
+            ctx.subscribe_instruments(vec![inst_id.clone()]);
 
-        // Record equity
-        portfolio.record_equity();
-
-        // Build context
-        let mut ctx = EngineContext::new(
-            config.initial_equity_per_instrument,
-            std::sync::Arc::new(std::sync::Mutex::new(crate::signals::SignalBus::new())),
-            std::ptr::null_mut(),
-        );
-        ctx.subscribe_instruments(vec![instrument_id.clone()]);
-
-        // Convert to nexus_types::Tick
-        let ntick = nexus_types::Tick {
-            timestamp_ns: tick.timestamp_ns,
-            price,
-            size,
-            vpin: 0.0,
-        };
-
-        // Call strategy
-        if let Some(signal) = strategy.on_trade(instrument_id.clone(), &ntick, &mut ctx) {
-            // Route signal through portfolio
-            let engine_signal = match signal {
-                nexus_types::Signal::Buy => EngineSignal::Buy,
-                nexus_types::Signal::Sell => EngineSignal::Sell,
-                nexus_types::Signal::Close => EngineSignal::Close,
+            // Convert to nexus_types::Tick
+            let ntick = nexus_types::Tick {
+                timestamp_ns: tick.timestamp_ns,
+                price,
+                size,
+                vpin: 0.0,
             };
 
-            let position = portfolio.state(&instrument_id)
-                .map(|s| s.position).unwrap_or(0.0);
-            let has_position = position != 0.0;
-            let is_long = position > 0.0;
+            // Call strategy
+            if let Some(signal) = strategy.on_trade(inst_id.clone(), &ntick, &mut ctx) {
+                // Route signal through portfolio
+                let engine_signal = match signal {
+                    nexus_types::Signal::Buy => EngineSignal::Buy,
+                    nexus_types::Signal::Sell => EngineSignal::Sell,
+                    nexus_types::Signal::Close => EngineSignal::Close,
+                };
 
-            match (engine_signal, has_position, is_long) {
-                (EngineSignal::Buy, false, _) | (EngineSignal::Buy, true, false) => {
-                    if let Some(state) = portfolio.state_mut(&instrument_id) {
-                        let size = if has_position { position.abs() + 1.0 } else { 1.0 };
-                        let comm = config.commission.compute(price, size.abs());
-                        if state.position == 0.0 {
-                            state.position = size;
-                            state.entry_price = price;
-                        } else {
+                let position = portfolio.state(&inst_id)
+                    .map(|s| s.position).unwrap_or(0.0);
+                let has_position = position != 0.0;
+                let is_long = position > 0.0;
+
+                match (engine_signal, has_position, is_long) {
+                    (EngineSignal::Buy, false, _) | (EngineSignal::Buy, true, false) => {
+                        if let Some(state) = portfolio.state_mut(&inst_id) {
+                            let sz = if has_position { position.abs() + 1.0 } else { 1.0 };
+                            let comm = config.commission.compute(price, sz.abs());
+                            if state.position == 0.0 {
+                                state.position = sz;
+                                state.entry_price = price;
+                            } else {
+                                let pnl = if state.position > 0.0 {
+                                    (price - state.entry_price) * state.position.abs()
+                                } else {
+                                    (state.entry_price - price) * state.position.abs()
+                                };
+                                state.realized_pnl += pnl;
+                                state.position = sz;
+                                state.entry_price = price;
+                            }
+                            state.equity -= comm;
+                            state.commissions += comm;
+                            state.num_trades += 1;
+                        }
+                    }
+                    (EngineSignal::Sell, false, _) | (EngineSignal::Sell, true, true) => {
+                        if let Some(state) = portfolio.state_mut(&inst_id) {
+                            let sz = if has_position { position.abs() + 1.0 } else { 1.0 };
+                            let comm = config.commission.compute(price, sz.abs());
+                            if state.position == 0.0 {
+                                state.position = -sz;
+                                state.entry_price = price;
+                            } else {
+                                let pnl = if state.position > 0.0 {
+                                    (price - state.entry_price) * state.position.abs()
+                                } else {
+                                    (state.entry_price - price) * state.position.abs()
+                                };
+                                state.realized_pnl += pnl;
+                                state.position = -sz;
+                                state.entry_price = price;
+                            }
+                            state.equity -= comm;
+                            state.commissions += comm;
+                            state.num_trades += 1;
+                        }
+                    }
+                    (EngineSignal::Close, true, _) => {
+                        if let Some(state) = portfolio.state_mut(&inst_id) {
                             let pnl = if state.position > 0.0 {
                                 (price - state.entry_price) * state.position.abs()
                             } else {
                                 (state.entry_price - price) * state.position.abs()
                             };
+                            let comm = config.commission.compute(price, state.position.abs());
                             state.realized_pnl += pnl;
-                            state.position = size;
-                            state.entry_price = price;
+                            state.equity += pnl - comm;
+                            state.commissions += comm;
+                            state.position = 0.0;
+                            state.entry_price = 0.0;
+                            state.num_trades += 1;
                         }
-                        state.equity -= comm;
-                        state.commissions += comm;
-                        state.num_trades += 1;
                     }
+                    _ => {}
                 }
-                (EngineSignal::Sell, false, _) | (EngineSignal::Sell, true, true) => {
-                    if let Some(state) = portfolio.state_mut(&instrument_id) {
-                        let size = if has_position { position.abs() + 1.0 } else { 1.0 };
-                        let comm = config.commission.compute(price, size.abs());
-                        if state.position == 0.0 {
-                            state.position = -size;
-                            state.entry_price = price;
-                        } else {
-                            let pnl = if state.position > 0.0 {
-                                (price - state.entry_price) * state.position.abs()
-                            } else {
-                                (state.entry_price - price) * state.position.abs()
-                            };
-                            state.realized_pnl += pnl;
-                            state.position = -size;
-                            state.entry_price = price;
-                        }
-                        state.equity -= comm;
-                        state.commissions += comm;
-                        state.num_trades += 1;
-                    }
-                }
-                (EngineSignal::Close, true, _) => {
-                    if let Some(state) = portfolio.state_mut(&instrument_id) {
-                        let pnl = if state.position > 0.0 {
-                            (price - state.entry_price) * state.position.abs()
-                        } else {
-                            (state.entry_price - price) * state.position.abs()
-                        };
-                        let comm = config.commission.compute(price, state.position.abs());
-                        state.realized_pnl += pnl;
-                        state.equity += pnl - comm;
-                        state.commissions += comm;
-                        state.position = 0.0;
-                        state.entry_price = 0.0;
-                        state.num_trades += 1;
-                    }
-                }
-                _ => {}
             }
-        }
 
-        // Update peaks
-        for (id, p) in last_prices.iter() {
-            if let Some(state) = portfolio.state_mut(&instrument_id) {
-                state.update_peak(*p);
+            // Update peaks
+            for (_id, p) in last_prices.iter() {
+                if let Some(state) = portfolio.state_mut(&inst_id) {
+                    state.update_peak(*p);
+                }
             }
         }
     }

@@ -1,129 +1,139 @@
 #!/usr/bin/env python3
 """
-Download Binance BTCUSDT klines and convert to TVC3-compatible CSV.
-Usage: python3 scripts/fetch_binance_data.py --days 7 --output tvc_data/BTCUSDT_2025-01-02.csv
+Download Binance BTCUSDT raw trades from the public historical archive.
+
+URL pattern:
+    https://data.binance.vision/data/spot/daily/trades/{symbol}/{symbol}-trades-{YYYY-MM-DD}.zip
+
+Each ZIP contains a CSV:
+    trade_id, price, qty, quoteQty, time, isBuyerMaker, isBestMatch
+
+Timestamps are in **microseconds** for dates from Jan 1 2025 onwards.
+
+Usage:
+    python3 scripts/fetch_binance_data.py --date 2025-01-02 --output data/
 """
 
 import argparse
 import csv
 import time
+import zipfile
+import io
+import os
 import requests
 from datetime import datetime, timezone, timedelta
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BASE_URL = "https://data.binance.vision/data/spot/daily/trades"
 SYMBOL = "BTCUSDT"
-INTERVAL = "1m"
-MAX_PER_REQUEST = 1000  # Binance limit
 
-def fetch_klines(start_ms: int, end_ms: int):
-    """Fetch klines from Binance API in chunks."""
-    all_klines = []
-    current = start_ms
 
-    while current < end_ms:
-        url = f"{BINANCE_KLINES_URL}?symbol={SYMBOL}&interval={INTERVAL}&startTime={current}&endTime={end_ms}&limit={MAX_PER_REQUEST}"
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if not data:
-            break
-
-        all_klines.extend(data)
-        print(f"  Fetched {len(data)} klines, total: {len(all_klines)}", flush=True)
-
-        # Next batch: last timestamp + 1ms
-        current = int(data[-1][0]) + 1
-
-        # Rate limit protection
-        time.sleep(0.2)
-
-    return all_klines
-
-def klines_to_csv(klines, output_path: str):
+def download_and_convert(date_str: str, output_dir: str) -> dict:
     """
-    Convert Binance klines to TVC3 CSV format.
-    Binance kline format: [open_time, open, high, low, close, volume, close_time, ...]
-    We output: timestamp(ns), price, quantity, side, trade_id
-    timestamp is open_time in milliseconds converted to nanoseconds.
-    price = close price (most recent)
-    quantity = volume
-    side = BUY/SELL based on price movement
+    Download a daily trades ZIP and convert to TVC CSV.
+    Returns dict with stats.
     """
-    with open(output_path, 'w', newline='') as f:
+    url = f"{BASE_URL}/{SYMBOL}/{SYMBOL}-trades-{date_str}.zip"
+    print(f"Downloading: {url}")
+
+    resp = requests.get(url, timeout=60)
+    if resp.status_code == 404:
+        print(f"  Not found (404) — no data for {date_str}")
+        return None
+    resp.raise_for_status()
+
+    z = zipfile.ZipFile(io.BytesIO(resp.content))
+    if len(z.namelist()) != 1:
+        print(f"  Unexpected ZIP contents: {z.namelist()}")
+        return None
+
+    csv_name = z.namelist()[0]
+    with z.open(csv_name) as f:
+        content = f.read().decode('utf-8')
+
+    # Parse trades
+    reader = csv.reader(io.StringIO(content))
+    header = next(reader)
+    print(f"  ZIP header: {header}")
+
+    rows_out = []
+    first_ts = None
+    last_ts = None
+    trade_count = 0
+
+    for row in reader:
+        if len(row) < 6:
+            continue
+        # trade_id, price, qty, quoteQty, time, isBuyerMaker, isBestMatch
+        try:
+            trade_id = int(row[0])
+            price = float(row[1])
+            qty = float(row[2])
+            time_us = int(row[4])   # microseconds
+            is_buyer_maker = row[5].strip().lower() == 'true'
+            # Convert microseconds → nanoseconds
+            ts_ns = time_us * 1000
+            # isBuyerMaker: true → buyer was maker → taker sold → SELL-side
+            side = 'SELL' if is_buyer_maker else 'BUY'
+            rows_out.append((ts_ns, price, qty, side, trade_id))
+            if first_ts is None:
+                first_ts = ts_ns
+            last_ts = ts_ns
+            trade_count += 1
+        except (ValueError, IndexError):
+            continue
+
+    print(f"  {trade_count} trades, time range: {first_ts} → {last_ts}")
+
+    # Write CSV
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, f"{SYMBOL}_{date_str}.csv")
+    with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['timestamp', 'price', 'quantity', 'side', 'trade_id'])
+        writer.writerows(rows_out)
 
-        trade_id = 0
-        prev_close = None
+    first_dt = datetime.utcfromtimestamp(first_ts / 1e9) if first_ts else None
+    last_dt = datetime.utcfromtimestamp(last_ts / 1e9) if last_ts else None
 
-        for kline in klines:
-            open_time_ms = int(kline[0])
-            open_price = float(kline[1])
-            high_price = float(kline[2])
-            low_price = float(kline[3])
-            close_price = float(kline[4])
-            volume = float(kline[5])
-            close_time_ms = int(kline[6])
+    print(f"  Wrote: {csv_path} ({os.path.getsize(csv_path) / 1024:.1f} KB)")
+    print(f"  Time range: {first_dt} → {last_dt}")
 
-            # Use close time as primary timestamp (nanoseconds)
-            ts_ns = close_time_ms * 1_000_000
+    return {
+        'date': date_str,
+        'csv_path': csv_path,
+        'trade_count': trade_count,
+        'first_ts': first_ts,
+        'last_ts': last_ts,
+    }
 
-            # Determine side: BUY if close >= open, else SELL
-            side = 'BUY' if close_price >= open_price else 'SELL'
-
-            # Use close price as the price
-            price = close_price
-
-            writer.writerow([ts_ns, f"{price:.2f}", f"{volume:.6f}", side, trade_id])
-            trade_id += 1
-            prev_close = close_price
-
-    return trade_id
 
 def main():
-    parser = argparse.ArgumentParser(description="Download Binance BTCUSDT klines")
-    parser.add_argument("--output", default="BTCUSDT.csv", help="Output CSV path")
-    parser.add_argument("--days", type=int, default=7, help="Number of days to fetch")
-    parser.add_argument("--start-date", default="2025-01-02", help="Start date YYYY-MM-DD")
+    parser = argparse.ArgumentParser(
+        description="Download Binance BTCUSDT daily trades → TVC CSV"
+    )
+    parser.add_argument(
+        "--date", required=True,
+        help="Date YYYY-MM-DD (e.g. 2025-01-02)"
+    )
+    parser.add_argument(
+        "--output", "-o", default=".",
+        help="Output directory for CSV files"
+    )
     args = parser.parse_args()
 
-    # Parse start date
-    start_dt = datetime.fromisoformat(args.start_date)
-    start_dt = start_dt.replace(tzinfo=timezone.utc)
-    start_ms = int(start_dt.timestamp() * 1000)
-
-    # End date = start + days
-    end_dt = start_dt + timedelta(days=args.days)
-    end_ms = int(end_dt.timestamp() * 1000)
-
-    print(f"=== Binance Data Fetcher ===")
-    print(f"Symbol:    {SYMBOL}")
-    print(f"Interval:  {INTERVAL}")
-    print(f"Start:     {start_dt} ({start_ms} ms)")
-    print(f"End:       {end_dt} ({end_ms} ms)")
-    print(f"Days:      {args.days}")
-    print(f"Output:    {args.output}")
+    print(f"=== Binance Raw Trades Fetcher ===")
+    print(f"Symbol:  {SYMBOL}")
+    print(f"Date:    {args.date}")
+    print(f"Output:  {args.output}")
     print()
 
-    print("Fetching klines...")
-    klines = fetch_klines(start_ms, end_ms)
-    print(f"Total klines fetched: {len(klines)}")
+    result = download_and_convert(args.date, args.output)
 
-    if not klines:
-        print("No data fetched!")
-        return
+    if result:
+        print(f"\n✓ Downloaded {result['trade_count']} trades for {result['date']}")
+    else:
+        print("\n✗ No data available for this date")
 
-    print("Writing CSV...")
-    count = klines_to_csv(klines, args.output)
-    print(f"Wrote {count} rows to {args.output}")
-
-    # Print time range
-    first_ts = int(klines[0][0])
-    last_ts = int(klines[-1][0])
-    first_dt = datetime.fromtimestamp(first_ts / 1000, tz=timezone.utc)
-    last_dt = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc)
-    print(f"Time range: {first_dt} to {last_dt}")
 
 if __name__ == "__main__":
     main()

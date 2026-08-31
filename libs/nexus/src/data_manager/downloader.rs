@@ -17,8 +17,12 @@ pub struct RawTradeData {
     pub venue: Venue,
     pub symbol: String,
     pub date: NaiveDate,
-    /// Vector of (timestamp_ns, price_int, size_int) — nano-integer format
-    pub trades: Vec<(u64, i64, i64)>,
+    /// Vector of (timestamp_ns, price_int, size_int, side) — nano-integer format.
+    /// `side` is the aggressor: 0 = buy (taker bought), 1 = sell (taker sold).
+    /// Source CSV columns:
+    /// - Binance: `isBuyerMaker` (true → sell aggressor, false → buy aggressor)
+    /// - Bybit:   `side` ("Buy"/"Sell")
+    pub trades: Vec<(u64, i64, i64, u8)>,
 }
 
 /// Trait for exchange-specific download implementations.

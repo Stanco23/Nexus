@@ -59,6 +59,29 @@ pub trait StrategyCtx: Send + Sync {
         tp: Option<f64>,
     ) -> u64;
 
+    /// Submit a trailing stop order.
+    ///
+    /// `trailing_delta_pct` is the percentage offset from the extreme price
+    /// (e.g. 0.01 = 1%). For a SELL trailing stop on a long position, the stop
+    /// price trails 1% below the highest price achieved.
+    fn submit_trailing(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        price: f64,
+        size: f64,
+        trailing_delta_pct: f64,
+    ) -> u64;
+
     /// Generate a trading signal directly.
     fn emit_signal(&mut self, signal: Signal);
+
+    /// Submit an order directly. Returns the order ID.
+    fn submit_order(&mut self, order: Order) -> u64;
+
+    /// Cancel an order by ID. Returns true if cancelled.
+    fn cancel_order(&mut self, order_id: u64) -> bool;
+
+    /// Total PnL (realized + unrealized) for an open position.
+    fn position_pnl(&self, instrument_id: InstrumentId) -> f64;
 }

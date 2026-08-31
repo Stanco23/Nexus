@@ -20,6 +20,16 @@ pub enum LoadError {
     NoData,
 }
 
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Io(e) => write!(f, "IO error: {}", e),
+            LoadError::TvcFormat(msg) => write!(f, "TVC format error: {}", msg),
+            LoadError::NoData => write!(f, "No data available"),
+        }
+    }
+}
+
 impl From<std::io::Error> for LoadError {
     fn from(e: std::io::Error) -> Self { LoadError::Io(e) }
 }

@@ -40,14 +40,22 @@
 //! - **OKX**: HTTP klines + trade APIs
 //! - **Coinbase**: HTTP product candles + trades
 
+pub mod bar_ingester;
 pub mod catalog;
+pub mod data_manager;
 pub mod downloader;
+pub mod downloaders;
 pub mod loader;
+#[macro_use]
+pub mod macros;
 pub mod tvc_builder;
 pub mod types;
 
+pub use bar_ingester::{BarIngester, ExchangeKind, InstrumentType};
 pub use catalog::Catalog;
+pub use data_manager::DataManager;
 pub use downloader::Downloader;
+pub use downloaders::{BinanceDownloader, BybitDownloader};
 pub use loader::DataLoader;
 pub use tvc_builder::TvcBuilder;
 pub use types::{DataManagerConfig, Exchange, Venue};

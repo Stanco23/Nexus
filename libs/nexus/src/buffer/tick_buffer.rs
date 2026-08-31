@@ -120,7 +120,9 @@ impl TickBuffer {
                 cum_sell_volume: cum_sell,
                 vpin,
                 bucket_index,
-                instrument_id: None, // RingBuffer doesn't store instrument_id directly
+                // Propagate instrument_id from the parent RingBuffer so per-tick
+                // stats carry the routing info needed by DataEngine.
+                instrument_id: Some(rb.instrument_id()),
             });
 
             if (tick_idx + 1) % bucket_size == 0 {

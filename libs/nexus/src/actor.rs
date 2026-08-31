@@ -139,6 +139,11 @@ impl SystemClock {
         self.default_handler = Some(Box::new(handler));
         self
     }
+
+    /// Construct a boxed clock for passing to actors that need `Box<dyn Clock>`.
+    pub fn new_boxed() -> Box<Self> {
+        Box::new(Self::new())
+    }
 }
 
 impl Default for SystemClock {
@@ -922,6 +927,11 @@ impl Component {
         self.fsm.current()
     }
 
+    /// Return the clock for timestamp queries.
+    pub fn clock(&self) -> &dyn Clock {
+        &*self.clock
+    }
+
     /// Initialize the component (PreInitialized → Initialized).
     ///
     /// In Nautilus this happens automatically when a msgbus is set. We call it
@@ -1268,6 +1278,10 @@ impl GenericActor {
 
     pub fn component_mut(&mut self) -> &mut Component {
         &mut self.component
+    }
+
+    pub fn clock(&self) -> &dyn Clock {
+        self.component.clock()
     }
 
     pub fn trader_id(&self) -> &str {

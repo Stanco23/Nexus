@@ -181,6 +181,10 @@ impl TvcWriter {
             return Err(WriterError::AlreadyFinalized);
         }
 
+        // Anchors only at fixed intervals (every anchor_interval ticks). They serve
+        // as seek-only index points — not as precision preservers. Same-timestamp ticks
+        // are valid as regular deltas with ts_delta = 0; the decoder recovers the
+        // previous tick's timestamp exactly, so price/size carry forward unchanged.
         let is_anchor = self.tick_count.is_multiple_of(self.anchor_interval as u64);
 
         if is_anchor {
@@ -424,6 +428,7 @@ fn tick_to_bytes(tick: &TradeTick) -> [u8; ANCHOR_TICK_SIZE] {
 }
 
 /// Convert a TradeTick to 30 bytes (for checkpoint sidecar).
+/// Same layout as `tick_to_bytes` — alias kept for the checkpoint API.
 fn tick_to_bytes_lt(tick: &TradeTick) -> [u8; ANCHOR_TICK_SIZE] {
     tick_to_bytes(tick)
 }

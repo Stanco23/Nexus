@@ -49,6 +49,8 @@ pub struct QueuedOrder {
     pub remaining_size: f64,
     pub submitted_ns: u64,
     pub queue_position: u64, // position in queue at this price level
+    /// Trailing delta percentage for trailing stop orders.
+    pub trailing_delta_pct: Option<f64>,
 }
 
 /// A fill event recorded by the OrderEmulator.
@@ -188,6 +190,52 @@ impl OrderEmulator {
             remaining_size: size,
             submitted_ns: timestamp_ns,
             queue_position,
+            trailing_delta_pct: None,
+        };
+
+        self.pending.push(qo);
+        order_id
+    }
+
+    /// Submit a trailing stop order.
+    ///
+    /// `trailing_delta_pct` is the percentage offset (e.g. 0.01 = 1%).
+    /// The initial trigger price is set at `price`; it updates each tick
+    /// based on market movement via `process_fills`.
+    pub fn submit_trailing(
+        &mut self,
+        price: f64,
+        size: f64,
+        side: Side,
+        trailing_delta_pct: f64,
+        timestamp_ns: u64,
+    ) -> OrderId {
+        let price_int = (price * 1_000_000_000.0) as i64;
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        let queue_position = if side == Side::Buy {
+            let level = self.bid_queues.entry(price_int).or_insert_with(QueueLevel::new);
+            let pos = level.orders.len() as u64;
+            level.push(order_id, timestamp_ns);
+            pos
+        } else {
+            let level = self.ask_queues.entry(price_int).or_insert_with(QueueLevel::new);
+            let pos = level.orders.len() as u64;
+            level.push(order_id, timestamp_ns);
+            pos
+        };
+
+        let qo = QueuedOrder {
+            order_id,
+            side,
+            price,
+            price_int,
+            size,
+            remaining_size: size,
+            submitted_ns: timestamp_ns,
+            queue_position,
+            trailing_delta_pct: Some(trailing_delta_pct),
         };
 
         self.pending.push(qo);
@@ -1012,6 +1060,7 @@ impl OrderEmulator {
             remaining_size: size,
             submitted_ns: timestamp_ns,
             queue_position: 0, // Immediate fill, no queue position
+            trailing_delta_pct: None,
         };
 
         self.pending.push(qo);

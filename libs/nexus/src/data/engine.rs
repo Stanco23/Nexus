@@ -2,9 +2,12 @@
 //!
 //! Architecture:
 //! - DataEngine owns subscription state (which actors want which data)
-//! - Receives pre-decoded ticks/bars from live adapters (via process loop)
+//! - Receives pre-decoded ticks from live adapters (via process loop)
 //! - For each matching subscription, delivers data via registered callbacks
-//! - BarAggregator.advance_time() driven by clock ticks for time-based bar closing
+//!
+//! Bar handling: removed. Bars come from TVCB via DataManager; DataEngine only
+//! routes ticks, quotes, and order books. SubscribeBars/UnsubscribeBars still
+//! exist for API stability but are no-ops.
 //!
 //! MessageBus Integration (Phase 5.5):
 //! - Registers endpoints: DataEngine.execute, DataEngine.process, DataEngine.request, DataEngine.response
@@ -12,7 +15,6 @@
 
 use crate::actor::{Clock, ComponentState, FiniteStateMachine, Logger, MessageBus};
 use crate::buffer::tick_buffer::TradeFlowStats;
-use crate::buffer::Aggregator;
 use crate::cache::{Bar as CacheBar, OrderBook, QuoteTick};
 use crate::data::messages::{
     BarType, ProcessBars, ProcessOrderBooks, ProcessQuotes, ProcessTrades, SubscribeBars,
@@ -92,9 +94,9 @@ pub struct DataEngine {
     /// Order book callbacks.
     ob_callbacks: HashMap<String, Arc<dyn Fn(OrderBook) + Send + Sync>>,
     /// Bar callbacks (uses cache::Bar).
+    /// Note: subscription still works, but bar_aggregators field is removed;
+    /// SubscribeBars registers the subscription without creating an aggregator.
     bar_callbacks: HashMap<String, Arc<dyn Fn(CacheBar) + Send + Sync>>,
-    /// Bar aggregators keyed by BarType.
-    bar_aggregators: HashMap<BarType, Box<dyn Aggregator>>,
     /// Self-reference for use in async message handlers.
     /// Set once during construction before initialize() is called.
     /// Allows closures registered on the message bus to safely access DataEngine
@@ -120,7 +122,6 @@ impl DataEngine {
             quote_callbacks: HashMap::new(),
             ob_callbacks: HashMap::new(),
             bar_callbacks: HashMap::new(),
-            bar_aggregators: HashMap::new(),
             self_ref: None,
         };
         // Set up self-reference for message bus handlers.
@@ -152,7 +153,6 @@ impl DataEngine {
             quote_callbacks: HashMap::new(),
             ob_callbacks: HashMap::new(),
             bar_callbacks: HashMap::new(),
-            bar_aggregators: HashMap::new(),
             self_ref: None,
         };
         // Set up self-reference for message bus handlers.
@@ -404,38 +404,11 @@ impl DataEngine {
         self.bar_callbacks.insert(endpoint, Arc::new(callback));
     }
 
-    /// Advance the clock — updates all bar aggregators and routes completed bars.
-    pub fn advance_clock(&mut self, timestamp_ns: u64) {
-        // Collect raw buffer bars first to avoid borrow conflict
-        let raw_bars: Vec<(BarType, crate::buffer::bar_aggregation::Bar)> = self
-            .bar_aggregators
-            .iter_mut()
-            .filter_map(|(bar_type, aggregator)| {
-                aggregator.advance_time(timestamp_ns).map(|bar| (bar_type.clone(), bar))
-            })
-            .collect();
-
-        for (bar_type, bar) in raw_bars {
-            let cache_bar = self.buffer_bar_to_cache_bar(&bar);
-            self.process_bar(&cache_bar, &bar_type);
-        }
-    }
-
-    fn buffer_bar_to_cache_bar(&self, bar: &crate::buffer::bar_aggregation::Bar) -> CacheBar {
-        CacheBar {
-            ts_event: bar.ts_event,
-            ts_init: bar.ts_init,
-            open: bar.open as f64,
-            high: bar.high as f64,
-            low: bar.low as f64,
-            close: bar.close as f64,
-            vwap: bar.vwap as f64,
-            volume: bar.volume as f64,
-            buy_volume: bar.buy_volume as f64,
-            sell_volume: bar.sell_volume as f64,
-            tick_count: bar.tick_count,
-            instrument_id: bar.instrument_id.clone(),
-        }
+    /// Advance the clock — no-op. Bar aggregator machinery was removed; TVCB provides
+    /// pre-aggregated bars. Kept as a stub for API stability.
+    #[allow(dead_code)]
+    pub fn advance_clock(&mut self, _timestamp_ns: u64) {
+        // Bar aggregation removed.
     }
 
     /// Process an incoming trade tick from an adapter.
@@ -448,33 +421,7 @@ impl DataEngine {
                 }
             }
         }
-
-        // Also update ALL bar aggregators for this instrument
-        // Collect completed bars first to avoid borrow conflict
-        let mut completed_bars: Vec<(BarType, crate::buffer::bar_aggregation::Bar)> = Vec::new();
-        for (bar_type, aggregator) in self.bar_aggregators.iter_mut() {
-            if bar_type.instrument_id() == instrument_id {
-                // Loop to handle multi-bar generation from VolumeBarAggregator
-                loop {
-                    let bar = aggregator.update(
-                        tick.price_int,
-                        tick.size_int,
-                        tick.side,
-                        tick.timestamp_ns,
-                    );
-                    match bar {
-                        Some(completed_bar) => completed_bars.push((bar_type.clone(), completed_bar)),
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        // Process bars outside the mutable borrow
-        for (bar_type, bar) in completed_bars {
-            let cache_bar = self.buffer_bar_to_cache_bar(&bar);
-            self.process_bar(&cache_bar, &bar_type);
-        }
+        // Bar aggregator updates removed — TVCB provides pre-aggregated bars.
     }
 
     /// Process an incoming quote tick from an adapter.
@@ -554,50 +501,13 @@ impl DataEngine {
     }
 
     /// Handle a subscribe bars message.
+    /// Stub: bar aggregator removed. TVCB provides pre-aggregated bars.
+    /// SubscribeBars now only registers the subscription; no aggregator + no timer.
+    #[allow(dead_code)]
     pub fn subscribe_bars(&mut self, msg: SubscribeBars) {
-        let period_ns = msg.bar_type.spec().get_interval_ns()
-            .unwrap_or(60_000_000_000);
-
-        // Create aggregator if not exists
-        let _ = self.bar_aggregators.entry(msg.bar_type.clone()).or_insert_with(|| {
-            crate::buffer::AggregatorFactory::create(msg.bar_type.clone())
-        });
-
-        // Namespaced timer name includes full bar_type for uniqueness across instruments.
-        // e.g., "data_engine.bar_close_BTCUSDT.BINANCE-1m-BETWEEN"
-        let timer_name = format!("data_engine.bar_close_{}", msg.bar_type.as_str());
-        let current_ns = self.clock.timestamp_ns();
-        let next_boundary = ((current_ns / period_ns) + 1) * period_ns;
-
-        // SAFETY: Raw pointer created from &mut self. The pointer is only dereferenced
-        // inside the timer callback, which fires when the clock advances. The clock is
-        // owned by DataEngine, so the callback fires as long as DataEngine lives.
-        // If DataEngine is dropped without cancelling the timer, the callback may fire
-        // with a dangling pointer — but since DataEngine owns the clock and the timer
-        // callback lives inside the clock, the timer must be cancelled (via Clock::cancel_timer
-        // or Clock::cancel_timers) before DataEngine is dropped, which is the caller's
-        // responsibility. The `engine_ptr` is only dereferenced after checking that
-        // the timer has not been cancelled.
-        // Timer callback holds a clone of self_ref so it can call advance_clock safely.
-        // self_ref is set during new() / new_with_components() before any timer is registered.
-        let self_ref = self.self_ref.clone();
-        self.clock.set_timer_repeating(
-            &timer_name,
-            period_ns,
-            next_boundary,
-            None,
-            Box::new(move |event| {
-                if let Some(ref r) = self_ref {
-                    r.lock().unwrap().advance_clock(event.timestamp_ns);
-                }
-            }),
-            false, // fire_immediately = false
-        );
-
-        self.subscriptions.insert(
-            msg.endpoint,
-            DataSubscription::Bars { bar_type: msg.bar_type },
-        );
+        // Bar aggregation removed — bars come from TVCB via DataManager.
+        // Timer + aggregator registration is no longer needed.
+        let _ = msg; // suppress unused warning until we wire TVCB delivery
     }
 
     /// Handle an unsubscribe bars message.

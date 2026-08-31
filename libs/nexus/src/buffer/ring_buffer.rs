@@ -329,7 +329,10 @@ impl RingBuffer {
             }
         }
 
-        Ok((offset, tick_index, last_tick))
+        // At this point, we broke out of the loop when last_tick.timestamp_ns >= target_ns.
+        // tick_index has been incremented AFTER decoding the current tick.
+        // So tick_index - 1 is the index of last_tick.
+        Ok((offset, tick_index - 1, last_tick))
     }
 
     /// Get the first anchor byte offset (start of data after header).
@@ -393,7 +396,7 @@ impl RingBuffer {
     }
 
     /// Decode a delta tick at the given byte offset using the provided reference tick.
-    /// Returns the decoded tick and bytes consumed (4 for base, 15 for overflow).
+    /// Returns the decoded tick and bytes consumed (4 for base, 12 for overflow).
     pub fn decode_delta_at(
         &self,
         byte_offset: usize,
@@ -411,46 +414,50 @@ impl RingBuffer {
         let first_byte = self.mmap[byte_offset];
 
         if first_byte == 0xFF {
-            // 12-byte overflow delta
-            // Layout: [0xFF][2B ts_extra][8B price_extra i64][1B size+side]
-            if byte_offset + 12 > self.mmap.len() {
+            // 14-byte overflow delta
+            // Layout: [0xFF][4B ts_i32 zigzag][4B price_i32 zigzag][4B size_i32 zigzag][2B pad][1B side+flags]
+            if byte_offset + 14 > self.mmap.len() {
                 return Err(RingBufferError::SeekFailed(
                     "Overflow delta beyond bounds".into(),
                 ));
             }
 
-            let ts_extra_raw =
-                u16::from_le_bytes([self.mmap[byte_offset + 1], self.mmap[byte_offset + 2]]);
-            let price_extra = i64::from_le_bytes([
-                self.mmap[byte_offset + 3],
-                self.mmap[byte_offset + 4],
+            let mut ts_buf = [0u8; 8];
+            ts_buf[..4].copy_from_slice(&self.mmap[byte_offset + 1..byte_offset + 5]);
+            let ts_delta_raw = u64::from_le_bytes(ts_buf);
+            let price_extra_raw = i32::from_le_bytes([
                 self.mmap[byte_offset + 5],
                 self.mmap[byte_offset + 6],
                 self.mmap[byte_offset + 7],
                 self.mmap[byte_offset + 8],
+            ]);
+            let size_extra_raw = i32::from_le_bytes([
                 self.mmap[byte_offset + 9],
                 self.mmap[byte_offset + 10],
+                self.mmap[byte_offset + 11],
+                self.mmap[byte_offset + 12],
             ]);
-            let size_byte = self.mmap[byte_offset + 11];
 
-            // ts_extra encoding:
-            // - marker=0 (bit 15 = 0): ts_extra = ts_extra_raw >> 1 (direct small delta)
-            // - marker=1 (bit 15 = 1): ts_extra = (ts_extra_raw & 0x7FFF) << TIMESTAMP_EXTRA_SHIFT
-            const TIMESTAMP_EXTRA_SHIFT: u32 = 21;
-            let ts_extra = if (ts_extra_raw & 0x8000) == 0 {
-                (ts_extra_raw >> 1) as u64
-            } else {
-                ((ts_extra_raw & 0x7FFF) as u64) << TIMESTAMP_EXTRA_SHIFT
+            // zigzag_decode: i64 for ts (±2.1s overflow range), i32 for price/size.
+            let zdec64 = |n: u64| -> i64 {
+                let v = n as i64;
+                (v >> 1) ^ (-(v & 1))
+            };
+            let zdec32 = |n: u32| -> i32 {
+                let v = n as i32;
+                (v >> 1) ^ (-(v & 1))
             };
 
-            let timestamp_ns = prev_tick.timestamp_ns + ts_extra;
-            let price_int = prev_tick.price_int + price_extra as i64;
+            // ts is stored as zigzag(i32) microseconds. Decode and convert to nanoseconds.
+            let timestamp_ns = (prev_tick.timestamp_ns as i64)
+                .wrapping_add((zdec64(ts_delta_raw) as i64) * 1_000)
+                as u64;
+            let price_int = prev_tick.price_int + zdec32(price_extra_raw as u32) as i64;
+            let size_int = prev_tick.size_int + zdec32(size_extra_raw as u32) as i64;
 
-            // size_extra: bit 7 = side, bits 0-6 = size sign-magnitude
-            let side = (size_byte >> 7) as u8;
-            let size_sign = if (size_byte & 0x40) != 0 { -1 } else { 1 };
-            let size_magnitude = (size_byte & 0x3F) as i32;
-            let size_int = prev_tick.size_int + (size_sign * size_magnitude) as i64;
+            // side (bit 0) and flags (bits 1-7) at byte 13
+            let side = self.mmap[byte_offset + 13] & 1;
+            let flags = (self.mmap[byte_offset + 13] >> 1) & 0x7F;
 
             Ok((
                 TradeTick {
@@ -458,48 +465,62 @@ impl RingBuffer {
                     price_int,
                     size_int,
                     side,
-                    flags: prev_tick.flags,
-                    sequence: prev_tick.sequence + 1,
-                },
-                12,
-            ))
-        } else {
-            // 4-byte base delta
-            if byte_offset + 4 > self.mmap.len() {
+                    flags,
+                                        sequence: prev_tick.sequence + 1,
+                                    },
+                                    14,
+                                ))
+                            } else {
+            // 8-byte base delta
+            if byte_offset + 8 > self.mmap.len() {
                 return Err(RingBufferError::SeekFailed(
                     "Base delta beyond bounds".into(),
                 ));
             }
 
-            let packed = u32::from_le_bytes([
-                self.mmap[byte_offset],
-                self.mmap[byte_offset + 1],
-                self.mmap[byte_offset + 2],
-                self.mmap[byte_offset + 3],
-            ]);
+            let mut packed_bytes = [0u8; 8];
+            packed_bytes.copy_from_slice(&self.mmap[byte_offset..byte_offset + 8]);
+            let packed = u64::from_le_bytes(packed_bytes);
 
-            const TIMESTAMP_DELTA_MASK: u32 = 0xFFFFF; // 20 bits, matches types.rs
-            const PRICE_ZIGZAG_MASK: u32 = 0x7FFFF; // 19 bits, matches types.rs
-            const PRICE_ZIGZAG_SHIFT: u32 = 20; // matches types.rs
+            // 8-byte base layout (64 bits packed):
+            //   bits 0-16:   ts_delta in 1µs units (17 bits, max 131ms)
+            //   bits 17-34:  price_zigzag (18 bits)
+            //   bits 35-61:  size_zigzag (27 bits)
+            //   bit 62:      side (1 bit)
+            //   bit 63:      flags (1 bit)
+            const TIMESTAMP_DELTA_MASK: u64 = 0x1FFFF; // 17 bits
+            const PRICE_ZIGZAG_MASK: u64 = 0x3FFFF;    // 18 bits
+            const PRICE_ZIGZAG_SHIFT: u32 = 17;
+            const SIZE_ZIGZAG_MASK: u64 = 0x7FFFFFF;   // 27 bits
+            const SIZE_ZIGZAG_SHIFT: u32 = 35;
 
-            let ts_delta = packed & TIMESTAMP_DELTA_MASK;
+            let ts_delta_us = (packed & TIMESTAMP_DELTA_MASK) as u32;
             let price_zigzag_raw = (packed >> PRICE_ZIGZAG_SHIFT) & PRICE_ZIGZAG_MASK;
+            let size_zigzag_raw = (packed >> SIZE_ZIGZAG_SHIFT) & SIZE_ZIGZAG_MASK;
 
-            // Sign-extend from 18 bits to i64 for proper arithmetic
+            // Sign-extend 18-bit price_zigzag to i32
             let price_zigzag = if price_zigzag_raw & (1 << 17) != 0 {
                 (price_zigzag_raw as i64 | 0xFFFFFC0000_i64) as i32
             } else {
                 price_zigzag_raw as i32
             };
+            // Sign-extend 27-bit size_zigzag to i32
+            let size_zigzag = if size_zigzag_raw & (1 << 26) != 0 {
+                (size_zigzag_raw as i64 | 0xFFFFFFFFF8000000_u64 as i64) as i32
+            } else {
+                size_zigzag_raw as i32
+            };
 
-            // Zigzag decode: (n >> 1) ^ -(n & 1)
             let price_delta = ((price_zigzag >> 1) ^ -(price_zigzag & 1)) as i64;
+            let size_delta = ((size_zigzag >> 1) ^ -(size_zigzag & 1)) as i64;
 
-            let timestamp_ns = prev_tick.timestamp_ns + ts_delta as u64;
+            // Decode side (bit 62) and flags (bit 63) from packed
+            let side = ((packed >> 62) & 1) as u8;
+            let flags = ((packed >> 63) & 1) as u8;
+
+            let timestamp_ns = prev_tick.timestamp_ns + (ts_delta_us as u64) * 1_000;
             let price_int = prev_tick.price_int + price_delta;
-            let size_int = prev_tick.size_int;
-            let side = prev_tick.side;
-            let flags = prev_tick.flags;
+            let size_int = prev_tick.size_int + size_delta;
 
             Ok((
                 TradeTick {
@@ -510,7 +531,7 @@ impl RingBuffer {
                     flags,
                     sequence: prev_tick.sequence + 1,
                 },
-                4,
+                8,
             ))
         }
     }
@@ -526,9 +547,16 @@ impl RingBuffer {
     }
 
     /// Create an iterator starting from a specific anchor position.
-    /// Takes decoded first_tick so we don't re-decode it.
-    /// anchor_slot is the index into anchor_index for the current anchor (for iteration state).
-    pub fn iter_from(&self, byte_offset: usize, tick_index: u64, first_tick: TradeTick, anchor_slot: usize) -> RingIter<'_> {
+    /// The first_tick is the already-decoded anchor tick at byte_offset.
+    /// RingIter takes ownership and returns it on the first next() call.
+    /// anchor_slot is the index into anchor_index for the current anchor.
+    pub fn iter_from(
+        &self,
+        byte_offset: usize,
+        tick_index: u64,
+        first_tick: TradeTick,
+        anchor_slot: usize,
+    ) -> RingIter<'_> {
         RingIter::from_position(self, byte_offset, tick_index, first_tick, anchor_slot)
     }
 }
@@ -539,17 +567,40 @@ impl RingBuffer {
 
 /// Zero-copy sequential iterator over TradeTicks from a RingBuffer.
 ///
-/// Iterates through the memory-mapped data, decoding anchors and deltas.
-/// Does not copy the underlying mmap data — only decodes into TradeTicks.
+/// Design:
+/// - `current_offset` always points to the next unread byte in the tick stream
+/// - `last_tick` is always the previously returned tick (used for delta decode)
+/// - `anchor_slot` is the anchor_index entry for the CURRENT (most recently returned) anchor
+/// - When `current_tick_index` crosses an anchor boundary (tick_index % anchor_interval == 0),
+///   we re-decode from `anchor_index[anchor_slot + 1]` to resync the delta stream
+///
+/// The key invariant: after returning any tick, `current_offset` points to where the
+/// NEXT tick's data begins. For anchor ticks that's `offset + ANCHOR_TICK_SIZE` (past anchor
+/// data to first delta). For delta ticks that's `offset + consumed` (past delta to next item).
+///
+/// Construction modes:
+/// - `new()`: start at first anchor, first next() returns anchor tick
+/// - `range()`: start at seeked position, first next() returns anchor tick
+/// - `from_position()`: start at already-decoded anchor, first next() returns anchor tick
+///   (caller already decoded anchor separately; RingIter takes ownership and returns it)
 #[derive(Debug)]
 pub struct RingIter<'a> {
     buffer: &'a RingBuffer,
+    /// Offset of the NEXT byte to read. After returning an anchor: offset + ANCHOR_TICK_SIZE.
+    /// After returning a delta: offset + consumed. Always points to next unread data.
     current_offset: usize,
+    /// Global tick index of the NEXT tick to be returned (before increment).
+    /// Starts at 0 for new(), at seek position for range/from_position.
     current_tick_index: u64,
+    /// The previously returned tick — used as reference for delta decoding.
     last_tick: TradeTick,
+    /// Upper bound timestamp (non-inclusive). Iteration stops when ts >= end_ns.
     end_ns: u64,
-    started: bool,
-    next_anchor_tick: u64,
+    /// Index into buffer.anchor_index for the CURRENT anchor (the anchor whose
+    /// data we've most recently returned or skipped past).
+    /// When current_tick_index is in [0, 1023], anchor_slot=0.
+    /// When current_tick_index is in [1024, 2047], anchor_slot=1.
+    /// Updated when we cross an anchor boundary during iteration.
     anchor_slot: usize,
 }
 
@@ -567,48 +618,54 @@ impl<'a> RingIter<'a> {
             current_tick_index: 0,
             last_tick: first_tick,
             end_ns: u64::MAX,
-            started: false,
-            next_anchor_tick: buffer.anchor_interval() as u64,
-            anchor_slot: 1,
+            anchor_slot: 0, // anchor_index[0] is the first anchor we returned
         }
     }
 
-    /// Create an iterator for a time range [start_ns, end_ns].
+/// Create an iterator for a time range [start_ns, end_ns].
     fn range(buffer: &'a RingBuffer, start_ns: u64, end_ns: u64) -> Self {
-        let (offset, tick_index, first_tick) = buffer
+        let (anchor_offset, tick_index, first_tick) = buffer
             .seek_to_time_ns(start_ns)
             .expect("Failed to seek to start_ns");
 
+        // The anchor that contains tick_index
         let anchor_interval = buffer.anchor_interval() as u64;
-        let current_anchor_index = tick_index / anchor_interval;
-        let next_anchor_tick = (current_anchor_index + 1) * anchor_interval;
+        let anchor_slot = (tick_index / anchor_interval) as usize;
 
         Self {
             buffer,
-            current_offset: offset,
+            // anchor_offset: current_offset points to the anchor tick data at seek position.
+            // last_tick is the already-decoded anchor tick from seek_to_time_ns.
+            // first next() uses is_anchor_tick to decide: if anchor data, return last_tick;
+            // if delta data, decode_delta_at.
+            current_offset: anchor_offset,
             current_tick_index: tick_index,
             last_tick: first_tick,
             end_ns,
-            started: false,
-            next_anchor_tick,
-            anchor_slot: current_anchor_index as usize + 1,
+            anchor_slot,
         }
     }
 
-    /// Create an iterator starting from a specific anchor position (for sequential iteration).
-    fn from_position(buffer: &'a RingBuffer, byte_offset: usize, tick_index: u64, first_tick: TradeTick, anchor_slot: usize) -> Self {
-        let anchor_interval = buffer.anchor_interval() as u64;
-        let current_anchor_index = tick_index / anchor_interval;
-        let next_anchor_tick = (current_anchor_index + 1) * anchor_interval;
-
+    /// Create an iterator starting from an already-decoded anchor position.
+    /// The caller has decoded `first_tick` at `byte_offset` and consumed it separately.
+    /// We take ownership: first next() returns first_tick, then iteration continues
+    /// from byte_offset + ANCHOR_TICK_SIZE as normal.
+    ///
+    /// `anchor_slot` is the index into anchor_index for the current anchor.
+    pub(crate) fn from_position(
+        buffer: &'a RingBuffer,
+        byte_offset: usize,
+        tick_index: u64,
+        first_tick: TradeTick,
+        anchor_slot: usize,
+    ) -> Self {
         Self {
             buffer,
+            // Pass byte_offset (anchor start), first next() will advance past anchor correctly
             current_offset: byte_offset,
             current_tick_index: tick_index,
             last_tick: first_tick,
             end_ns: u64::MAX,
-            started: false,
-            next_anchor_tick,
             anchor_slot,
         }
     }
@@ -621,93 +678,121 @@ impl<'a> RingIter<'a> {
             None
         }
     }
+
+    /// Common helper: check if next tick is beyond end_ns without advancing.
+    fn is_beyond_end(&self, timestamp_ns: u64) -> bool {
+        timestamp_ns >= self.end_ns
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.current_tick_index >= self.buffer.num_ticks()
+    }
 }
 
 impl<'a> Iterator for RingIter<'a> {
     type Item = TradeTick;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_tick_index >= self.buffer.num_ticks() {
+        // Exhausted tick stream
+        if self.is_at_end() {
             return None;
         }
 
-        // Check end_ns before returning
-        // For iter(): end_ns = u64::MAX, use > check (original behavior)
-        // For iter_range(): end_ns = specific value, use >= check (exclusive end)
-        let past_end = if self.end_ns == u64::MAX {
-            self.last_tick.timestamp_ns > self.end_ns
-        } else {
-            self.last_tick.timestamp_ns >= self.end_ns
-        };
-        if past_end {
-            return None;
-        }
+        let anchor_interval = self.buffer.anchor_interval() as u64;
 
-        // On first iteration, return the initial tick
-        // For iter(): the initial tick is always an anchor, advance by ANCHOR_TICK_SIZE
-        // For iter_range(): the initial tick could be an anchor OR a delta, don't advance
-        if !self.started {
-            self.started = true;
-            // Only advance if this is a full iteration (end_ns == u64::MAX)
-            if self.end_ns == u64::MAX {
-                self.current_offset += ANCHOR_TICK_SIZE;
-                self.current_tick_index += 1;
-                self.anchor_slot = 1;
-            }
-            // For range iteration, don't advance - the seek already positioned us correctly
+// ─── Anchor boundary check ────────────────────────────────────────────
+        // TVC3 layout: anchor k covers tick indices [k*1024, (k+1)*1024 - 1].
+        // Anchor k's data lives at anchor_index[k].byte_offset — it encodes tick k*1024.
+        // After anchor k's data, delta encoding continues until tick (k+1)*1024 - 1.
+        // At tick (k+1)*1024 (the first tick of anchor k+1), we must re-decode from
+        // anchor_index[k+1] because delta decoding from anchor k's data won't produce it.
+        //
+        // We detect anchor boundaries by comparing computed_anchor_slot to anchor_slot:
+        // - computed_anchor_slot = current_tick_index / anchor_interval
+        // - anchor_slot = the anchor whose data we last consumed
+        //
+        // When computed_anchor_slot > anchor_slot, we've entered the next anchor's range
+        // and need to re-decode from the next anchor's position.
+        //
+        // The is_anchor_tick check below determines HOW to return the current tick:
+        // if it's the first tick of an anchor, return via anchor data (no delta decode).
+        // The crossing_boundary check above handles WHEN to switch anchor data sources.
+        let computed_anchor_slot = (self.current_tick_index / anchor_interval) as usize;
+        let crossing_boundary = computed_anchor_slot > self.anchor_slot;
 
-            return Some(self.last_tick);
-        }
+        if crossing_boundary {
+            // We're at the first tick of a new anchor. Look up its byte_offset from index.
+            let target_slot = computed_anchor_slot;
 
-        // Check if the current position is at an anchor (we've already decoded it, checking from current position)
-        let next_idx = self.anchor_slot;
-        if next_idx < self.buffer.anchor_index().len()
-            && self.current_tick_index == self.buffer.anchor_index()[next_idx].tick_index
-        {
-            match self.buffer.decode_anchor_at(self.current_offset) {
-                Ok(tick) => {
-                    // Validate: anchors must have side in {0,1} and timestamp must not go backward.
-                    // If the writer placed an OVERFLOW delta at an anchor position (indexed as anchor
-                    // but written as 15-byte delta), the decoded "anchor" will have garbage values.
-                    let side_valid = tick.side <= 1;
-                    let ts_valid = tick.timestamp_ns >= self.last_tick.timestamp_ns;
-                    if side_valid && ts_valid {
-                        self.last_tick = tick;
-                        self.current_offset += ANCHOR_TICK_SIZE;
-                        self.current_tick_index += 1;
-                        self.anchor_slot += 1;
+            let anchor_idx = self.buffer.anchor_index();
+            if let Some(entry) = anchor_idx.get(target_slot) {
+                let anchor_offset = entry.byte_offset as usize;
 
-                        if self.last_tick.timestamp_ns > self.end_ns {
-                            return None;
+                // Decode the anchor tick at this position
+                match self.buffer.decode_anchor_at(anchor_offset) {
+                    Ok(anchor_tick) => {
+                        // Validate: timestamp must not go backward STRICTLY.
+                        // Equal timestamps are valid (consecutive ticks at same ns is allowed).
+                        if anchor_tick.timestamp_ns < self.last_tick.timestamp_ns {
+                            return None; // Corrupt data, stop iteration
                         }
-                        return Some(self.last_tick);
+                        // anchor_slot committed to this new anchor
+                        self.anchor_slot = target_slot;
+                        self.current_offset = anchor_offset;
+                        self.last_tick = anchor_tick;
                     }
-                    // Fall through: this position has an OVERFLOW delta but was indexed as anchor.
-                    // Decode it as an overflow delta (15 bytes) and keep anchor_slot unchanged so
-                    // we retry this tick_index at the next anchor_index entry.
+                    Err(_) => return None,
                 }
-                Err(_) => return None,
+            } else {
+                // No more anchors in index — stop
+                return None;
             }
         }
 
-        // Decode next delta tick
-        let (tick, consumed) = match self
-            .buffer
-            .decode_delta_at(self.current_offset, &self.last_tick)
-        {
-            Ok(result) => result,
-            Err(_) => return None,
-        };
+        // ─── Return current tick ──────────────────────────────────────────────
+        // current_offset points to the start of the current tick's data.
+        // If it's an anchor (offset is at anchor slot), advance past ANCHOR_TICK_SIZE.
+        // If it's a delta, decode and advance by consumed bytes.
+        let current_offset = self.current_offset;
 
-        self.last_tick = tick;
-        self.current_offset += consumed;
-        self.current_tick_index += 1;
+        // Determine if we're at an anchor or delta by checking if current tick_index
+        // is a multiple of anchor_interval (i.e., the first tick in an anchor group).
+        // For anchor ticks (tick_index % anchor_interval == 0), the data is ANCHOR_TICK_SIZE.
+        // For delta ticks, we decode to find consumed bytes.
+        let is_anchor_tick = self.current_tick_index % anchor_interval == 0;
 
-        if self.current_tick_index == self.next_anchor_tick {
-            self.next_anchor_tick += self.buffer.anchor_interval() as u64;
+        if is_anchor_tick {
+            // We're at an anchor tick — return it and advance past anchor data
+            let tick = self.last_tick;
+
+            // Check end_ns boundary before returning
+            if self.is_beyond_end(tick.timestamp_ns) {
+                return None;
+            }
+
+            // Advance: past anchor data to the first delta (or next structure)
+            self.current_offset = current_offset + ANCHOR_TICK_SIZE;
+            self.current_tick_index += 1;
+
+            Some(tick)
+        } else {
+            // Delta tick — decode at current_offset
+            let (tick, consumed) = match self.buffer.decode_delta_at(current_offset, &self.last_tick) {
+                Ok(result) => result,
+                Err(_) => return None,
+            };
+
+            // Check end_ns boundary
+            if self.is_beyond_end(tick.timestamp_ns) {
+                return None;
+            }
+
+            self.last_tick = tick;
+            self.current_offset = current_offset + consumed;
+            self.current_tick_index += 1;
+
+            Some(self.last_tick)
         }
-
-        Some(self.last_tick)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

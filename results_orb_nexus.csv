@@ -1,5 +1,11 @@
 metric,value
 instrument,BTCUSDT.BINANCE
+<<<<<<< Updated upstream
 pnl,0.00
 max_drawdown,0.00
 num_trades,0
+=======
+pnl,-5159.18
+max_drawdown,5.16
+num_trades,140
+>>>>>>> Stashed changes

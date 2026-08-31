@@ -1,7 +1,0 @@
-metric,value
-instrument,BTCUSDT.BINANCE
-total_ticks,1440
-num_trades,23
-pnl,-2503.95
-max_drawdown,2503.95
-runtime_sec,0.0030

@@ -7,6 +7,8 @@ pub mod signals;
 pub mod strategy_trait;
 pub mod types;
 
+pub use examples::{EmaCrossStrategy, RsiStrategy, SmaCrossTrailingStrategy, TrendFollowingStrategy, VwapMomentumStrategy};
+
 pub use context::StrategyCtx;
 pub use indicators::{
     Atr, Ema, Indicator, Macd, Rsi, Sma, Stochastic, Vwap,
@@ -20,8 +22,10 @@ pub use types::{
     StrategyId, Tick,
 };
 
-// live_strategy and actor_wrapper require the nexus crate (live trading bridging).
-// They are compiled only when the "live" feature is enabled.
+// actor_wrapper lives in nexus (libs/nexus/src/live/actor_wrapper.rs) when the
+// "live" feature is enabled — it cannot live here due to cyclic deps.
+// nexus depends on strategy (for Strategy trait), strategy cannot depend on nexus.
+
 #[cfg(feature = "live")]
 pub mod live_strategy;
 

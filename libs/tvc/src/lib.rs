@@ -26,9 +26,14 @@ pub mod reader;
 pub mod types;
 pub mod writer;
 
+pub mod tvcb;
+
 pub use compression::{
     pack_delta, unpack_anchor_at, unpack_base_delta, unpack_delta_at, unpack_overflow_delta,
 };
 pub use reader::TvcReader;
 pub use types::{AnchorIndexEntry, AnchorTick, DecodedTick, HeaderError, TradeTick, TvcHeader};
 pub use writer::{CheckpointWriterError, TvcWriter};
+
+// Re-export TVCB types at library level
+pub use tvcb::{TvcbReader, TvcbWriter, BarIter, TvcbHeader, AnchorBar, IndexEntry, TvcbError};

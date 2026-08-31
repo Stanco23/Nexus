@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::ring_buffer::{RingBuffer, RingBufferError};
+use super::ring_buffer::{RingBuffer, RingBufferError, RingIter};
+use tvc::types::ANCHOR_TICK_SIZE;
 use super::tick_buffer::{TickBuffer, TradeFlowStats};
 use crate::instrument::InstrumentId;
 use tvc::TradeTick;
@@ -128,9 +129,13 @@ impl RingBufferSet {
         Self::from_files([(path.to_path_buf(), instrument_id)])
     }
 
-    /// Get the number of instruments.
+    /// Number of instruments in this buffer set.
     pub fn num_instruments(&self) -> usize {
-        self.buffers.len()
+        let mut seen = HashMap::new();
+        for (id, _) in &self.buffers {
+            seen.insert(id.clone(), ());
+        }
+        seen.len()
     }
 
     /// Get the total tick count across all instruments.
@@ -195,12 +200,21 @@ impl RingBufferSet {
         let anchor = self.merged_anchors.get(global_tick_index as usize)?;
         let buffer = self.buffers.get(anchor.buffer_idx)?.1.as_ref();
 
-        // Compute anchor_slot: which index into buffer's anchor_index corresponds to this anchor
+        // Compute anchor_slot: which index into buffer'sanchor_index corresponds to this anchor
         let byte_offset = anchor.byte_offset as u64;
         let anchor_idx = buffer.anchor_index();
         let anchor_slot = anchor_idx.iter().position(|e| e.byte_offset == byte_offset).unwrap_or(0);
 
         Some((buffer, anchor.byte_offset as usize, anchor.local_tick_index, anchor_slot))
+    }
+
+    /// Sequential anchor iterator — seek once, stream all ticks.
+    ///
+    /// One entry per anchor tick (anchor_interval=1024). Each yielded RingIter
+    /// covers anchor_interval ticks via delta decoding. No binary search per tick,
+    /// no global_tick iteration loop.
+    pub fn anchor_iter(&self) -> AnchorIter<'_> {
+        AnchorIter::new(self)
     }
 
     /// Get all unique instrument IDs in order of first occurrence.
@@ -221,6 +235,96 @@ impl RingBufferSet {
         &self.buffers
     }
 }
+
+// =============================================================================
+// AnchorIter — sequential anchor iteration for RingBufferSet
+// =============================================================================
+
+/// Iterator over merged anchors for sequential anchor-by-anchor sweep.
+///
+/// One seek + sequential iteration — no binary search per tick,
+/// no 365M iteration loop. Each yield covers anchor_interval ticks
+/// via RingIter streaming.
+#[derive(Debug)]
+pub struct AnchorIter<'a> {
+    buffer_set: &'a RingBufferSet,
+    /// Current index into merged_anchors
+    anchor_idx: usize,
+}
+
+impl<'a> AnchorIter<'a> {
+    fn new(buffer_set: &'a RingBufferSet) -> Self {
+        Self {
+            buffer_set,
+            anchor_idx: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for AnchorIter<'a> {
+    type Item = (
+        &'a RingBuffer,
+        usize,        // byte_offset
+        u64,          // local_tick_index
+        usize,        // anchor_slot
+        InstrumentId, // instrument_id
+        RingIter<'a>, // pre-positioned iterator
+    );
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let anchor = self.buffer_set.merged_anchors.get(self.anchor_idx)?;
+        let buffer = self.buffer_set.buffers.get(anchor.buffer_idx)?.1.as_ref();
+        let byte_offset = anchor.byte_offset as usize;
+        let local_tick_index = anchor.local_tick_index;
+        let instrument_id = anchor.instrument_id.clone();
+
+        // Decode anchor tick (consumed by RingIter's first next()).
+                // On decode error, skip this anchor and advance to the next one.
+                // Iterative (not recursive) so it is stack-safe on heavily-corrupted files.
+                let first_tick = match buffer.decode_anchor_at(byte_offset) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        self.anchor_idx += 1;
+                        return self.next();
+                    }
+                };
+                let anchor_idx_buf = buffer.anchor_index();
+
+                // anchor_slot derived once per anchor — O(n) linear scan amortized over
+                // anchor_interval (1024) ticks, so O(1) per anchor in practice.
+                // RingIter increments anchor_slot internally when crossing anchor boundaries.
+                let anchor_slot = anchor_idx_buf
+                    .iter()
+                    .position(|e| e.byte_offset as usize == byte_offset)
+                    .unwrap_or(0);
+
+        let num_ticks = buffer.num_ticks();
+        let ring_iter = RingIter::from_position(
+            buffer,
+            byte_offset + ANCHOR_TICK_SIZE, // past anchor header
+            local_tick_index + 1,           // tick_index 1 (anchor is tick 0)
+            first_tick,
+            anchor_slot,
+        );
+
+        self.anchor_idx += 1;
+        Some((
+            buffer,
+            byte_offset,
+            local_tick_index,
+            anchor_slot,
+            instrument_id,
+            ring_iter,
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.buffer_set.merged_anchors.len() - self.anchor_idx;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for AnchorIter<'_> {}
 
 // =============================================================================
 // TickBufferSet
@@ -292,23 +396,22 @@ impl TickBufferSet {
         })
     }
 
-    /// Get the number of instruments (deduplicated).
+    /// Number of instruments.
     pub fn num_instruments(&self) -> usize {
         self.instrument_ids.len()
     }
 
-    /// Get all instrument IDs.
+    /// All unique instrument IDs.
     pub fn instrument_ids(&self) -> &[InstrumentId] {
         &self.instrument_ids
     }
 
-    /// Get the total tick count across all instruments.
+    /// Total tick count across all instruments.
     pub fn total_ticks(&self) -> u64 {
         self.buffers.iter().map(|(_, b)| b.num_ticks()).sum()
     }
 
-    /// Get a reference to a specific instrument's TickBuffer.
-    /// Returns the first buffer with matching instrument_id.
+    /// Get a specific instrument's TickBuffer.
     pub fn get(&self, instrument_id: &InstrumentId) -> Option<&Arc<TickBuffer>> {
         self.buffers
             .iter()
@@ -316,7 +419,7 @@ impl TickBufferSet {
             .map(|(_, buf)| buf)
     }
 
-    /// Get all buffers as a slice.
+    /// Get all buffers.
     pub fn buffers(&self) -> &[(InstrumentId, Arc<TickBuffer>)] {
         &self.buffers
     }
@@ -431,18 +534,15 @@ impl<'a> Iterator for MergeCursor<'a> {
     type Item = MultiInstrumentEvent<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let result = self.current_event.take();
-        self.find_next();
-        result
+        self.advance()
     }
 }
 
-/// Internal anchor info before merging.
 struct AnchorInfo {
     instrument_id: InstrumentId,
     byte_offset: u64,
     local_tick_index: u64,
-    buffer_idx: usize, // Index into buffers Vec (0-based, in file loading order)
+    buffer_idx: usize,
 }
 
 #[cfg(test)]
